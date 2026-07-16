@@ -1,5 +1,7 @@
 #include <QtTest>
 
+#include <limits>
+
 #include "ktm/xc2/Xc2JsonCodec.h"
 
 using namespace ktm::xc2;
@@ -115,6 +117,46 @@ private slots:
             R"({"jobId":"synthetic","state":"IN_PROGRESS","ticks":1,"totalTicks":2,"message":"x"})").ok());
         QVERIFY(!Xc2JsonCodec::jobProgress(
             R"({"jobId":"synthetic","status":"CREATED","ticks":1,"totalTicks":2,"message":"x"})").ok());
+    }
+
+    void jobProgressParsesFullWidthIntegersExactly_data()
+    {
+        QTest::addColumn<QByteArray>("ticksLiteral");
+        QTest::addColumn<qint64>("expectedTicks");
+
+        QTest::newRow("2^53 + 1")
+            << QByteArrayLiteral("9007199254740993")
+            << qint64{9007199254740993LL};
+        QTest::newRow("qint64 minimum")
+            << QByteArrayLiteral("-9223372036854775808")
+            << std::numeric_limits<qint64>::min();
+        QTest::newRow("qint64 maximum")
+            << QByteArrayLiteral("9223372036854775807")
+            << std::numeric_limits<qint64>::max();
+    }
+
+    void jobProgressParsesFullWidthIntegersExactly()
+    {
+        QFETCH(QByteArray, ticksLiteral);
+        QFETCH(qint64, expectedTicks);
+
+        const QByteArray payload =
+            QByteArrayLiteral(
+                R"({"jobId":"synthetic","status":"IN_PROGRESS","ticks":)")
+            + ticksLiteral
+            + QByteArrayLiteral(R"(,"totalTicks":0,"message":"x"})");
+        const auto progress = Xc2JsonCodec::jobProgress(payload);
+
+        QVERIFY2(progress.ok(), qPrintable(progress.error.message));
+        QCOMPARE(progress.value->ticks, expectedTicks);
+    }
+
+    void jobProgressRejectsInvalidIntegerValues()
+    {
+        QVERIFY(!Xc2JsonCodec::jobProgress(
+            R"({"jobId":"synthetic","status":"IN_PROGRESS","ticks":1.5,"totalTicks":2,"message":"x"})").ok());
+        QVERIFY(!Xc2JsonCodec::jobProgress(
+            R"({"jobId":"synthetic","status":"IN_PROGRESS","ticks":"1","totalTicks":2,"message":"x"})").ok());
     }
 };
 

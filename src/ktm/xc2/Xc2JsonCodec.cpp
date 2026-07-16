@@ -4,7 +4,6 @@
 #include <QJsonDocument>
 #include <QJsonParseError>
 
-#include <cmath>
 #include <limits>
 
 namespace ktm::xc2 {
@@ -123,18 +122,16 @@ bool requireInteger64(const QJsonObject &object,
         return false;
     }
 
-    const double number = jsonValue.toDouble();
-    constexpr double qint64Minimum = -9223372036854775808.0;
-    constexpr double qint64UpperBound = 9223372036854775808.0;
-    if (!std::isfinite(number)
-        || std::trunc(number) != number
-        || number < qint64Minimum
-        || number >= qint64UpperBound) {
+    constexpr qint64 minimumDefault = std::numeric_limits<qint64>::min();
+    constexpr qint64 maximumDefault = std::numeric_limits<qint64>::max();
+    const qint64 minimumResult = jsonValue.toInteger(minimumDefault);
+    const qint64 maximumResult = jsonValue.toInteger(maximumDefault);
+    if (minimumResult != maximumResult) {
         failureMessage = QStringLiteral("Field '%1' must be a 64-bit integer")
                              .arg(field);
         return false;
     }
-    value = static_cast<qint64>(number);
+    value = minimumResult;
     return true;
 }
 
