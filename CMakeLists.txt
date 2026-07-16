@@ -74,6 +74,8 @@ if(RX14_KTM_XC2)
         src/ktm/xc2/Xc2JsonCodec.h
         src/ktm/xc2/Xc2Models.cpp
         src/ktm/xc2/Xc2Models.h
+        src/ktm/xc2/Xc2BackendManager.cpp
+        src/ktm/xc2/Xc2BackendManager.h
         src/ktm/xc2/Xc2RestClient.cpp
         src/ktm/xc2/Xc2RestClient.h
         src/ktm/xc2/Xc2StompCodec.cpp
@@ -88,7 +90,12 @@ if(RX14_KTM_XC2)
     target_include_directories(rx14_ktm_xc2 PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
     )
-    target_link_libraries(rx14_ktm_xc2 PUBLIC Qt6::Core Qt6::Network)
+    target_link_libraries(rx14_ktm_xc2 PUBLIC
+        Qt6::Core
+        Qt6::Network
+        Iphlpapi
+        Ws2_32
+    )
 endif()
 
 # ── BLAKE3 (portable C, no SIMD) ────────────────────────────────────────────
@@ -635,6 +642,50 @@ if(BUILD_TESTING AND RX14_KTM_XC2)
     )
     add_test(NAME xc2_process_output COMMAND test_Xc2ProcessOutput)
     set_tests_properties(xc2_process_output PROPERTIES LABELS "unit;ktm")
+
+    add_executable(fake_xc2_sidecar
+        tests/ktm/fake_xc2_sidecar.cpp
+    )
+    target_link_libraries(fake_xc2_sidecar PRIVATE
+        Qt6::Core
+        Qt6::Network
+    )
+
+    add_executable(xc2_manager_exit_helper
+        tests/ktm/xc2_manager_exit_helper.cpp
+    )
+    target_compile_definitions(xc2_manager_exit_helper PRIVATE
+        FAKE_XC2_SIDECAR_PATH="$<TARGET_FILE:fake_xc2_sidecar>"
+    )
+    target_link_libraries(xc2_manager_exit_helper PRIVATE
+        rx14_ktm_xc2
+        Qt6::Network
+    )
+    add_dependencies(xc2_manager_exit_helper fake_xc2_sidecar)
+
+    add_executable(test_Xc2BackendManager
+        tests/ktm/test_Xc2BackendManager.cpp
+    )
+    target_compile_definitions(test_Xc2BackendManager PRIVATE
+        FAKE_XC2_SIDECAR_PATH="$<TARGET_FILE:fake_xc2_sidecar>"
+        XC2_MANAGER_EXIT_HELPER_PATH="$<TARGET_FILE:xc2_manager_exit_helper>"
+    )
+    target_link_libraries(test_Xc2BackendManager PRIVATE
+        rx14_ktm_xc2
+        Qt6::Network
+        Qt6::Test
+        Iphlpapi
+        Ws2_32
+    )
+    add_dependencies(test_Xc2BackendManager
+        fake_xc2_sidecar
+        xc2_manager_exit_helper
+    )
+    add_test(NAME xc2_backend_manager COMMAND test_Xc2BackendManager)
+    set_tests_properties(xc2_backend_manager PROPERTIES
+        LABELS "integration;loopback;ktm"
+        TIMEOUT 180
+    )
 endif()
 
 # ── Map auto-detect corpus harness (issue #25) ─────────────────────────────
