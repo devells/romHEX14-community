@@ -171,9 +171,41 @@ stale locks on the next application start.
 
 ### 6.2 `Xc2RestClient`
 
-`Xc2RestClient` wraps `QNetworkAccessManager`, a dedicated cookie jar, JSON
-serialization, and typed asynchronous results. Its public surface is grouped by
-domain rather than exposing arbitrary URL strings:
+`Xc2RestClient` deliberately does not use `QNetworkAccessManager`. Qt 6.8's
+private HTTP channel can reconnect up to twice and a live close-before-status
+fake proved that it transparently resends a complete GET or POST; Qt exposes no
+public no-retry switch. Each XC2 operation therefore creates one fresh
+`QTcpSocket`, sets `QNetworkProxy::NoProxy`, connects to one canonical numeric
+loopback `QHostAddress`, writes one HTTP/1.1 request, and never reconnects,
+retries, redirects, reuses a connection, or resends request bytes.
+
+The base configuration boundary accepts the original visible-ASCII URL bytes,
+not a caller-constructed `QUrl`. This is required because `QUrl` irreversibly
+canonicalizes `127.1` and integer/octal IPv4 aliases to `127.0.0.1` and decodes
+unreserved escapes such as `%78` and `%2e`. The client strictly parses the raw
+scheme, authority, canonical explicit port, and exact `/xc2/1.0[/]` path before
+constructing internal canonical REST and WebSocket URLs. A rebase is rejected
+while any socket is pending; a successful cross-authority rebase clears the
+dedicated cookie jar. Cookie export accepts encoded bytes only when they equal
+the derived WebSocket URL's fully encoded bytes exactly.
+
+Requests carry an explicit-port `Host` header with IPv6 brackets when needed,
+`Connection: close`, `Accept-Encoding: identity`, and manually selected REST
+cookies. The client owns a dedicated `QNetworkCookieJar` and manually installs
+every separate `Set-Cookie` only after a syntactically complete response, then
+uses the same jar for later REST Cookie headers and WebSocket export.
+
+An incremental bounded HTTP/1.1 parser handles fragmented headers,
+`Content-Length`, chunked bodies plus trailers, 204/no-body, and
+close-delimited bodies. It rejects ambiguous `Transfer-Encoding` plus
+`Content-Length`, malformed or truncated chunks, invalid framing, headers or
+trailers above 64 KiB, and decoded bodies above 8 MiB. Independent total and
+inactivity timers, caller abort, socket events, and parser failures converge on
+one socket-pending `completeOnce` gate, so every request emits exactly one typed
+asynchronous result.
+
+The public surface is grouped by domain rather than exposing arbitrary request
+URLs:
 
 - Service/session: health, current user, settings, shutdown.
 - VCI: lookup, available devices, selected device, selection.
@@ -184,7 +216,9 @@ domain rather than exposing arbitrary URL strings:
 
 Every response is validated before conversion to a C++ model. A successful HTTP
 status with missing required fields is a contract error. State-changing calls
-have an idempotency classification and are never automatically repeated.
+have an idempotency classification and are never automatically repeated; the
+Task 5 foundation transport itself automatically repeats no request of any
+class.
 
 ### 6.3 `Xc2StompClient`
 

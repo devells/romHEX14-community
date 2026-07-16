@@ -908,7 +908,24 @@ rtk git commit -m "feat: validate external XC2 installation"
 - Consumes: Task 1 endpoint specs and Task 2 strict codecs/models.
 - Produces: `Xc2TransportReason`, `Xc2RequestId`,
   `Xc2RestClient::requestServiceStatus/requestCurrentUser/requestShutdown`,
-  reply signals, authority-bound `webSocketUrl`/`cookieHeaderFor`, and `abort`.
+  reply signals, raw-byte `setBaseUrl`, authority-bound
+  `webSocketUrl`/`cookieHeaderFor`, and `abort`.
+
+**Evidence-locked transport constraints:**
+
+- In Qt 6.8, constructing a `QUrl` irreversibly canonicalizes IPv4 aliases such
+  as `127.1`, integer, and octal forms to `127.0.0.1`, and decodes unreserved
+  path escapes such as `%78` and `%2e`. Therefore the trust-boundary input is
+  `QByteArray`, and validation happens on the original visible-ASCII bytes
+  before any `QUrl` is constructed.
+- A live fake against Qt's private `QNetworkAccessManager` HTTP channel proved
+  that one close-before-status can transparently replay the complete GET or
+  POST request. The private channel permits up to two reconnects and has no
+  public no-retry switch. Manual redirect policy does not remove that replay.
+- Consequently this client never uses `QNetworkAccessManager`. Every operation
+  gets one fresh `QTcpSocket`, explicit `QNetworkProxy::NoProxy`, one numeric
+  loopback destination, one HTTP/1.1 request, and no reconnect, retry, or
+  connection reuse.
 
 - [ ] **Step 1: Write a complete loopback fake server before the client**
 
@@ -919,14 +936,19 @@ increments `requestCount()` exactly once only after the complete body has been
 received. Each capture exposes the exact method, request-target, headers, and
 body. Normal queued responses always include an exact `Content-Length` and
 `Connection: close`; special scripted responses support close-before-status,
-declared-length truncation, drip bytes without completion, no bytes, and a
-redirect `Location`. A trap server independently counts requests so redirect
-tests prove that it was never contacted.
+declared-length truncation, drip bytes without completion, no bytes, delayed
+completion, arbitrary raw responses, and raw responses fragmented at any byte
+boundary. Raw scripts cover fragmented headers, chunked bodies and trailers,
+204/no-body, close-delimited bodies, malformed framing, and repeated
+`Set-Cookie`. A redirect script supplies `Location`. A trap server independently
+counts requests so redirect tests prove that it was never contacted.
 
 The server must let a test wait for `requestCaptured` before calling `abort()`;
 do not use a timing guess that can cancel before the request reaches the wire.
+Expose enough connection/request counts to prove that a close-before-status
+response caused exactly one captured GET or POST and no hidden reconnect.
 
-- [ ] **Step 2: Write failing URL, request-target, redirect, and cookie tests**
+- [ ] **Step 2: Write failing raw-URL, rebase, and cookie-authority tests**
 
 Add these data-driven cases to `test_Xc2RestClient.cpp`:
 
@@ -935,11 +957,9 @@ void acceptsIpv4Ipv6AndLocalhostBases_data();
 void acceptsIpv4Ipv6AndLocalhostBases();
 void rejectsUnsafeOrAliasedBases_data();
 void rejectsUnsafeOrAliasedBases();
-void sendsExactRequestTargets();
-void ownedManagerBypassesApplicationProxy();
-void get302DoesNotFollowRedirect();
-void shutdown307DoesNotFollowRedirect();
 void cookieExportRequiresDerivedWebSocketAuthority();
+void successfulCrossAuthorityRebaseClearsCookieJar();
+void rebaseWhilePendingFailsAndPreservesAuthorityAndCookies();
 ```
 
 The accepted table contains all of these forms, with and without the one
@@ -952,44 +972,118 @@ http://[::1]:<port>/xc2/1.0
 http://LOCALHOST:<port>/xc2/1.0/
 ```
 
-The rejected table contains a relative URL, `https` and `ws`, a missing or zero
-port, user info, query, fragment, `localhost.`, `foo.localhost`,
-`localhost.localdomain`, `127.1`, integer/octal IPv4 aliases, a non-loopback
-numeric IPv4/IPv6 address, `/xc2/1.0//`, a case-changed path, an extra segment,
-a dot segment, and percent-encoded path variants. Validation performs no DNS
-lookup. It accepts only an absolute `http` URL with an explicit port in
-`1..65535`, no user info/query/fragment, and a fully encoded path exactly equal
-to `/xc2/1.0` or `/xc2/1.0/`. The host is either case-insensitive exact
-`localhost` or a numeric address parsed by `QHostAddress` and proven loopback;
-host aliases are never resolved. Store the context without a trailing slash.
+Call `setBaseUrl()` with the original `QByteArray`; the test must not construct a
+`QUrl` first. The rejected table contains empty/relative input, bytes outside
+visible ASCII `0x21..0x7e`, `https` and `ws`, a missing, zero, signed,
+leading-zero, or overflowing port, user info, query, fragment, `localhost.`,
+`foo.localhost`, `localhost.localdomain`, `127.1`, integer and octal IPv4
+aliases, non-canonical bracket/IPv6 spellings, a non-loopback numeric IPv4/IPv6
+address, `/xc2/1.0//`, a case-changed path, an extra segment, a literal dot
+segment, and every percent-encoded path spelling, including unreserved `%78`
+and `%2e` variants. Include regression rows proving that passing those aliases
+through `QUrl` first would have hidden the distinction.
 
-For every endpoint construct the URL as the validated authority plus exactly
-`restContext() + '/' + EndpointSpec::path`; never call `QUrl::resolved()`.
-Assert captured targets are exactly
-`/xc2/1.0/serviceStatus/status`, `/xc2/1.0/auth/currentUser`, and
-`/xc2/1.0/serviceStatus/shutdown`, with no doubled slash or inherited suffix.
-
-Every request sets `QNetworkRequest::RedirectPolicyAttribute` to
-`QNetworkRequest::ManualRedirectPolicy`. Queue a GET `302` and shutdown POST
-`307`, each pointing at the trap server. Both operations must fail, the origin
-must record one request, and the trap must record zero requests after the full
-deadline. There is no automatic retry.
+Validation performs no DNS lookup. Parse scheme, authority, explicit canonical
+decimal port, and path directly from the raw bytes. Accept only `http`, port
+`1..65535`, no user info/query/fragment, and a raw path byte-for-byte equal to
+`/xc2/1.0` or `/xc2/1.0/`. The host is either case-insensitive exact
+`localhost` or a numeric address whose input spelling is canonical and whose
+parsed `QHostAddress` is loopback; never resolve a hostname alias. Only after
+these checks may the implementation construct canonical internal `QUrl`
+values. Canonicalize `localhost` to numeric IPv4 loopback and store the REST
+context without a trailing slash.
 
 The cookie test returns a synthetic session cookie, then accepts export only
 for the one URL derived from the REST base:
 `ws://<same validated host>:<same explicit port>/xc2-websocket`. The supplied
-WebSocket URL must be absolute `ws`, have no user info/query/fragment, match the
-validated REST host and explicit port, and have the exact case-sensitive path
-`/xc2-websocket`. Canonicalize the validated REST host once, derive
-`webSocketUrl()` from it, and require the supplied URL to equal that canonical
-result rather than resolving another spelling. Reject wrong/missing port, host
-alias, `wss`, path suffix, and query before calling
-`QNetworkCookieJar::cookiesForUrl()`; this explicit port check is mandatory
-because cookie matching itself is not port-scoped. Join only the dedicated
-jar's returned cookies with
+argument is also a `QByteArray` and must equal
+`webSocketUrl().toEncoded(QUrl::FullyEncoded)` byte-for-byte before cookie
+matching. Reject wrong/missing port, host aliases, alternate case or encoding,
+`wss`, path suffix, query, and every semantically equivalent but non-identical
+spelling. This exact comparison is mandatory because cookie matching itself is
+not port-scoped. Join only the dedicated jar's returned cookies with
 `QNetworkCookie::NameAndValueOnly`.
 
-- [ ] **Step 3: Write failing deadline, exactly-once, and response-matrix tests**
+Once any request is pending, every `setBaseUrl()` call fails with `Contract` and
+leaves `baseUrl()`, `webSocketUrl()`, and all cookies unchanged. A successful
+change to another canonical authority replaces the dedicated cookie jar before
+the new authority becomes usable, so neither REST nor WebSocket export can
+inherit cookies from the old authority.
+
+- [ ] **Step 3: Write failing exact-wire, no-retry, and redirect tests**
+
+Add these cases:
+
+```cpp
+void sendsExactRequestTargetsAndHeaders();
+void freshSocketBypassesApplicationProxy();
+void closeBeforeStatusSendsOneRequestOnly_data();
+void closeBeforeStatusSendsOneRequestOnly();
+void restCookieContinuesAcrossRequests();
+void get302DoesNotFollowRedirect();
+void shutdown307DoesNotFollowRedirect();
+```
+
+For every endpoint build the request target as exactly
+`restContext() + '/' + EndpointSpec::path`; never call `QUrl::resolved()`.
+Assert targets are `/xc2/1.0/serviceStatus/status`,
+`/xc2/1.0/auth/currentUser`, and `/xc2/1.0/serviceStatus/shutdown`, without a
+doubled slash or inherited suffix. Every request carries `Host` with the
+explicit port and IPv6 brackets when applicable, `Connection: close`, and
+`Accept-Encoding: identity`. A shutdown is one `POST` with
+`Content-Type: application/x-www-form-urlencoded`, `Content-Length: 0`, and an
+empty body. A cookie established by one complete REST response is sent as
+`Cookie` on the next matching REST request.
+
+Temporarily install a trap application proxy and prove the fresh socket still
+connects directly to numeric loopback. For both a GET and the shutdown POST,
+have the origin capture the complete request and then close before any status
+line. Wait beyond the request deadline and require exactly one request and one
+connection: neither operation may be transparently replayed.
+
+Queue a GET `302` and shutdown POST `307`, each pointing at an independent trap
+server. The client has no redirect-following code: both operations fail, each
+origin records exactly one request, and each trap remains at zero through the
+full deadline.
+
+- [ ] **Step 4: Write failing strict HTTP/1.1 parser and cookie-ingest tests**
+
+Add parser rows for:
+
+```cpp
+void fragmentedHttpResponses_data();
+void fragmentedHttpResponses();
+void fragmentedChunkedResponseExportsMultipleCookies();
+void malformedOrTruncatedChunkedIsTransportFailure_data();
+void malformedOrTruncatedChunkedIsTransportFailure();
+void acceptsCloseDelimitedResponse();
+void rejectsAmbiguousOrOversizedResponses_data();
+void rejectsAmbiguousOrOversizedResponses();
+```
+
+Fragment the status line, each header delimiter, body, chunk-size lines, chunk
+terminators, zero chunk, and trailers across arbitrary socket reads. Require a
+strict incremental parser for `Content-Length`, `Transfer-Encoding: chunked`
+with syntactically valid trailers, 204/no-body, and EOF-terminated
+close-delimited responses. A complete chunked response can deliver multiple
+separate `Set-Cookie` headers; all are parsed and installed in the dedicated
+jar, and their REST/WS export is deterministic.
+
+Reject duplicate or invalid lengths, any `Transfer-Encoding` plus
+`Content-Length`, unsupported transfer codings, malformed status/header/trailer
+syntax, an invalid/overflowing chunk size, a malformed chunk terminator, bytes
+after the terminating trailers, and EOF in any incomplete fixed-length or
+chunked state. Cap the status/headers, each chunk line, and trailers at 64 KiB;
+cap the decoded body at 8 MiB for every framing mode. A declared or accumulated
+body above 8 MiB fails before unbounded buffering. A 204 carrying forbidden
+body framing or bytes fails.
+
+Only a syntactically complete response may mutate the cookie jar. Iterate every
+`Set-Cookie` field separately, parse it with `QNetworkCookie`, and install it
+against the canonical endpoint URL. A timeout, cancel, truncation, malformed
+response, or over-limit response installs no cookies.
+
+- [ ] **Step 5: Write failing deadline, exactly-once, and response-matrix tests**
 
 Add these cases:
 
@@ -998,6 +1092,7 @@ void totalDeadlineStopsDripAndNeverResponses_data();
 void totalDeadlineStopsDripAndNeverResponses();
 void abortAfterCaptureCompletesCanceledExactlyOnce();
 void timeoutAndFinishedRaceCompletesExactlyOnce();
+void deletingClientInsideFinishedSlotIsSafeAndExactlyOnce();
 void classifiesCompleteResponseMatrix_data();
 void classifiesCompleteResponseMatrix();
 void shutdownIsOneExactEmptyFormPost();
@@ -1007,9 +1102,13 @@ Use short injected test deadlines and `QElapsedTimer`. One server sends a byte
 often enough to stay below the transfer inactivity timeout but never completes;
 another accepts the request and never sends a byte. Each must finish once near
 the independent total wall-clock deadline, not remain alive indefinitely.
+The inactivity timer starts with the request and restarts only when response
+bytes arrive; the total timer never restarts and remains authoritative.
 After `requestCaptured`, `abort(id)` must produce exactly one result with
-`Transport/Canceled`. Exercise timeout and `finished` in the same event-loop
-turn and assert one terminal signal and removal of the pending request.
+`Transport/Canceled`. Exercise timeout, socket error/disconnect, parser failure,
+and abort in the same event-loop turn and assert one terminal signal and removal
+of the pending request. Deleting the client from that signal must not access a
+freed pending record or emit again.
 
 The data-driven response matrix is exact:
 
@@ -1025,15 +1124,14 @@ The data-driven response matrix is exact:
 | a malformed success payload or malformed non-2xx error | `Contract`, preserving any HTTP status and raw bytes |
 | any 3xx | failure and no redirect; valid XC2 error JSON is classified `Backend` |
 
-Transport/truncation takes precedence over the HTTP/body matrix. Cancellation
-and timeout take precedence over a network error produced by `abort()`. The
-shutdown capture must be exactly one `POST` with request-target
-`/xc2/1.0/serviceStatus/shutdown`, content type
-`application/x-www-form-urlencoded`, `Content-Length: 0`, an empty body, and no
-retry. Close without a response and wait beyond the request deadline to prove
+Framing/protocol failure and truncation are `Transport/Network` and take
+precedence over the HTTP/body matrix while preserving any parsed status and raw
+payload. Cancellation and timeout take precedence over the socket error caused
+by `abort()`. The shutdown capture repeats the Step 3 exact-wire assertions;
+close without a response and wait beyond the deadline to prove
 `requestCount() == 1`.
 
-- [ ] **Step 4: Run the REST target to verify red behavior**
+- [ ] **Step 6: Run the REST target to verify red behavior**
 
 ```powershell
 rtk cmake --build build-test --target test_Xc2RestClient --parallel
@@ -1041,7 +1139,7 @@ rtk cmake --build build-test --target test_Xc2RestClient --parallel
 
 Expected: missing-client compile failure.
 
-- [ ] **Step 5: Implement the owned transport and domain interface**
+- [ ] **Step 7: Implement the raw-byte authority and domain interface**
 
 ```cpp
 enum class Xc2TransportReason { None, Canceled, Timeout, Network };
@@ -1058,14 +1156,16 @@ class Xc2RestClient final : public QObject {
 public:
     explicit Xc2RestClient(Xc2RestClientOptions options = {},
                            QObject *parent = nullptr);
-    bool setBaseUrl(const QUrl &loopbackRestBase, Xc2Error *error = nullptr);
+    bool setBaseUrl(const QByteArray &encodedLoopbackRestBase,
+                    Xc2Error *error = nullptr);
     QUrl baseUrl() const;
     QUrl webSocketUrl() const;
 
     Xc2RequestId requestServiceStatus();
     Xc2RequestId requestCurrentUser();
     Xc2RequestId requestShutdown();
-    Xc2Result<QByteArray> cookieHeaderFor(const QUrl &url) const;
+    Xc2Result<QByteArray> cookieHeaderFor(
+        const QByteArray &encodedWsUrl) const;
     void abort(Xc2RequestId id);
 
 signals:
@@ -1082,44 +1182,53 @@ Declare `Xc2TransportReason` immediately before the existing `Xc2Error` in
 `Xc2TransportReason transportReason = Xc2TransportReason::None;` into
 `Xc2Error`; no localized message parsing may substitute for this field.
 
-The client always creates and owns its own `QNetworkAccessManager` and its own
-`QNetworkCookieJar`; there is no constructor or setter for an external manager
-or jar. Set the manager proxy explicitly to `QNetworkProxy::NoProxy` so system,
-application, or injected proxy state cannot weaken the loopback/redirect/cookie
-guarantees. The proxy test temporarily installs a trap application proxy and
-proves the request still goes directly to the loopback fake.
+Implement the raw validation and rebase transaction from Step 2 before creating
+the canonical internal `QUrl` values. The client owns one dedicated
+`QNetworkCookieJar`; there is no constructor or setter for an external jar. It
+uses the jar manually for matching REST request cookies, installing every
+complete-response `Set-Cookie`, and exporting the exact derived WebSocket
+Cookie. It does not own or instantiate a `QNetworkAccessManager`.
 
-- [ ] **Step 6: Implement one pending record and one completion path**
+- [ ] **Step 8: Implement one-shot sockets, the incremental parser, and one completion path**
 
-Create one pending record per request containing ID, endpoint, reply pointer,
-deadline timer, forced transport reason, and a completed flag. A single private
-`completeOnce(id)` reads/classifies the finished reply, stops the timer, removes
-the record, emits the endpoint's terminal signal, and calls `deleteLater()`.
-Only `QNetworkReply::finished` may call `completeOnce`; `errorOccurred` merely
-records evidence. `abort(id)` sets `Canceled` and calls `reply->abort()`.
-Deadline expiry sets `Timeout` and calls `reply->abort()`. Neither path emits or
-deletes directly, so abort/error/finished races cannot double-complete.
+Create one pending record per request containing the ID, endpoint, fresh
+`QTcpSocket`, request bytes, total and inactivity timers, forced transport
+reason, incremental parser/framing state, accumulated bounded payload, and a
+completed flag. Set `QNetworkProxy::NoProxy` on the socket and call
+`connectToHost(QHostAddress(canonicalHost), explicitPort)` so no DNS or proxy
+path exists. Serialize one HTTP/1.1 request with the exact Step 3 target and
+headers. Never create a replacement socket, reconnect, reuse a connection, or
+resend bytes after any close or error.
 
-Start a per-request single-shot wall-clock timer from request creation and also
-set Qt's transfer timeout as an inactivity backstop. The total timer is the
-authority even when bytes continue to arrive. A non-forced network failure maps
-to `Xc2ErrorCategory::Transport` plus `Xc2TransportReason::Network`; successful
-HTTP/body classifications retain `None`. Apply the response matrix from Step 3
-without treating a present HTTP status as proof that a truncated transfer was
-complete.
+Feed `readyRead` bytes into the strict Step 4 state machine. A fixed-length or
+chunked response completes only at its exact terminator; a close-delimited
+response completes only at EOF. A status line alone never proves transfer
+completion. When a complete message is available, stop using the socket and
+classify it once through the Step 5 response matrix.
 
-- [ ] **Step 7: Run REST and contract tests**
+All socket, parser, timer, and caller-cancel paths converge on one private
+`completeOnce(id)` gate. `abort(id)` records `Canceled`, deadline expiry records
+`Timeout`, and both abort the socket and schedule that gate; socket errors and
+disconnects only record evidence and schedule the same gate. The gate stops
+timers, removes the pending record before any terminal signal, cleans up the
+socket/state, and emits exactly once. A non-forced incomplete or malformed
+transfer maps to `Transport/Network`; successful HTTP/body classifications
+retain `Xc2TransportReason::None`.
+
+- [ ] **Step 9: Run REST and contract tests**
 
 ```powershell
 rtk cmake --build build-test --target test_Xc2RestClient --parallel
 rtk ctest --test-dir build-test --output-on-failure -L ktm
 ```
 
-Expected: all matrix, strict-URL, redirect-trap, cookie-authority, deadline, and
-exactly-once tests pass; shutdown is one exact request and both redirect traps
-remain at zero requests.
+Expected: raw-URL/rebase, exact wire/Host headers, one-request GET/POST,
+redirect traps, manual cookie continuity/export, fragmented framing, parser
+limits, response matrix, deadline, and exactly-once tests all pass. No test or
+production path instantiates `QNetworkAccessManager`; shutdown is one exact
+request and both redirect traps remain at zero.
 
-- [ ] **Step 8: Commit the REST client**
+- [ ] **Step 10: Commit the REST client**
 
 ```powershell
 rtk git add CMakeLists.txt src/ktm/xc2/Xc2Models.h src/ktm/xc2/Xc2RestClient.* tests/ktm/FakeHttpServer.* tests/ktm/test_Xc2RestClient.cpp
@@ -1724,13 +1833,14 @@ void connectIsSingleFlightAndStaleGenerationSignalsAreIgnored();
 ```
 
 The Task 5 integration test first obtains a synthetic session cookie from the
-loopback HTTP fake. The STOMP client must open exactly
-`restClient.webSocketUrl()` and send exactly the successful
-`restClient.cookieHeaderFor(restClient.webSocketUrl())` result. There is no
-public API that accepts an arbitrary WebSocket URL and Cookie pair. Temporarily
-install an application proxy whose trap listener counts connections and prove
-the WebSocket still connects directly. A raw origin returning `302` to a second
-loopback port must fail without contacting the trap or replaying Cookie.
+loopback HTTP fake. Name that configured instance `rest`. The STOMP client must
+open exactly `rest.webSocketUrl()` and send exactly the successful
+`rest.cookieHeaderFor(rest.webSocketUrl().toEncoded(QUrl::FullyEncoded))`
+result. There is no public API that accepts an arbitrary WebSocket URL and
+Cookie pair. Temporarily install an application proxy whose trap listener counts
+connections and prove the WebSocket still connects directly. A raw origin
+returning `302` to a second loopback port must fail without contacting the trap
+or replaying Cookie.
 
 The positive server selects `v12.stomp`. Negative rows select no subprotocol or
 a different subprotocol and assert that no STOMP CONNECT is sent. A successful
@@ -1889,7 +1999,7 @@ class Xc2StompClient final : public QObject {
 public:
     explicit Xc2StompClient(Xc2StompClientOptions options = {},
                             QObject *parent = nullptr);
-    bool connectToBackend(const Xc2RestClient &restClient,
+    bool connectToBackend(const Xc2RestClient &rest,
                           Xc2Error *error = nullptr);
     bool subscribe(Topic topic, Xc2Error *error = nullptr);
     bool unsubscribe(Topic topic, Xc2Error *error = nullptr);
@@ -1912,12 +2022,13 @@ signals:
 
 - [ ] **Step 6: Implement authority-bound handshake and one connection generation**
 
-`connectToBackend` accepts only a configured `Xc2RestClient`. In the same call,
-copy its canonical `webSocketUrl()` and request
-`cookieHeaderFor(webSocketUrl())`; a failed cookie result fails synchronously
-without creating a socket. There is no overload accepting caller-provided URL
-or Cookie bytes. This preserves the Task 5 guarantee that REST and WebSocket use
-the same validated host and explicit port.
+`connectToBackend` accepts only a configured `Xc2RestClient` named `rest`. In
+the same call, copy its canonical `rest.webSocketUrl()` and request
+`rest.cookieHeaderFor(rest.webSocketUrl().toEncoded(QUrl::FullyEncoded))`; a
+failed cookie result fails synchronously without creating a socket. There is no
+overload accepting caller-provided URL or Cookie bytes. This preserves the Task
+5 guarantee that REST and WebSocket use the same validated host and explicit
+port while satisfying its byte-for-byte encoded-URL export gate.
 
 Create a fresh `QWebSocket` for each accepted call. Set its proxy to
 `QNetworkProxy::NoProxy` before opening it. Build `QNetworkRequest` from only the
@@ -2307,15 +2418,19 @@ Require exactly one `--base-url <raw-string>`, allow at most one
 `--timeout-ms <100..120000>` with default `30000`, reject all positional,
 duplicate, unknown, empty, overflow, and malformed values with exit 2 and zero
 network. `--help` is the conventional informational exit 0 with zero network and
-does not represent a compatibility result. Pass the raw base string to the Task
-5 strict loopback validator without prior URL normalization.
+does not represent a compatibility result. Preserve the `--base-url` value as
+`rawBaseUrlBytes`: first require every original command-line code unit to be
+visible ASCII, then convert those ASCII code units byte-for-byte to
+`QByteArray`. Do not trim, case-fold, percent-decode, parse, reconstruct, or
+otherwise normalize it, and never construct a `QUrl` from it. Call Task 5 as
+`restClient.setBaseUrl(rawBaseUrlBytes, &error)` with those exact bytes.
 
 After validation, start one `QDeadlineTimer`/single-shot wall-clock authority and
 run this asynchronous state sequence without nested event loops or blocking
 waits:
 
 1. `requestServiceStatus()` and require strict `alive`.
-2. `requestCurrentUser()` on the same owned manager/cookie jar.
+2. `requestCurrentUser()` on the same REST client and dedicated cookie jar.
 3. Require non-blank `loginName` and `name`, then exact `EcuDiagnosticRead`
    permission. Blank identity is a REST contract failure, not an authenticated
    permission failure.
