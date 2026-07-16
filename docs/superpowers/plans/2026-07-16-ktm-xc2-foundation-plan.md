@@ -16,6 +16,7 @@
 - The feature must not start or embed `XC2.exe` or use Qt WebEngine.
 - The approved initial backend SHA-256 is `B64A38C47F74D02145F462CDDA16EEA421A2170146155602575A1BD8B7E62840`.
 - The approved initial D-PDU provider SHA-256 is `3F790B47D3F968FE2E757F309BFFDC0448C2FCE8A488DFA7C00F1FEDCB2A3075`.
+- The only selectable D-PDU API is the root-file entry whose short name is `AVL Ditest VCI2K_DPDU_API`; other discovered interfaces are rejected before `device/apply`.
 - The sidecar binds only to `127.0.0.1` on a manager-selected port and arbitrary pre-existing services on port 8082 are never reused.
 - Health/read operations may be retried only by their owning controller; state-changing requests have zero automatic retries.
 - External XC2 JARs, vendor DLLs, credentials, dealer data, and firmware are never committed to this repository.
@@ -100,6 +101,18 @@ private slots:
                 QCOMPARE(spec.maxAutomaticRetries, 0);
         }
     }
+
+    void deviceSelectionIsRestrictedToAvlVci2k()
+    {
+        const auto &p = Xc2ContractProfile::approved();
+        QCOMPARE(p.supportedPduApiShortName(),
+                 QStringLiteral("AVL Ditest VCI2K_DPDU_API"));
+        const EndpointSpec apply = p.endpoint(Endpoint::DeviceApply);
+        QCOMPARE(apply.path, QStringLiteral("device/apply"));
+        QCOMPARE(apply.method, HttpMethod::PostJson);
+        QCOMPARE(apply.semantics, OperationSemantics::StateChanging);
+        QCOMPARE(apply.maxAutomaticRetries, 0);
+    }
 };
 
 QTEST_APPLESS_MAIN(Xc2ContractProfileTest)
@@ -125,12 +138,16 @@ if(RX14_KTM_XC2)
     find_package(Qt6 6.5 REQUIRED COMPONENTS WebSockets)
 endif()
 
-if(BUILD_TESTING)
+if(BUILD_TESTING AND RX14_KTM_XC2)
     find_package(Qt6 6.5 REQUIRED COMPONENTS Test)
 endif()
 ```
 
-Register the test with `add_test(NAME xc2_contract_profile COMMAND test_Xc2ContractProfile)` and labels `unit;ktm`.
+Create and register KTM test targets only inside
+`if(BUILD_TESTING AND RX14_KTM_XC2)`. Register this test with
+`add_test(NAME xc2_contract_profile COMMAND test_Xc2ContractProfile)` and
+labels `unit;ktm`. A non-Windows build with `RX14_KTM_XC2=OFF` must not search
+for either Qt Test or Qt WebSockets.
 
 - [ ] **Step 2: Configure/build to verify the test is red**
 
@@ -161,7 +178,8 @@ enum class HttpMethod { Get, PostJson, PostForm, Delete };
 
 enum class Endpoint {
     ServiceStatus, Shutdown, CurrentUser, Login, Logout,
-    DeviceLookup, DeviceGet, DeviceGetSelected, SettingsGet, SettingsSet,
+    DeviceLookup, DeviceGet, DeviceGetSelected, DeviceApply, DeviceClose,
+    SettingsGet, SettingsSet,
     VehicleDetect, VehicleSelect, VehicleInfo, AutoScan,
     EcuDomains, EcuOpen, EcuClose, EcuScan, EcuClearDtc,
     EcuFunctions, EcuMeasurementsGet, EcuMeasurementsStart,
@@ -192,6 +210,7 @@ public:
     QString profileId() const;
     QString restContext() const;
     QString webSocketPath() const;
+    QString supportedPduApiShortName() const;
     EndpointSpec endpoint(Endpoint endpoint) const;
     QString topic(Topic topic) const;
 
@@ -203,6 +222,13 @@ private:
 ```
 
 Implement every enum value with the observed XC2 path/topic. Dynamic paths use named templates such as `ecu/open/{ecuId}`; later clients replace only declared placeholders after percent-encoding. Classify discovery/jobs, selection, clear, flow, and flash endpoints as `StateChanging` with zero retries. `ServiceStatus`, `CurrentUser`, settings reads, vehicle info, ECU-domain/function reads, and measurement-definition reads are `ReadOnly`; keep their profile retry value zero because retry policy belongs to the caller.
+
+Use the observed device routes exactly: `device/lookup` (GET), `device/get`
+(GET), `device/getSelected` (GET), `device/apply` (JSON POST), and
+`device/close` (JSON POST). Device apply/close are state-changing. Later device
+filtering and apply code must compare the selected candidate's D-PDU API short
+name to `supportedPduApiShortName()` before issuing `device/apply`; do not expose
+an arbitrary provider override.
 
 - [ ] **Step 4: Build and run the profile test**
 
@@ -346,8 +372,7 @@ struct Xc2CurrentUser {
 struct Xc2JobAccepted { QString jobId; };
 
 enum class Xc2JobState {
-    Created, InProgress, Finished, Canceled, Error,
-    NotAuthorized, VisibilityLost
+    Created, InProgress, Finished, Canceled, Error, NotAuthorized
 };
 
 struct Xc2JobProgress {
@@ -709,7 +734,7 @@ timeout for health/session reads. The client performs no automatic retry.
 - [ ] **Step 4: Implement strict reply handling and cookie export**
 
 Treat any 2xx as HTTP success, then apply the endpoint codec. A malformed body
-becomes `ContractError`; network failure with no HTTP status becomes
+becomes `Xc2ErrorCategory::Contract`; network failure with no HTTP status becomes
 `Transport`; a JSON XC2 error preserves status/code/raw body. Build the Cookie
 header by joining `QNetworkCookie::toRawForm(QNetworkCookie::NameAndValueOnly)`
 for the WebSocket URL.
@@ -998,7 +1023,7 @@ void acceptedJobStartsCreated();
 void progressTransitionsCreatedToInProgressToFinished();
 void terminalJobRejectsFurtherProgress();
 void unknownJobIsCreatedFromProgressWithoutLosingEvent();
-void visibilityLossDoesNotPretendFailureOrSuccess();
+void visibilityLossPreservesStateAndLaterProgressRecovers();
 void clearRemovesOnlyRequestedTerminalJob();
 ```
 
@@ -1017,6 +1042,7 @@ struct Xc2JobRecord {
     QString jobId;
     Xc2JobState state = Xc2JobState::Created;
     QList<Xc2JobProgress> events;
+    bool visibilityLost = false;
     bool terminal() const;
 };
 
@@ -1037,10 +1063,14 @@ signals:
 };
 ```
 
-Allowed transitions are `Created -> InProgress -> terminal`, direct
-`Created -> terminal`, and non-terminal `Created/InProgress -> VisibilityLost`.
+Allowed backend-state transitions are `Created -> InProgress -> terminal` and
+direct `Created -> terminal`. `markVisibilityLost()` sets the independent
+`visibilityLost` flag on non-terminal records without changing their last known
+backend state. The next accepted authoritative progress event for the same
+`jobId` clears that flag and may continue to `InProgress` or a terminal state.
 No event can change Finished/Canceled/Error/NotAuthorized to another state.
-Keep every accepted ordered progress event.
+Keep every accepted ordered progress event and test loss followed by recovered
+progress and completion.
 
 - [ ] **Step 4: Add the read-only contract probe**
 
@@ -1084,8 +1114,8 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-Expected: romHEX14 builds without Qt WebSockets and no KTM target/action is
-present.
+Expected: romHEX14 builds without searching for Qt WebSockets or Qt Test, and
+no KTM target/action is present.
 
 - [ ] **Step 7: Mark every completed checkbox and self-review the implementation**
 
