@@ -78,6 +78,8 @@ if(RX14_KTM_XC2)
         src/ktm/xc2/Xc2RestClient.h
         src/ktm/xc2/Xc2StompCodec.cpp
         src/ktm/xc2/Xc2StompCodec.h
+        src/ktm/xc2/internal/Xc2ProcessOutput.cpp
+        src/ktm/xc2/internal/Xc2ProcessOutput.h
         src/ktm/xc2/Xc2Settings.cpp
         src/ktm/xc2/Xc2Settings.h
         src/ktm/xc2/Xc2InstallationProbe.cpp
@@ -620,6 +622,19 @@ if(BUILD_TESTING AND RX14_KTM_XC2)
         LABELS "loopback;unit;ktm"
         TIMEOUT 60
     )
+
+    add_executable(test_Xc2ProcessOutput
+        src/ktm/xc2/internal/Xc2ProcessOutput.cpp
+        src/ktm/xc2/internal/Xc2ProcessOutput.h
+        tests/ktm/test_Xc2ProcessOutput.cpp
+    )
+    target_include_directories(test_Xc2ProcessOutput PRIVATE src)
+    target_link_libraries(test_Xc2ProcessOutput PRIVATE
+        Qt6::Core
+        Qt6::Test
+    )
+    add_test(NAME xc2_process_output COMMAND test_Xc2ProcessOutput)
+    set_tests_properties(xc2_process_output PROPERTIES LABELS "unit;ktm")
 endif()
 
 # ── Map auto-detect corpus harness (issue #25) ─────────────────────────────
