@@ -37,6 +37,7 @@ jobs:
           target: 'desktop'
           arch: 'win64_mingw'
           tools: 'tools_mingw1310'
+          modules: 'qtwebsockets'
       - name: Configure
         shell: bash
         run: |
@@ -50,9 +51,11 @@ jobs:
             ls "$IQTA_TOOLS/" || true
           fi
       - name: CMake Configure
-        run: cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DRX14_PRO_BUILD=OFF
+        run: cmake -B build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release -DRX14_PRO_BUILD=OFF -DBUILD_TESTING=ON -DRX14_KTM_XC2=ON
       - name: Build
         run: cmake --build build --parallel
+      - name: KTM foundation tests
+        run: ctest --test-dir build --output-on-failure -L ktm
       - name: Deploy
         shell: cmd
         run: |
@@ -80,7 +83,7 @@ jobs:
           target: 'desktop'
           arch: 'clang_64'
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DRX14_PRO_BUILD=OFF
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DRX14_PRO_BUILD=OFF -DRX14_KTM_XC2=OFF
       - name: Build
         run: cmake --build build --parallel
       - name: Deploy
@@ -104,7 +107,7 @@ jobs:
             qt6-base-dev qt6-tools-dev qt6-tools-dev-tools qt6-l10n-tools \
             libgl-dev libxkbcommon-dev libfuse2 libxcb-cursor0 zlib1g-dev
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DRX14_PRO_BUILD=OFF -DCMAKE_INSTALL_PREFIX=/usr
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DRX14_PRO_BUILD=OFF -DRX14_KTM_XC2=OFF -DCMAKE_INSTALL_PREFIX=/usr
       - name: Build
         run: cmake --build build --parallel
       - name: Package AppImage

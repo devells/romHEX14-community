@@ -28,6 +28,26 @@ set(CMAKE_AUTORCC ON)
 
 option(RX14_PRO_BUILD "Include account system, update checker, and premium feature gates" OFF)
 
+if(WIN32)
+    set(RX14_KTM_XC2_DEFAULT ON)
+else()
+    set(RX14_KTM_XC2_DEFAULT OFF)
+endif()
+option(RX14_KTM_XC2 "Enable KTM XC2 integration" ${RX14_KTM_XC2_DEFAULT})
+
+include(CTest)
+
+if(RX14_KTM_XC2)
+    if(NOT WIN32)
+        message(FATAL_ERROR "RX14_KTM_XC2 is supported only on Windows.")
+    endif()
+    find_package(Qt6 6.5 REQUIRED COMPONENTS WebSockets)
+endif()
+
+if(BUILD_TESTING AND RX14_KTM_XC2)
+    find_package(Qt6 6.5 REQUIRED COMPONENTS Test)
+endif()
+
 # ── Debug RPC + on-disk D:\rx14-debug logger ────────────────────────────────
 # When enabled, builds in a TCP JSON-line RPC server (127.0.0.1:48714) that
 # lets external dev tooling query UI state, trigger actions, and grab widget
@@ -45,6 +65,17 @@ option(RX14_DEBUG_RPC "Enable in-app TCP debug RPC + D:\\rx14-debug logging" ${R
 
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Concurrent Network Sql LinguistTools)
 find_package(ZLIB QUIET)
+
+if(RX14_KTM_XC2)
+    add_library(rx14_ktm_xc2 STATIC
+        src/ktm/xc2/Xc2ContractProfile.cpp
+        src/ktm/xc2/Xc2ContractProfile.h
+    )
+    target_include_directories(rx14_ktm_xc2 PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+    target_link_libraries(rx14_ktm_xc2 PUBLIC Qt6::Core)
+endif()
 
 # ── BLAKE3 (portable C, no SIMD) ────────────────────────────────────────────
 add_library(blake3 STATIC
@@ -509,6 +540,18 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
     elseif(CMAKE_COMPILER_IS_GNUCXX)
         target_compile_options(rx14 PRIVATE -O2 -fstack-protector-strong -D_FORTIFY_SOURCE=2)
     endif()
+endif()
+
+if(BUILD_TESTING AND RX14_KTM_XC2)
+    add_executable(test_Xc2ContractProfile
+        tests/ktm/test_Xc2ContractProfile.cpp
+    )
+    target_link_libraries(test_Xc2ContractProfile PRIVATE
+        rx14_ktm_xc2
+        Qt6::Test
+    )
+    add_test(NAME xc2_contract_profile COMMAND test_Xc2ContractProfile)
+    set_tests_properties(xc2_contract_profile PROPERTIES LABELS "unit;ktm")
 endif()
 
 # ── Map auto-detect corpus harness (issue #25) ─────────────────────────────
