@@ -1133,15 +1133,22 @@ rtk git commit -m "feat: add strict XC2 REST transport"
 **Files:**
 - Create: `src/ktm/xc2/Xc2BackendManager.h`
 - Create: `src/ktm/xc2/Xc2BackendManager.cpp`
+- Create: `src/ktm/xc2/internal/Xc2ProcessOutput.h`
+- Create: `src/ktm/xc2/internal/Xc2ProcessOutput.cpp`
 - Create: `tests/ktm/fake_xc2_sidecar.cpp`
+- Create: `tests/ktm/xc2_manager_exit_helper.cpp`
 - Create: `tests/ktm/test_Xc2BackendManager.cpp`
 - Modify: `CMakeLists.txt`
 
 **Interfaces:**
-- Consumes: validated layout from Task 4 and REST health/shutdown from Task 5.
-- Produces: `Xc2LaunchSpec`, `Xc2BackendState`, `Xc2BackendEndpoints`, the
-  validated startup user, and an asynchronous, PID-owned `Xc2BackendManager`
-  lifecycle.
+- Consumes: fresh production inspection from Task 4 and encoded-base REST health
+  and current-user requests from Task 5. The manager deliberately does not use
+  Task 5's shutdown request because the state-changing write needs a
+  connection-specific Windows PID proof.
+- Produces: `Xc2BackendState`, `Xc2BackendEndpoints`, the exact validated startup
+  user, bounded sanitized process output, and an asynchronous HANDLE/PID-owned
+  `Xc2BackendManager` lifecycle. No public report, layout, launch spec, program,
+  argv callback, candidate allocator, or lock-path seam has spawn authority.
 
 - [ ] **Step 1: Implement the fake sidecar test executable before manager code**
 
@@ -1160,6 +1167,9 @@ IPv4 `127.0.0.1`. It accepts:
 --oversize-output
 --sensitive-output
 --hold-lock <absolute path>
+--user-mode <valid|empty-permissions|blank-login|blank-name|missing-permissions|malformed>
+--release-listener-after-ready <absolute trigger path>
+--event-log <absolute json-lines path>
 ```
 
 It returns plain `alive` for exact
@@ -1167,14 +1177,22 @@ It returns plain `alive` for exact
 non-empty `permissions` array for exact `GET /xc2/1.0/auth/currentUser`, and
 exits cleanly after exact empty-form
 `POST /xc2/1.0/serviceStatus/shutdown`. It never opens a non-loopback socket.
-The output modes split logical lines across writes, emit a line larger than the
-client cap, and emit synthetic `Authorization`, `Cookie`, `password`, `token`,
-`sessionIndex`, and `SAMLResponse` fields on both streams. `--hold-lock` obtains
-a `QLockFile` and waits, allowing a test to kill the helper and leave a real
-stale per-user lock file.
+The JSON-lines event log records `LISTENING`, every complete request, concurrent
+and maximum concurrent health counts, listener release, shutdown bytes, and
+process exit. It flushes `LOCKED` only after `--hold-lock` has actually obtained
+the `QLockFile`. Listener handoff tests create the trigger file only after Ready,
+wait for `LISTENER_RELEASED`, and then start a decoy on that exact port.
 
-Pass `$<TARGET_FILE:fake_xc2_sidecar>` to the test through compile definition
-`FAKE_XC2_SIDECAR_PATH`.
+The user modes make missing/malformed/blank identity and empty permissions
+independently testable. Output modes emit all nine sensitive field names on both
+streams, but process-pipe write boundaries are not treated as deterministic:
+exact fragmentation is tested by feeding chunks directly to the pure
+`Xc2ProcessOutput` accumulator. `--hold-lock` waits after its flushed handshake,
+allowing a test to kill the helper and leave a real stale lock file.
+
+Pass `$<TARGET_FILE:fake_xc2_sidecar>` and
+`$<TARGET_FILE:xc2_manager_exit_helper>` to the test through compile definitions
+`FAKE_XC2_SIDECAR_PATH` and `XC2_MANAGER_EXIT_HELPER_PATH`.
 
 - [ ] **Step 2: Write failing launch-profile and bind tests**
 
@@ -1183,14 +1201,20 @@ Add these cases first:
 ```cpp
 void productionArgumentsOverrideEveryEmbedded8082();
 void productionArgumentsKeepRequiredJavaOrderingAndProfile();
-void invalidPrerequisiteReportCannotCreateProductionSpec();
-void fakeArgumentsReceiveManagerSelectedPort();
+void productionStartCannotConsumeForgedOrTestReports();
+void productionStartRunsFreshInspectionBeforeAnySideEffect();
+void productionBuilderUsesExactApprovedPaths();
+void productionProcessEnvironmentRemovesInjectionVariables();
+void privateFakeArgumentsReceiveManagerSelectedPort();
 void rejectsEveryBindAddressExceptIpv4Localhost_data();
 void rejectsEveryBindAddressExceptIpv4Localhost();
 ```
 
-`productionArgumentsOverrideEveryEmbedded8082()` calls `argumentsForPort(49123)`
-and requires these exact effective JVM system properties, all before `-jar`:
+The production argv builder is a pure private function exposed only through the
+friend test-access class. It returns a `QStringList`; it cannot construct a
+`QProcess`, acquire a lock, select a port, or start the manager. Call it with a
+synthetic already-validated layout and port `49123`, then require these exact
+effective JVM system properties, all before `-jar`:
 
 ```text
 -Dserver.address=127.0.0.1
@@ -1207,16 +1231,16 @@ These five approved templates override the four fixed-port URLs in
 `BOOT-INF/classes/xc2.properties`. Do not generically preserve or rewrite an
 arbitrary source URL path/query. The vendor files remain read-only. Assert the
 joined generated argv and the five effective override values contain no
-`:8082`, every callback/GRIPS authority uses the selected port, and
-`-Dserver.port` is before `-jar`.
+`:8082`, every callback/GRIPS authority uses the selected port, and every
+approved property key occurs exactly once. Require one `-jar` token, no JVM or
+application argument after the absolute JAR path, and no duplicate key whose
+last-one-wins behavior could weaken the profile.
 
 Also require `-Dloader.main=com.avl.ditest.xc2.Xc2NgApplication` before `-jar`,
 `-Dspring.profiles.active=dev`, and
 `-Dcom.avl.ditest.xc2.developer=true`. The latter is the explicitly approved
 local diagnostic launch profile only; it does not claim or simulate DealerNet
-authentication. `productionLaunchSpec` consumes a successful Task 4
-`Xc2PrerequisiteReport`, so the checked x86 Java path/PE validation cannot be
-bypassed by passing an arbitrary layout.
+authentication.
 
 Retain the existing required arguments
 `-Dssc.includezip=true`, `-Dlogging.config=config/log.xml`, and
@@ -1225,13 +1249,42 @@ all JVM `-D` arguments, including `loader.main`, the dynamic URL overrides, the
 `dev` profile, and the diagnostic flag, precede the single `-jar` token and the
 absolute `xc2_backend_patched.jar` path.
 
-The fake spec's `argumentsForPort` must return `--port <selected>`. The bind
-table accepts only `QHostAddress::LocalHost` (`127.0.0.1`) and rejects
-`Any`, `AnyIPv4`, `AnyIPv6`, `LocalHostIPv6`, `127.0.0.2`, and non-loopback
-addresses before acquiring a lock or spawning. Endpoints may be derived only as
+The public production entry point is only
+`startProduction(const QString &installRoot)`. It performs a fresh
+`Xc2InstallationProbe::inspectProduction(installRoot)` inside the start attempt
+and uses the returned layout immediately; it never accepts a public
+`Xc2PrerequisiteReport`, `Xc2InstallLayout`, mutable launch spec, program, or
+argv callback. A hand-built empty-issue report, an `inspectForTest()` report,
+and a previously valid report whose layout was later mutated therefore have no
+call path into production startup. Assert that the startup deadline begins
+before the fresh inspection and that failed production inspection does not
+create the lock directory, invoke the candidate allocator, or spawn.
+
+Separately exercise the private pure builder with a synthetic already-validated
+production layout; no unit test depends on an external XC2 installation. Assert
+the direct `QProcess` program is the absolute checked `jre/bin/java.exe`, the
+working directory is the exact `resources/app` root, and the final argument is
+its absolute approved `xc2_backend_patched.jar`; never use `cmd.exe`,
+PowerShell, `start`, `javaw`, or PATH lookup. Build a child environment from the
+current environment but remove, case-insensitively on Windows,
+`JAVA_TOOL_OPTIONS`, `_JAVA_OPTIONS`, `JDK_JAVA_OPTIONS`,
+`SPRING_APPLICATION_JSON`, `SPRING_CONFIG_LOCATION`,
+`SPRING_CONFIG_ADDITIONAL_LOCATION`, `SPRING_PROFILES_ACTIVE`, `SERVER_ADDRESS`,
+and `SERVER_PORT`. The private fake verifies these variables are absent without
+requiring Java.
+
+The fake launch seam, lock override, bind-address rows, and deterministic
+candidate sequence exist only behind a friend `Xc2BackendManagerTestAccess` in
+the test binary. The production path always uses exact IPv4
+`QHostAddress::LocalHost`; the private table rejects `Any`, `AnyIPv4`, `AnyIPv6`,
+`LocalHostIPv6`, `127.0.0.2`, and non-loopback addresses before locking or
+spawning. Internally, probing may construct only the canonical encoded bytes
+`http://127.0.0.1:<selected>/xc2/1.0` and pass
+`QUrl(...).toEncoded(QUrl::FullyEncoded)` to Task 5's encoded-base
+`setBaseUrl(const QByteArray &)`. Public `endpoints()` remains empty until the
+current attempt, listener PID, health, and user have all passed; only then expose
 `http://127.0.0.1:<selected>/xc2/1.0` and
-`ws://127.0.0.1:<selected>/xc2-websocket` after the address, generation, and
-listener PID have all been validated.
+`ws://127.0.0.1:<selected>/xc2-websocket`.
 
 - [ ] **Step 3: Write failing PID ownership, collision, and lock tests**
 
@@ -1239,40 +1292,107 @@ Use real child processes, `GetExtendedTcpTable`, and bounded
 `QSignalSpy`/`QTRY_COMPARE_WITH_TIMEOUT` checks for:
 
 ```cpp
-void readyRequiresSelectedListenerOwnedByCurrentChildPid();
+void readyRequiresExactIpv4ListenerOwnedByStableChildHandle();
+void ownerTableUsesNetworkByteOrderAndRejectsDuplicateRows();
 void validAliveDecoyOn8082IsIgnoredAndSurvives();
+void injectedCandidate8082IsRejectedBeforeArgumentsOrSpawn();
 void portStealRaceCleansChildAndRetriesANewPort();
-void shutdownIsSentOnlyToCurrentChildPid();
+void threePortCollisionsExhaustWithoutResidue();
+void shutdownConnectionProvesServerFourTupleBeforeWriting();
+void listenerHandoffWritesZeroBytesToDecoy();
 void ignoreShutdownIsTerminatedThenKilledWithoutResidue();
 void perUserLockRejectsSecondManagerUntilChildFinished();
+void livePerUserLockOlderThanThirtySecondsIsNeverRemoved();
 void stalePerUserLockIsRecovered();
-void finishedAndErrorRevokeOwnership();
+void processErrorRevokesNetworkButRetainsCleanupOwnership();
 ```
 
 Start a fake sidecar decoy on `127.0.0.1:8082` that returns a completely valid
 `alive`. Start the manager and prove its selected port is not 8082, the Windows
-listener owner PID equals `ownedProcessId()`, that PID is the manager's current
-fake `QProcess`, and the decoy remains alive after the owned child stops. A
-health response alone is not proof of ownership.
+listener owner PID equals `ownedProcessId()`, that PID and executable belong to
+the manager's direct fake `QProcess`, and the decoy remains alive after the owned
+child stops with zero requests in its event log. A health response alone is not
+proof of ownership. Separately inject candidate sequence `8082, 49123` while
+8082 is free and prove 8082 is skipped without calling its argv callback or
+spawning; an occupied decoy alone cannot prove the explicit rejection branch.
 
-For the port-steal race, let the first `argumentsForPort` callback launch a
-separate fake process on the just-selected candidate before the managed child
-can bind it. The valid response is therefore from the wrong PID. The manager
-must never emit `ready`, asynchronously terminate/kill and reap its failed child,
-select a different port, call `argumentsForPort` again, and become Ready only
-for the new child/PID. Bound retries to three candidates; exhaustion is a
-startup failure with no orphan. The test explicitly reaps its stealer.
+For the port-steal race, the private candidate sequence and fake ready handshake
+put a separate process on the first selected candidate before the managed child
+can bind. The valid response is therefore from the wrong PID. The manager must
+never emit `ready`, must asynchronously terminate/kill and reap its failed
+child, then select a different port and become Ready only for the new
+child/HANDLE/PID. Give every attempt a distinct `attemptId` and fresh Task 5
+client/cookie jar. Do not start attempt N+1 until attempt N is NotRunning and
+its REST client is destroyed. Bound collision retries to exactly three; steal
+all three candidates and assert one final failure, no Ready, every stealer and
+managed-attempt process HANDLE signaled, and no orphan. Retry only a proven
+listener collision, not Java/config/argv/job-object failure.
 
-Give both managers the same temporary lock path. The first obtains the
-`QLockFile` before spawning; the second emits a busy failure without spawning.
-The lock remains held through graceful shutdown, terminate, kill, and collision
-cleanup, and is released only after the actual child has emitted `finished` and
-`QProcess::state() == NotRunning`. Then the second manager can start. For stale
-recovery, kill the `--hold-lock` helper without running its destructor and prove
-the manager safely recovers that dead-PID lock; it must never remove a live
-owner's lock. Production uses a per-user path under
-`QStandardPaths::AppLocalDataLocation`, while the explicit lock path in
-`Xc2LaunchSpec` is a deterministic test seam.
+Production uses one fixed absolute path
+`QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation)
++ "/ktm-xc2-vci2k.lock"`, independent of install root, selected port, and run.
+Fail closed if the location is empty or its parent cannot be created. Construct
+the long-lived `QLockFile`, call `setStaleLockTime(0)`, then `tryLock(0)` before
+selecting a port or spawning. Never automatically call `removeStaleLockFile()`
+after a live-owner failure. The private friend seam may supply a temporary
+absolute lock path but production callers cannot.
+
+Give two managers the same private test path. The first obtains it before
+spawning; the second reports busy without spawning and returns through the
+closed `Failed -> Stopped` path. Keep the lock through verified shutdown,
+terminate, kill, collision cleanup, and manager-to-reaper transfer; release only
+after the actual child emitted `finished`, its stable process HANDLE is signaled,
+and `QProcess::state() == NotRunning`. Hold a live helper lock for more than the
+default 30 seconds and prove it is never removed. For stale recovery, wait for
+the fake's flushed `LOCKED` event, kill and wait for the helper HANDLE, then
+prove `tryLock()` safely removes the dead-PID stale file; never remove a live
+owner's lock.
+
+At `QProcess::started`, open and retain a Windows process HANDLE with the rights
+needed for `SYNCHRONIZE`, limited query, job assignment, and termination. Holding
+that HANDLE until finished prevents PID reuse from authorizing a later process.
+Every network proof requires the HANDLE to be unsignaled and the captured PID to
+equal the current attempt. Query `GetExtendedTcpTable` with `AF_INET` and
+`TCP_TABLE_OWNER_PID_LISTENER`, retry its size query if the table grows, and
+match exactly one row. Convert `dwLocalPort` with `ntohs`, `dwLocalAddr` with
+`ntohl`, require `127.0.0.1`, and reject zero, wildcard, `127.0.0.2`, byte-swapped,
+duplicate, or conflicting rows. Include `<winsock2.h>` before Windows/IP Helper
+headers under MinGW and link `Iphlpapi` and `Ws2_32` explicitly.
+
+The manager does not call Task 5's `requestShutdown()`. It creates a dedicated
+`QTcpSocket`, sets `QNetworkProxy::NoProxy`, and connects only to literal
+`127.0.0.1:selected`. After `connected`, and before writing any byte, repeatedly
+query `GetExtendedTcpTable(AF_INET, TCP_TABLE_OWNER_PID_ALL)` within the one
+shutdown deadline. Match exactly one `ESTABLISHED` server row whose local tuple
+is `127.0.0.1:selected`, remote tuple is
+`127.0.0.1:<socket.localPort()>`, owning PID is the captured PID, and stable
+HANDLE is still live. Convert both row addresses with `ntohl` and both row ports
+with `ntohs`; zero, wildcard, byte-swapped, reversed, duplicate, or conflicting
+rows fail the proof. Only then serialize with exact CRLF delimiters and write
+once on that same socket:
+
+```text
+POST /xc2/1.0/serviceStatus/shutdown HTTP/1.1
+Host: 127.0.0.1:<selected>
+Content-Type: application/x-www-form-urlencoded
+Content-Length: 0
+Connection: close
+
+```
+
+An optional Cookie header may contain only the current attempt's authority-bound
+Task 5 cookie export. Resolve it once from the current attempt before connecting
+by passing the manager-generated canonical
+`http://127.0.0.1:<selected>/xc2/1.0/serviceStatus/shutdown` target's
+`QUrl::toEncoded(QUrl::FullyEncoded)` bytes to
+`cookieHeaderFor(const QByteArray &)`: a failed export writes zero bytes, an
+empty success omits the header, and a non-empty success adds exactly one
+`Cookie:` header. Cookie bytes are never logged. A proof failure, socket error,
+timeout, duplicate row, closed listener, signaled HANDLE, or handoff writes zero
+bytes and falls directly to terminate then kill of the owned HANDLE/QProcess. A
+partial or failed write is never retried. The fake event logs prove the normal
+path receives one exact empty-form POST and every decoy/handoff path receives
+zero bytes.
 
 - [ ] **Step 4: Write failing startup, lifecycle, and output tests**
 
@@ -1282,36 +1402,89 @@ Add:
 void healthPollingIsSingleFlightWithinOneTotalDeadline();
 void startupTimeoutAbortsReplyAndLateAliveCannotReviveRun();
 void currentUserAndPermissionsAreValidatedBeforeReady();
+void emptyPermissionsRemainReadyButAuthorizeNothing();
 void earlyCrashReportsBackendErrorAndLeavesNoOwnedRun();
 void stopDuringStartNeverEmitsReady();
+void repeatedStartIsRejectedWithoutDisturbingCurrentRun();
 void stopIsIdempotentAndRestartWaitsForStopped();
 void destroyRunningManagerReapsWithoutUiThreadWait();
+void applicationExitJobObjectKillsChildWithoutEarlyUnlock();
 void stdoutAndStderrUseIndependentFragmentBuffers();
 void outputLinesAndRingsAreBounded();
 void outputControlsAndSensitiveFieldsAreRemoved();
 ```
 
 At most one health request may be pending. A single startup wall-clock deadline
-covers process start, all health attempts, listener ownership verification, and
-the strict `currentUser` request. On timeout, abort the pending REST reply,
-invalidate the run generation, cancel every poll timer, and asynchronously
-terminate then kill. A scripted alive reply delivered after the deadline must
-not transition the stale generation to Ready. Before Ready, parse
-`currentUser`, retain the exact returned `permissions`, and test the synthetic
-diagnostic identity/permission list; missing or malformed identity/permissions
-fails startup rather than being described as DealerNet-authenticated.
+covers fresh production inspection, process start, all health attempts, listener
+ownership verification, and the strict `currentUser` request. Each run owns an
+immutable `runId`; each collision attempt owns an immutable `attemptId`. Timeout
+or stop first sets `mayBecomeReady=false`, revokes `networkAuthorized`, removes
+the expected pending request ID, and cancels every poll/deadline timer. Only
+after those mutations may it call Task 5 `abort(id)`, because abort completion
+may re-enter synchronously. The immutable run/attempt contexts remain valid for
+`errorOccurred`, output draining, `finished`, HANDLE close, lock release, and
+`Stopped`; canceling readiness must never suppress cleanup callbacks.
 
-Output parsing keeps separate incremental byte buffers and rings for stdout and
-stderr. Emit only complete logical lines (and the final partial line at EOF),
-handle CRLF split across reads, cap each input line at 16 KiB, discard the
-remainder of an oversized line through its delimiter, append one `[truncated]`
-marker, and retain at most 256 sanitized lines per stream. Strip ANSI CSI/OSC
-sequences and C0/C1 controls other than tab before emission. Case-insensitively
-replace values for `Authorization`, `Proxy-Authorization`, `Cookie`,
-`Set-Cookie`, `password`, `token`, `sessionIndex`, `SAMLRequest`, and
-`SAMLResponse` in header, `key=value`, or JSON-string form with `<redacted>`.
-Tests split both the sensitive field name and value across process reads and
-assert neither `outputLine` nor `recentOutput()` contains the synthetic secret.
+Every Task 5 result matches the emitting client pointer, runId, attemptId,
+request ID, state, and `mayBecomeReady` before acting. Health polling schedules
+the next request only after the prior terminal signal. A stopped/timed-out first
+attempt may deliver canceled or scripted late success after a new attempt exists;
+it cannot poll, request current user, publish endpoints, emit Ready, or release
+the new attempt's resources.
+
+Before Ready, parse `currentUser`, require non-blank `loginName` and `name`, and
+retain the returned permissions exactly, including order, spelling, duplicates,
+unknown values, and an empty list. Empty permissions still allow backend Ready
+but authorize no operation; later controllers require their own exact
+case-sensitive permissions. Missing/malformed/blank identity fails startup.
+Neither Ready nor a non-empty permissions list is described as DealerNet
+authentication, and `currentUser()`/public endpoints are cleared as soon as stop
+or failure begins.
+
+`Xc2ProcessOutput` is a pure, non-QObject, non-spawning accumulator with wholly
+independent stdout/stderr state: incremental decoder/sanitizer state, bounded
+sanitized pending-line bytes, oversized-line discard flags, and rings. Tests
+feed exact chunk boundaries directly. The control/ANSI filter and sensitive
+field recognizer run incrementally before bytes enter the pending line or ring;
+never retain a whole unsanitized process chunk. Emit only complete logical lines
+and one final partial line at EOF, handle CRLF split across feeds, and never
+append unbounded `readAll()` data before scanning. Cap each pending prefix so the
+stored/emitted UTF-8 logical line is at most 16 KiB including one `[truncated]`
+suffix, then discard the remainder through its delimiter. Retain at most 256
+sanitized lines per stream and finalize both streams before `stopped`.
+
+Incrementally decode bounded bytes, strip ANSI CSI/OSC sequences and Unicode
+C0/C1 controls other than tab, then recognize and redact fields with bounded
+look-behind. Once a sensitive name is recognized, discard its value bytes as
+they arrive and retain only the replacement marker. Data-drive all nine names
+`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, `password`,
+`token`, `sessionIndex`, `SAMLRequest`, and `SAMLResponse`, case-insensitively in
+header, `key=value`, and JSON-string forms, for both streams. Split both field
+name and value across feeds and insert ANSI inside names. Assert no secret occurs
+in `outputLine`, `recentOutput()`, pending storage, truncated lines, or EOF
+partials, and assert both pending byte buffers plus rings stay within their
+documented bounds.
+
+`startProduction()` is single-flight: only `Stopped` accepts it. A second start
+in `Starting`, `Probing`, `Ready`, `Stopping`, or transient `Failed` is rejected
+through a separate start-rejection result without mutating the current run,
+spawning, or emitting that run's `failed`. Invalid input, busy lock, inspection
+failure, early crash, collision exhaustion, and shutdown failure enter `Failed`
+only while cleanup is outstanding, emit one run failure, and always transition
+to `Stopped` after NotRunning/HANDLE signal and lock release. `stop()` is
+idempotent in every state and never issues a second shutdown write.
+
+Deleting a running manager transfers the complete process/HANDLE/job/lock
+context to an application-lifetime reaper without waiting or running a nested
+event loop. The reaper performs asynchronous terminate/kill and releases the
+lock only after NotRunning. In addition, every successfully started child is
+assigned, before network authorization, to a Windows Job Object configured with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; job creation/configuration/assignment
+failure is fatal. OS handle closure then kills the child even when the Qt event
+loop is already exiting. `xc2_manager_exit_helper` starts a fake, publishes its
+PID/lock path, and exits immediately; the parent test retains the process HANDLE
+and proves the child dies and the lock is not reusable while that child remains
+live.
 
 - [ ] **Step 5: Run the manager target to verify red behavior**
 
@@ -1321,19 +1494,10 @@ rtk cmake --build build-test --target test_Xc2BackendManager --parallel
 
 Expected: missing manager compile failure.
 
-- [ ] **Step 6: Implement launch spec and manager interface**
+- [ ] **Step 6: Implement the provenance-safe manager interface**
 
 ```cpp
-struct Xc2LaunchSpec {
-    QString program;
-    std::function<QStringList(quint16)> argumentsForPort;
-    QString workingDirectory;
-    QHostAddress bindAddress = QHostAddress::LocalHost;
-    QString lockFilePath;
-    int startupTimeoutMs = 60000;
-    int shutdownTimeoutMs = 5000;
-    int maxPortAttempts = 3;
-};
+namespace ktm::xc2 {
 
 enum class Xc2BackendState {
     Stopped, Starting, Probing, Ready, Stopping, Failed
@@ -1344,14 +1508,15 @@ struct Xc2BackendEndpoints {
     QUrl webSocketUrl;
 };
 
+class Xc2BackendManagerTestAccess;
+
 class Xc2BackendManager final : public QObject {
     Q_OBJECT
 public:
     explicit Xc2BackendManager(QObject *parent = nullptr);
     ~Xc2BackendManager() override;
-    static Xc2Result<Xc2LaunchSpec> productionLaunchSpec(
-        const Xc2PrerequisiteReport &report);
-    void start(Xc2LaunchSpec spec);
+    bool startProduction(const QString &installRoot,
+                         Xc2Error *error = nullptr);
     void stop();
     Xc2BackendState state() const;
     bool ownsProcess() const;
@@ -1366,46 +1531,86 @@ signals:
     void outputLine(bool standardError, const QString &line);
     void failed(const Xc2Error &);
     void stopped(int exitCode, QProcess::ExitStatus);
+
+private:
+    friend class Xc2BackendManagerTestAccess;
+    struct PrivateLaunchPlan;
+    struct RunContext;
+    bool startPrivateForTest(PrivateLaunchPlan plan,
+                             Xc2Error *error = nullptr);
 };
+
+} // namespace ktm::xc2
+
+Q_DECLARE_METATYPE(ktm::xc2::Xc2BackendState)
+Q_DECLARE_METATYPE(ktm::xc2::Xc2BackendEndpoints)
 ```
+
+`PrivateLaunchPlan` and the pure production argv builder are private. Only the
+friend class defined in `test_Xc2BackendManager.cpp` can construct a fake
+program, bind-address row, lock override, timeout, environment observer, or
+candidate sequence. `startProduction()` validates non-empty absolute input,
+performs fresh production inspection, and immediately copies only that
+inspection's verified paths into the private run; it never accepts Task 4 DTOs.
+Validate positive bounded startup/shutdown timeouts, `maxPortAttempts` in
+`1..3`, an absolute existing working directory, direct executable/JAR paths,
+absolute test lock paths, exact IPv4 bind address, non-empty callback, and
+candidate ports before acquiring the lock. Clear a supplied error on every
+accepted start. Register both public metatypes before queued signals/QSignalSpy.
 
 - [ ] **Step 7: Implement run-scoped ownership and Windows listener proof**
 
-Represent each run with its own generation, `QProcess`, `QLockFile`, selected
-port, process ID, startup/shutdown timers, poll timer, pending REST request IDs,
-output buffers, and completion state. `start()` is accepted only in `Stopped`.
-Validate the spec and obtain the per-user lock before selecting a port or
-spawning. Select a candidate by briefly binding `QTcpServer` to
-`127.0.0.1:0`, reject candidate 8082, close it, then and only then call
-`argumentsForPort(selected)`. Set `QProcess` program/arguments/working directory
-and connect `started`, both ready-read signals, `errorOccurred`, and `finished`
-with the captured generation. Every process signal, timer callback, REST result,
-and reaper/collision continuation checks that captured generation before reading
-or mutating the current run.
+`RunContext` owns immutable `runId`, one fixed `QLockFile`, failure/stopped
+completion flags, public-state snapshots, and the active attempt. Each attempt
+owns immutable `attemptId`, direct `QProcess`, fresh `Xc2RestClient`, selected
+port, captured PID and stable HANDLE, Job Object, startup/shutdown/poll timers,
+pending request IDs, dedicated shutdown socket, output accumulator, and the
+separate booleans `mayBecomeReady`, `networkAuthorized`,
+`ownsChildForCleanup`, and `cleanupCompleted`. A process error immediately
+revokes only `networkAuthorized`/`mayBecomeReady`; `ownsChildForCleanup` and the
+run lock remain true until NotRunning and the HANDLE is signaled.
 
-On Windows, query `GetExtendedTcpTable(TCP_TABLE_OWNER_PID_LISTENER)` and match
-the network-byte-order local port plus IPv4 `127.0.0.1`. Ready requires all of:
-current generation, live current `QProcess`, successful `alive`, listener PID
-equal to `QProcess::processId()`, and a strict current-user result. Re-run the
-same PID check immediately before shutdown. POST shutdown only when it still
-matches; if another PID owns the port, send it zero requests and clean up only
-the manager-owned `QProcess`. Link `Iphlpapi`. `finished` and `errorOccurred`
-immediately revoke network ownership for that generation; never let a PID or
-endpoint from a prior run authorize a later callback.
+`startProduction()` is accepted only in `Stopped`. Perform fresh inspection and
+all private option validation, derive the fixed production lock path, create its
+parent, set stale time zero, and acquire it before candidate allocation. The
+production allocator briefly binds `QTcpServer` to exact `127.0.0.1:0`, rejects
+8082, closes the reservation, then builds argv and starts the direct process.
+The unavoidable close-to-child-bind TOCTOU is handled only by the bounded,
+PID-proven collision path. The friend allocator supplies exact candidates for
+tests. Connect process and REST signals with both QObject receiver context and
+captured runId/attemptId so manager destruction disconnects callbacks while the
+transferred reaper context continues cleanup independently.
 
-Health polling is timer-driven and schedules the next request only after the
-previous one finishes. `stop()` is idempotent in `Stopped`/`Stopping`, cancels
-old timers, invalidates the generation's ability to become Ready, and follows
-verified shutdown -> terminate -> kill without blocking. A restart is rejected
-until the prior child is truly NotRunning and `stopped` has transitioned the
-manager back to `Stopped`.
+After `started`, capture the stable Windows HANDLE, prove the executable is the
+direct configured child, create/configure/assign the kill-on-close Job Object,
+then begin timer-driven health probing. Configure Task 5 using the internally
+generated canonical encoded base bytes, never a caller `QUrl`. A successful
+health response is followed by an exact listener-owner proof before issuing
+current user; a successful user is followed by a second exact listener/HANDLE
+proof before setting `networkAuthorized`, publishing endpoints/user, and
+emitting Ready. Any missing, duplicate, wildcard, wrong-port, wrong-address, or
+wrong-PID row prevents Ready. Collision cleanup waits for the old child and
+destroys its client before advancing to the next attempt under the same lock.
 
-The destructor must not call `waitForStarted`, `waitForFinished`, or run a local
-event loop on the UI thread. Move a still-running process together with its
-lock into an application-lifetime internal reaper that performs asynchronous
-terminate/kill, observes `finished`/`NotRunning`, and only then unlocks and
-deletes the process context. Thus destruction returns promptly without either
-orphaning a child or releasing the lock while that child still exists.
+`stop()` first makes Ready impossible, clears public endpoints/user, cancels
+startup timers, and detaches pending request IDs before aborting Task 5 replies.
+If the run had network authorization it attempts the dedicated, same-socket
+four-tuple-proven shutdown exactly once; otherwise it writes no network bytes.
+Whether proof, connect, write, or response succeeds or fails, cleanup advances
+without blocking through shutdown deadline, terminate deadline, and kill. Child
+`finished` drains/finalizes both output streams; cleanup verifies that the
+stable HANDLE is signaled, then closes the process/job handles in normal order,
+releases the lock, emits one `stopped`, and transitions to `Stopped`. Old
+callbacks may finish their own context but cannot observe or mutate a later
+run.
+
+The destructor never calls `waitForStarted`, `waitForFinished`, or a nested
+event loop. It disconnects manager-facing callbacks and transfers the entire
+attempt plus lock to the application-lifetime reaper, which performs the same
+asynchronous terminate/kill/NotRunning sequence. The Job Object is the final OS
+guarantee when the application event loop or reaper is itself exiting: closing
+its last handle kills the associated child tree. No path destroys `QLockFile`
+while its captured child HANDLE remains unsignaled.
 
 - [ ] **Step 8: Run manager and all KTM tests**
 
@@ -1414,16 +1619,20 @@ rtk cmake --build build-test --target test_Xc2BackendManager --parallel
 rtk ctest --test-dir build-test --output-on-failure -L ktm
 ```
 
-Expected: Ready is gated by the selected child PID plus strict health/user
-results; dynamic-port overrides, lock/collision recovery, stale-generation
-suppression, output bounds/redaction, and all stop/destruction paths pass with
-no child residue. The valid 8082 decoy and redirect/port-steal traps remain
-alive and receive no unauthorized shutdown.
+Expected: Ready is gated by the direct child's stable HANDLE, exact selected
+IPv4 listener PID, strict health, and non-blank current user; empty permissions
+are retained without authorizing operations. Fresh production provenance,
+unique dynamic-port overrides, sanitized environment, injected candidate
+collisions, long-lived/stale locks, run/attempt stale-callback suppression,
+same-socket shutdown proof, output bounds/redaction, normal destruction, and
+outer application exit all pass with every captured child HANDLE signaled. The
+valid 8082 decoy, handoff decoy, and port-steal traps remain alive until their
+test-owned cleanup and record zero unauthorized shutdown bytes.
 
 - [ ] **Step 9: Commit the owned manager**
 
 ```powershell
-rtk git add CMakeLists.txt src/ktm/xc2/Xc2BackendManager.* tests/ktm/fake_xc2_sidecar.cpp tests/ktm/test_Xc2BackendManager.cpp
+rtk git add CMakeLists.txt src/ktm/xc2/Xc2BackendManager.* src/ktm/xc2/internal/Xc2ProcessOutput.* tests/ktm/fake_xc2_sidecar.cpp tests/ktm/xc2_manager_exit_helper.cpp tests/ktm/test_Xc2BackendManager.cpp
 rtk git commit -m "feat: manage the XC2 sidecar lifecycle"
 ```
 

@@ -103,33 +103,71 @@ files, and explicitly selected firmware paths are the only shared artifacts.
 
 ## 6. Components
 
-### 6.1 `KtmBackendManager`
+### 6.1 `Xc2BackendManager`
 
 Responsibilities:
 
 - Store a configurable XC2 installation root in `AppConfig`.
-- Locate the bundled x86 Java executable, the approved production sidecar JAR,
-  its configuration, and D-PDU installation metadata.
-- Verify file existence, PE bitness where applicable, SHA-256 compatibility,
-  registry values, provider paths, and required working directories.
+- Accept only an installation-root string through `startProduction()`, then run
+  a fresh production inspection internally immediately before launch. Public
+  prerequisite reports, layouts, mutable launch specs, programs, argv callbacks,
+  candidate allocators, and lock paths never have production spawn authority.
+- Locate the bundled x86 Java executable, approved production sidecar JAR,
+  configuration, and D-PDU metadata; verify file existence, PE bitness,
+  SHA-256 compatibility, registry values, provider paths, and working paths.
 - Reserve a free loopback port and start the sidecar with `QProcess`.
 - Pass `server.address=127.0.0.1`, the selected port, logging configuration,
-  production main class, and local profile explicitly.
+  production main class, dynamic callback/GRIPS URLs, and local profile as unique
+  JVM properties before `-jar`. Start the absolute x86 Java path directly, use
+  the XC2 application root as working directory, and remove inherited Java/Spring
+  option-injection environment variables.
 - Set the XC2 application directory as the process working directory so its
   relative resources resolve consistently.
 - Poll `/xc2/1.0/serviceStatus/status` until the backend reports `alive` or a
-  bounded startup deadline expires.
-- Capture stdout, stderr, exit code, command metadata, and the backend log path.
-- Shut down only a sidecar started and owned by this romHEX14 instance.
+  bounded startup deadline expires. Construct the canonical fully encoded
+  loopback REST base internally and pass encoded bytes, never a caller-owned
+  mutable URL, into the REST client.
+- Require a non-blank strict current-user identity before Ready, retain its exact
+  permission list, and treat an empty list as Ready but unauthorized for every
+  later operation. Ready does not claim DealerNet authentication.
+- Capture bounded independently fragmented stdout/stderr, exit code, sanitized
+  command metadata, and the backend log path.
+- Hold a stable Windows process HANDLE and exact IPv4 listener PID proof. Before
+  a shutdown POST, connect a dedicated no-proxy socket and, before writing any
+  byte, prove the server side of that same established four-tuple is owned by the
+  still-live captured process. Otherwise write zero bytes and terminate/kill only
+  the owned process.
 
-The manager will not reuse an arbitrary service already listening on port 8082.
-That service may be the mock backend or an incompatible XC2 instance. It will
-start the approved production sidecar on its own port. It will not terminate
-external XC2 processes automatically.
+The manager will not reuse or select port 8082. That service may be the mock
+backend or an incompatible XC2 instance. A port reservation cannot be handed to
+Java atomically, so every attempt has a distinct identity and the manager retries
+at most three candidates only after proving a wrong-PID collision and fully
+reaping the failed child. It never terminates an external process.
 
-A per-user `QLockFile` prevents two romHEX14 instances from claiming VCI2K at
-the same time. A non-cooperating external XC2 process may still hold D-PDU; that
-condition is reported as `VciError`, not resolved by killing the process.
+A fixed absolute per-user `QLockFile` under `AppLocalDataLocation`, configured
+with stale-lock time zero, prevents two romHEX14 instances from claiming VCI2K.
+It is acquired before candidate selection and retained until the actual child is
+NotRunning and its stable HANDLE is signaled, including collision, stop, manager
+destruction, and asynchronous reaping. Dead-PID stale locks are recoverable;
+live owners are never removed because of lock age. A non-cooperating external
+XC2 process may still hold D-PDU; that condition is reported as `VciError`, not
+resolved by killing the process.
+
+Each run and each collision attempt have immutable identities. Canceling startup
+revokes only the ability to become Ready and network authorization; it never
+invalidates the callbacks required to drain output, observe `finished`, reap the
+child, and release the lock. Stop mutates those gates and removes pending request
+IDs before aborting an asynchronous REST reply, so synchronous abort completion
+cannot revive a stale run. Failed cleanup always closes through `Stopped`; a new
+start is rejected until then.
+
+Manager destruction transfers the complete process/HANDLE/job/lock context to an
+application-lifetime asynchronous reaper and never waits on the UI thread. Every
+owned child also belongs to a Windows Job Object with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so application exit kills the child tree
+even when no further Qt events can run. The lock is not deliberately released
+before normal child completion; crash leftovers are recovered as dead-owner
+stale locks on the next application start.
 
 ### 6.2 `Xc2RestClient`
 
