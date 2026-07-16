@@ -271,6 +271,12 @@ private slots:
         QCOMPARE(result.frames.at(1).headers.value(
                      QByteArrayLiteral("destination")),
                  QByteArrayLiteral("/topic/progress"));
+        QCOMPARE(result.frames.at(1).headers.value(
+                     QByteArrayLiteral("message-id")),
+                 QByteArrayLiteral("synthetic-progress-1"));
+        QCOMPARE(result.frames.at(1).headers.value(
+                     QByteArrayLiteral("subscription")),
+                 QByteArrayLiteral("progress-subscription"));
         QVERIFY(result.frames.at(1).body.contains(
             QByteArrayLiteral("00000000-0000-0000-0000-000000000001")));
         QCOMPARE(result.frames.at(2).command, QByteArrayLiteral("ERROR"));
