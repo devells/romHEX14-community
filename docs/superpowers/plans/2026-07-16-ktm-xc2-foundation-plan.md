@@ -896,6 +896,7 @@ rtk git commit -m "feat: validate external XC2 installation"
 ## Task 5: Strict Loopback REST Client
 
 **Files:**
+- Modify: `src/ktm/xc2/Xc2Models.h`
 - Create: `src/ktm/xc2/Xc2RestClient.h`
 - Create: `src/ktm/xc2/Xc2RestClient.cpp`
 - Create: `tests/ktm/FakeHttpServer.h`
@@ -905,28 +906,134 @@ rtk git commit -m "feat: validate external XC2 installation"
 
 **Interfaces:**
 - Consumes: Task 1 endpoint specs and Task 2 strict codecs/models.
-- Produces: `Xc2RequestId`, `Xc2RestClient::requestServiceStatus/requestCurrentUser/requestShutdown`, reply signals, `cookieHeaderFor`, and `abort`.
+- Produces: `Xc2TransportReason`, `Xc2RequestId`,
+  `Xc2RestClient::requestServiceStatus/requestCurrentUser/requestShutdown`,
+  reply signals, authority-bound `webSocketUrl`/`cookieHeaderFor`, and `abort`.
 
-- [ ] **Step 1: Write a loopback fake server and failing REST tests**
+- [ ] **Step 1: Write a complete loopback fake server before the client**
 
-The fake server binds `QHostAddress::LocalHost` on port zero, queues exact HTTP
-responses, captures method/path/headers/body, and exposes `requestCount()`.
-Tests cover:
+`FakeHttpServer` binds an explicitly supplied `QHostAddress::LocalHost` or
+`QHostAddress::LocalHostIPv6` on port zero. It incrementally parses the request
+line, headers, `Content-Length`, and body; a request enters the capture list and
+increments `requestCount()` exactly once only after the complete body has been
+received. Each capture exposes the exact method, request-target, headers, and
+body. Normal queued responses always include an exact `Content-Length` and
+`Connection: close`; special scripted responses support close-before-status,
+declared-length truncation, drip bytes without completion, no bytes, and a
+redirect `Location`. A trap server independently counts requests so redirect
+tests prove that it was never contacted.
+
+The server must let a test wait for `requestCaptured` before calling `abort()`;
+do not use a timing guess that can cancel before the request reaches the wire.
+
+- [ ] **Step 2: Write failing URL, request-target, redirect, and cookie tests**
+
+Add these data-driven cases to `test_Xc2RestClient.cpp`:
 
 ```cpp
-void rejectsNonLoopbackBaseUrl();
-void parsesPlainAliveHealth();
-void parsesStrictCurrentUserJson();
-void distinguishesTransportHttpAndContractErrors();
-void retainsSessionCookieForWebSocketHandshake();
-void shutdownPostsExactlyOnceWithoutRetry();
-void abortEmitsCanceledResultOnce();
+void acceptsIpv4Ipv6AndLocalhostBases_data();
+void acceptsIpv4Ipv6AndLocalhostBases();
+void rejectsUnsafeOrAliasedBases_data();
+void rejectsUnsafeOrAliasedBases();
+void sendsExactRequestTargets();
+void ownedManagerBypassesApplicationProxy();
+void get302DoesNotFollowRedirect();
+void shutdown307DoesNotFollowRedirect();
+void cookieExportRequiresDerivedWebSocketAuthority();
 ```
 
-For shutdown, close the fake connection without a response and assert
-`requestCount() == 1` after twice the read retry interval.
+The accepted table contains all of these forms, with and without the one
+permitted trailing slash where shown:
 
-- [ ] **Step 2: Run the REST target to verify red behavior**
+```text
+http://127.0.0.1:<port>/xc2/1.0
+http://127.0.0.1:<port>/xc2/1.0/
+http://[::1]:<port>/xc2/1.0
+http://LOCALHOST:<port>/xc2/1.0/
+```
+
+The rejected table contains a relative URL, `https` and `ws`, a missing or zero
+port, user info, query, fragment, `localhost.`, `foo.localhost`,
+`localhost.localdomain`, `127.1`, integer/octal IPv4 aliases, a non-loopback
+numeric IPv4/IPv6 address, `/xc2/1.0//`, a case-changed path, an extra segment,
+a dot segment, and percent-encoded path variants. Validation performs no DNS
+lookup. It accepts only an absolute `http` URL with an explicit port in
+`1..65535`, no user info/query/fragment, and a fully encoded path exactly equal
+to `/xc2/1.0` or `/xc2/1.0/`. The host is either case-insensitive exact
+`localhost` or a numeric address parsed by `QHostAddress` and proven loopback;
+host aliases are never resolved. Store the context without a trailing slash.
+
+For every endpoint construct the URL as the validated authority plus exactly
+`restContext() + '/' + EndpointSpec::path`; never call `QUrl::resolved()`.
+Assert captured targets are exactly
+`/xc2/1.0/serviceStatus/status`, `/xc2/1.0/auth/currentUser`, and
+`/xc2/1.0/serviceStatus/shutdown`, with no doubled slash or inherited suffix.
+
+Every request sets `QNetworkRequest::RedirectPolicyAttribute` to
+`QNetworkRequest::ManualRedirectPolicy`. Queue a GET `302` and shutdown POST
+`307`, each pointing at the trap server. Both operations must fail, the origin
+must record one request, and the trap must record zero requests after the full
+deadline. There is no automatic retry.
+
+The cookie test returns a synthetic session cookie, then accepts export only
+for the one URL derived from the REST base:
+`ws://<same validated host>:<same explicit port>/xc2-websocket`. The supplied
+WebSocket URL must be absolute `ws`, have no user info/query/fragment, match the
+validated REST host and explicit port, and have the exact case-sensitive path
+`/xc2-websocket`. Canonicalize the validated REST host once, derive
+`webSocketUrl()` from it, and require the supplied URL to equal that canonical
+result rather than resolving another spelling. Reject wrong/missing port, host
+alias, `wss`, path suffix, and query before calling
+`QNetworkCookieJar::cookiesForUrl()`; this explicit port check is mandatory
+because cookie matching itself is not port-scoped. Join only the dedicated
+jar's returned cookies with
+`QNetworkCookie::NameAndValueOnly`.
+
+- [ ] **Step 3: Write failing deadline, exactly-once, and response-matrix tests**
+
+Add these cases:
+
+```cpp
+void totalDeadlineStopsDripAndNeverResponses_data();
+void totalDeadlineStopsDripAndNeverResponses();
+void abortAfterCaptureCompletesCanceledExactlyOnce();
+void timeoutAndFinishedRaceCompletesExactlyOnce();
+void classifiesCompleteResponseMatrix_data();
+void classifiesCompleteResponseMatrix();
+void shutdownIsOneExactEmptyFormPost();
+```
+
+Use short injected test deadlines and `QElapsedTimer`. One server sends a byte
+often enough to stay below the transfer inactivity timeout but never completes;
+another accepts the request and never sends a byte. Each must finish once near
+the independent total wall-clock deadline, not remain alive indefinitely.
+After `requestCaptured`, `abort(id)` must produce exactly one result with
+`Transport/Canceled`. Exercise timeout and `finished` in the same event-loop
+turn and assert one terminal signal and removal of the pending request.
+
+The data-driven response matrix is exact:
+
+| Wire result | Required result |
+|---|---|
+| connection closes before an HTTP status | `Transport/Network`, `httpStatus == 0` |
+| HTTP 200 plus a truncated declared body | `Transport/Network`, preserving HTTP 200 and raw bytes |
+| health HTTP 200 body `alive` with any or missing MIME type | success |
+| health HTTP 204 empty | `Contract`, preserving HTTP 204/raw body |
+| current-user HTTP 204 empty | `Contract`, preserving HTTP 204/raw body |
+| shutdown complete HTTP 200 or 204 | success regardless of body/MIME |
+| non-2xx with a valid XC2 error JSON | `Backend`, preserving HTTP status, wire `status`, wire `code`, and raw bytes |
+| a malformed success payload or malformed non-2xx error | `Contract`, preserving any HTTP status and raw bytes |
+| any 3xx | failure and no redirect; valid XC2 error JSON is classified `Backend` |
+
+Transport/truncation takes precedence over the HTTP/body matrix. Cancellation
+and timeout take precedence over a network error produced by `abort()`. The
+shutdown capture must be exactly one `POST` with request-target
+`/xc2/1.0/serviceStatus/shutdown`, content type
+`application/x-www-form-urlencoded`, `Content-Length: 0`, an empty body, and no
+retry. Close without a response and wait beyond the request deadline to prove
+`requestCount() == 1`.
+
+- [ ] **Step 4: Run the REST target to verify red behavior**
 
 ```powershell
 rtk cmake --build build-test --target test_Xc2RestClient --parallel
@@ -934,23 +1041,31 @@ rtk cmake --build build-test --target test_Xc2RestClient --parallel
 
 Expected: missing-client compile failure.
 
-- [ ] **Step 3: Implement the domain-oriented public interface**
+- [ ] **Step 5: Implement the owned transport and domain interface**
 
 ```cpp
+enum class Xc2TransportReason { None, Canceled, Timeout, Network };
+
 using Xc2RequestId = quint64;
+
+struct Xc2RestClientOptions {
+    int totalDeadlineMs = 10000;
+    int transferTimeoutMs = 3000;
+};
 
 class Xc2RestClient final : public QObject {
     Q_OBJECT
 public:
-    explicit Xc2RestClient(QObject *parent = nullptr,
-                           QNetworkAccessManager *manager = nullptr);
+    explicit Xc2RestClient(Xc2RestClientOptions options = {},
+                           QObject *parent = nullptr);
     bool setBaseUrl(const QUrl &loopbackRestBase, Xc2Error *error = nullptr);
     QUrl baseUrl() const;
+    QUrl webSocketUrl() const;
 
     Xc2RequestId requestServiceStatus();
     Xc2RequestId requestCurrentUser();
     Xc2RequestId requestShutdown();
-    QByteArray cookieHeaderFor(const QUrl &url) const;
+    Xc2Result<QByteArray> cookieHeaderFor(const QUrl &url) const;
     void abort(Xc2RequestId id);
 
 signals:
@@ -962,33 +1077,52 @@ signals:
 };
 ```
 
-The client owns a dedicated `QNetworkCookieJar` when it owns the network
-manager. Validate host as literal loopback/localhost, build paths only from
-`Xc2ContractProfile`, attach request ID and endpoint enum as reply properties,
-and delete each reply after a single terminal signal. Use a 10-second transfer
-timeout for health/session reads. The client performs no automatic retry.
+Declare `Xc2TransportReason` immediately before the existing `Xc2Error` in
+`Xc2Models.h` and insert the exact member
+`Xc2TransportReason transportReason = Xc2TransportReason::None;` into
+`Xc2Error`; no localized message parsing may substitute for this field.
 
-- [ ] **Step 4: Implement strict reply handling and cookie export**
+The client always creates and owns its own `QNetworkAccessManager` and its own
+`QNetworkCookieJar`; there is no constructor or setter for an external manager
+or jar. Set the manager proxy explicitly to `QNetworkProxy::NoProxy` so system,
+application, or injected proxy state cannot weaken the loopback/redirect/cookie
+guarantees. The proxy test temporarily installs a trap application proxy and
+proves the request still goes directly to the loopback fake.
 
-Treat any 2xx as HTTP success, then apply the endpoint codec. A malformed body
-becomes `Xc2ErrorCategory::Contract`; network failure with no HTTP status becomes
-`Transport`; a JSON XC2 error preserves status/code/raw body. Build the Cookie
-header by joining `QNetworkCookie::toRawForm(QNetworkCookie::NameAndValueOnly)`
-for the WebSocket URL.
+- [ ] **Step 6: Implement one pending record and one completion path**
 
-- [ ] **Step 5: Run REST and contract tests**
+Create one pending record per request containing ID, endpoint, reply pointer,
+deadline timer, forced transport reason, and a completed flag. A single private
+`completeOnce(id)` reads/classifies the finished reply, stops the timer, removes
+the record, emits the endpoint's terminal signal, and calls `deleteLater()`.
+Only `QNetworkReply::finished` may call `completeOnce`; `errorOccurred` merely
+records evidence. `abort(id)` sets `Canceled` and calls `reply->abort()`.
+Deadline expiry sets `Timeout` and calls `reply->abort()`. Neither path emits or
+deletes directly, so abort/error/finished races cannot double-complete.
+
+Start a per-request single-shot wall-clock timer from request creation and also
+set Qt's transfer timeout as an inactivity backstop. The total timer is the
+authority even when bytes continue to arrive. A non-forced network failure maps
+to `Xc2ErrorCategory::Transport` plus `Xc2TransportReason::Network`; successful
+HTTP/body classifications retain `None`. Apply the response matrix from Step 3
+without treating a present HTTP status as proof that a truncated transfer was
+complete.
+
+- [ ] **Step 7: Run REST and contract tests**
 
 ```powershell
 rtk cmake --build build-test --target test_Xc2RestClient --parallel
 rtk ctest --test-dir build-test --output-on-failure -L ktm
 ```
 
-Expected: all tests pass and the fake server records no retry for shutdown.
+Expected: all matrix, strict-URL, redirect-trap, cookie-authority, deadline, and
+exactly-once tests pass; shutdown is one exact request and both redirect traps
+remain at zero requests.
 
-- [ ] **Step 6: Commit the REST client**
+- [ ] **Step 8: Commit the REST client**
 
 ```powershell
-rtk git add CMakeLists.txt src/ktm/xc2/Xc2RestClient.* tests/ktm/FakeHttpServer.* tests/ktm/test_Xc2RestClient.cpp
+rtk git add CMakeLists.txt src/ktm/xc2/Xc2Models.h src/ktm/xc2/Xc2RestClient.* tests/ktm/FakeHttpServer.* tests/ktm/test_Xc2RestClient.cpp
 rtk git commit -m "feat: add strict XC2 REST transport"
 ```
 
@@ -1005,41 +1139,181 @@ rtk git commit -m "feat: add strict XC2 REST transport"
 
 **Interfaces:**
 - Consumes: validated layout from Task 4 and REST health/shutdown from Task 5.
-- Produces: `Xc2LaunchSpec`, `Xc2BackendState`, `Xc2BackendEndpoints`, and asynchronous `Xc2BackendManager` lifecycle.
+- Produces: `Xc2LaunchSpec`, `Xc2BackendState`, `Xc2BackendEndpoints`, the
+  validated startup user, and an asynchronous, PID-owned `Xc2BackendManager`
+  lifecycle.
 
 - [ ] **Step 1: Implement the fake sidecar test executable before manager code**
 
-The fake sidecar is a `QCoreApplication` plus `QTcpServer`. It accepts:
+The fake sidecar is a `QCoreApplication` plus `QTcpServer` that binds exactly
+IPv4 `127.0.0.1`. It accepts:
 
 ```text
 --port <n>
 --ready-delay-ms <n>
+--health-delay-ms <n>
+--never-health
+--late-alive-ms <n>
 --exit-before-ready
 --ignore-shutdown
+--fragment-output
+--oversize-output
+--sensitive-output
+--hold-lock <absolute path>
 ```
 
-It writes one stdout and one stderr marker, returns plain `alive` for
-`GET /xc2/1.0/serviceStatus/status`, exits cleanly after
-`POST /xc2/1.0/serviceStatus/shutdown`, and never opens a non-loopback socket.
+It returns plain `alive` for exact
+`GET /xc2/1.0/serviceStatus/status`, a strict synthetic identity with a
+non-empty `permissions` array for exact `GET /xc2/1.0/auth/currentUser`, and
+exits cleanly after exact empty-form
+`POST /xc2/1.0/serviceStatus/shutdown`. It never opens a non-loopback socket.
+The output modes split logical lines across writes, emit a line larger than the
+client cap, and emit synthetic `Authorization`, `Cookie`, `password`, `token`,
+`sessionIndex`, and `SAMLResponse` fields on both streams. `--hold-lock` obtains
+a `QLockFile` and waits, allowing a test to kill the helper and leave a real
+stale per-user lock file.
 
-- [ ] **Step 2: Write failing manager lifecycle tests**
-
-Use `QSignalSpy`/`QTRY_COMPARE_WITH_TIMEOUT` to cover:
-
-```cpp
-void buildsProductionJavaArguments();
-void selectsLoopbackPortAndBecomesReady();
-void capturesStdoutAndStderr();
-void startupTimeoutDoesNotReportReady();
-void earlyCrashReportsBackendError();
-void stopShutsDownOnlyOwnedProcess();
-void arbitraryServiceOn8082IsNotReused();
-```
-
-Pass `$<TARGET_FILE:fake_xc2_sidecar>` through compile definition
+Pass `$<TARGET_FILE:fake_xc2_sidecar>` to the test through compile definition
 `FAKE_XC2_SIDECAR_PATH`.
 
-- [ ] **Step 3: Run the manager target to verify red behavior**
+- [ ] **Step 2: Write failing launch-profile and bind tests**
+
+Add these cases first:
+
+```cpp
+void productionArgumentsOverrideEveryEmbedded8082();
+void productionArgumentsKeepRequiredJavaOrderingAndProfile();
+void invalidPrerequisiteReportCannotCreateProductionSpec();
+void fakeArgumentsReceiveManagerSelectedPort();
+void rejectsEveryBindAddressExceptIpv4Localhost_data();
+void rejectsEveryBindAddressExceptIpv4Localhost();
+```
+
+`productionArgumentsOverrideEveryEmbedded8082()` calls `argumentsForPort(49123)`
+and requires these exact effective JVM system properties, all before `-jar`:
+
+```text
+-Dserver.address=127.0.0.1
+-Dserver.port=49123
+-Donelogin.saml2.sp.assertion_consumer_service.url=http://127.0.0.1:49123/xc2/1.0/auth/samlACS
+-Donelogin.saml2.sp.single_logout_service.url=http://127.0.0.1:49123/xc2/1.0/auth/samlLogoutSLO
+-Donelogin.saml2.idp.single_sign_on_service.url=http://127.0.0.1:49123/xc2/1.0/auth/mock
+-Donelogin.saml2.idp.single_logout_service.url=http://127.0.0.1:49123/xc2/1.0/auth/mock
+-Dcom.avl.ditest.xc2.gripsresource.prefix=http://127.0.0.1:49123/xc2/1.0/mock/streamer?file={0}
+```
+
+These five approved templates override the four fixed-port URLs in
+`config/custom-cloud.properties` and the GRIPS prefix in patched-JAR resource
+`BOOT-INF/classes/xc2.properties`. Do not generically preserve or rewrite an
+arbitrary source URL path/query. The vendor files remain read-only. Assert the
+joined generated argv and the five effective override values contain no
+`:8082`, every callback/GRIPS authority uses the selected port, and
+`-Dserver.port` is before `-jar`.
+
+Also require `-Dloader.main=com.avl.ditest.xc2.Xc2NgApplication` before `-jar`,
+`-Dspring.profiles.active=dev`, and
+`-Dcom.avl.ditest.xc2.developer=true`. The latter is the explicitly approved
+local diagnostic launch profile only; it does not claim or simulate DealerNet
+authentication. `productionLaunchSpec` consumes a successful Task 4
+`Xc2PrerequisiteReport`, so the checked x86 Java path/PE validation cannot be
+bypassed by passing an arbitrary layout.
+
+Retain the existing required arguments
+`-Dssc.includezip=true`, `-Dlogging.config=config/log.xml`, and
+`-Dspring.config.additional-location=file:./config/custom-cloud.properties`;
+all JVM `-D` arguments, including `loader.main`, the dynamic URL overrides, the
+`dev` profile, and the diagnostic flag, precede the single `-jar` token and the
+absolute `xc2_backend_patched.jar` path.
+
+The fake spec's `argumentsForPort` must return `--port <selected>`. The bind
+table accepts only `QHostAddress::LocalHost` (`127.0.0.1`) and rejects
+`Any`, `AnyIPv4`, `AnyIPv6`, `LocalHostIPv6`, `127.0.0.2`, and non-loopback
+addresses before acquiring a lock or spawning. Endpoints may be derived only as
+`http://127.0.0.1:<selected>/xc2/1.0` and
+`ws://127.0.0.1:<selected>/xc2-websocket` after the address, generation, and
+listener PID have all been validated.
+
+- [ ] **Step 3: Write failing PID ownership, collision, and lock tests**
+
+Use real child processes, `GetExtendedTcpTable`, and bounded
+`QSignalSpy`/`QTRY_COMPARE_WITH_TIMEOUT` checks for:
+
+```cpp
+void readyRequiresSelectedListenerOwnedByCurrentChildPid();
+void validAliveDecoyOn8082IsIgnoredAndSurvives();
+void portStealRaceCleansChildAndRetriesANewPort();
+void shutdownIsSentOnlyToCurrentChildPid();
+void ignoreShutdownIsTerminatedThenKilledWithoutResidue();
+void perUserLockRejectsSecondManagerUntilChildFinished();
+void stalePerUserLockIsRecovered();
+void finishedAndErrorRevokeOwnership();
+```
+
+Start a fake sidecar decoy on `127.0.0.1:8082` that returns a completely valid
+`alive`. Start the manager and prove its selected port is not 8082, the Windows
+listener owner PID equals `ownedProcessId()`, that PID is the manager's current
+fake `QProcess`, and the decoy remains alive after the owned child stops. A
+health response alone is not proof of ownership.
+
+For the port-steal race, let the first `argumentsForPort` callback launch a
+separate fake process on the just-selected candidate before the managed child
+can bind it. The valid response is therefore from the wrong PID. The manager
+must never emit `ready`, asynchronously terminate/kill and reap its failed child,
+select a different port, call `argumentsForPort` again, and become Ready only
+for the new child/PID. Bound retries to three candidates; exhaustion is a
+startup failure with no orphan. The test explicitly reaps its stealer.
+
+Give both managers the same temporary lock path. The first obtains the
+`QLockFile` before spawning; the second emits a busy failure without spawning.
+The lock remains held through graceful shutdown, terminate, kill, and collision
+cleanup, and is released only after the actual child has emitted `finished` and
+`QProcess::state() == NotRunning`. Then the second manager can start. For stale
+recovery, kill the `--hold-lock` helper without running its destructor and prove
+the manager safely recovers that dead-PID lock; it must never remove a live
+owner's lock. Production uses a per-user path under
+`QStandardPaths::AppLocalDataLocation`, while the explicit lock path in
+`Xc2LaunchSpec` is a deterministic test seam.
+
+- [ ] **Step 4: Write failing startup, lifecycle, and output tests**
+
+Add:
+
+```cpp
+void healthPollingIsSingleFlightWithinOneTotalDeadline();
+void startupTimeoutAbortsReplyAndLateAliveCannotReviveRun();
+void currentUserAndPermissionsAreValidatedBeforeReady();
+void earlyCrashReportsBackendErrorAndLeavesNoOwnedRun();
+void stopDuringStartNeverEmitsReady();
+void stopIsIdempotentAndRestartWaitsForStopped();
+void destroyRunningManagerReapsWithoutUiThreadWait();
+void stdoutAndStderrUseIndependentFragmentBuffers();
+void outputLinesAndRingsAreBounded();
+void outputControlsAndSensitiveFieldsAreRemoved();
+```
+
+At most one health request may be pending. A single startup wall-clock deadline
+covers process start, all health attempts, listener ownership verification, and
+the strict `currentUser` request. On timeout, abort the pending REST reply,
+invalidate the run generation, cancel every poll timer, and asynchronously
+terminate then kill. A scripted alive reply delivered after the deadline must
+not transition the stale generation to Ready. Before Ready, parse
+`currentUser`, retain the exact returned `permissions`, and test the synthetic
+diagnostic identity/permission list; missing or malformed identity/permissions
+fails startup rather than being described as DealerNet-authenticated.
+
+Output parsing keeps separate incremental byte buffers and rings for stdout and
+stderr. Emit only complete logical lines (and the final partial line at EOF),
+handle CRLF split across reads, cap each input line at 16 KiB, discard the
+remainder of an oversized line through its delimiter, append one `[truncated]`
+marker, and retain at most 256 sanitized lines per stream. Strip ANSI CSI/OSC
+sequences and C0/C1 controls other than tab before emission. Case-insensitively
+replace values for `Authorization`, `Proxy-Authorization`, `Cookie`,
+`Set-Cookie`, `password`, `token`, `sessionIndex`, `SAMLRequest`, and
+`SAMLResponse` in header, `key=value`, or JSON-string form with `<redacted>`.
+Tests split both the sensitive field name and value across process reads and
+assert neither `outputLine` nor `recentOutput()` contains the synthetic secret.
+
+- [ ] **Step 5: Run the manager target to verify red behavior**
 
 ```powershell
 rtk cmake --build build-test --target test_Xc2BackendManager --parallel
@@ -1047,17 +1321,18 @@ rtk cmake --build build-test --target test_Xc2BackendManager --parallel
 
 Expected: missing manager compile failure.
 
-- [ ] **Step 4: Implement launch spec and manager interface**
+- [ ] **Step 6: Implement launch spec and manager interface**
 
 ```cpp
 struct Xc2LaunchSpec {
     QString program;
-    QStringList arguments;
+    std::function<QStringList(quint16)> argumentsForPort;
     QString workingDirectory;
     QHostAddress bindAddress = QHostAddress::LocalHost;
-    quint16 port = 0;
+    QString lockFilePath;
     int startupTimeoutMs = 60000;
     int shutdownTimeoutMs = 5000;
+    int maxPortAttempts = 3;
 };
 
 enum class Xc2BackendState {
@@ -1073,13 +1348,17 @@ class Xc2BackendManager final : public QObject {
     Q_OBJECT
 public:
     explicit Xc2BackendManager(QObject *parent = nullptr);
-    static Xc2LaunchSpec productionLaunchSpec(
-        const Xc2InstallLayout &layout, quint16 port);
+    ~Xc2BackendManager() override;
+    static Xc2Result<Xc2LaunchSpec> productionLaunchSpec(
+        const Xc2PrerequisiteReport &report);
     void start(Xc2LaunchSpec spec);
     void stop();
     Xc2BackendState state() const;
     bool ownsProcess() const;
+    qint64 ownedProcessId() const;
     Xc2BackendEndpoints endpoints() const;
+    std::optional<Xc2CurrentUser> currentUser() const;
+    QStringList recentOutput(bool standardError) const;
 
 signals:
     void stateChanged(Xc2BackendState);
@@ -1090,41 +1369,58 @@ signals:
 };
 ```
 
-- [ ] **Step 5: Implement non-blocking ownership and health polling**
+- [ ] **Step 7: Implement run-scoped ownership and Windows listener proof**
 
-Use `QProcess::setProgram`, `setArguments`, and `setWorkingDirectory`; connect
-`started`, both ready-read signals, `errorOccurred`, and `finished`. Allocate a
-port by briefly binding `QTcpServer` to `127.0.0.1:0`, then close before launch.
-The production arguments are, in order:
+Represent each run with its own generation, `QProcess`, `QLockFile`, selected
+port, process ID, startup/shutdown timers, poll timer, pending REST request IDs,
+output buffers, and completion state. `start()` is accepted only in `Stopped`.
+Validate the spec and obtain the per-user lock before selecting a port or
+spawning. Select a candidate by briefly binding `QTcpServer` to
+`127.0.0.1:0`, reject candidate 8082, close it, then and only then call
+`argumentsForPort(selected)`. Set `QProcess` program/arguments/working directory
+and connect `started`, both ready-read signals, `errorOccurred`, and `finished`
+with the captured generation. Every process signal, timer callback, REST result,
+and reaper/collision continuation checks that captured generation before reading
+or mutating the current run.
 
-```text
--Dserver.address=127.0.0.1
--Dserver.port=<selected>
--Dssc.includezip=true
--Dlogging.config=config/log.xml
--Dloader.main=com.avl.ditest.xc2.Xc2NgApplication
--Dspring.config.additional-location=file:./config/custom-cloud.properties
--Dspring.profiles.active=dev
--jar
-<absolute xc2_backend_patched.jar>
-```
+On Windows, query `GetExtendedTcpTable(TCP_TABLE_OWNER_PID_LISTENER)` and match
+the network-byte-order local port plus IPv4 `127.0.0.1`. Ready requires all of:
+current generation, live current `QProcess`, successful `alive`, listener PID
+equal to `QProcess::processId()`, and a strict current-user result. Re-run the
+same PID check immediately before shutdown. POST shutdown only when it still
+matches; if another PID owns the port, send it zero requests and clean up only
+the manager-owned `QProcess`. Link `Iphlpapi`. `finished` and `errorOccurred`
+immediately revoke network ownership for that generation; never let a PID or
+endpoint from a prior run authorize a later callback.
 
-Poll health with bounded timer-owned GETs until ready/deadline. `stop()` posts
-shutdown only when `ownsProcess` is true, then terminates after timeout and
-kills only as a final owned-process cleanup. Never call `waitForStarted` or
-`waitForFinished` on the UI thread.
+Health polling is timer-driven and schedules the next request only after the
+previous one finishes. `stop()` is idempotent in `Stopped`/`Stopping`, cancels
+old timers, invalidates the generation's ability to become Ready, and follows
+verified shutdown -> terminate -> kill without blocking. A restart is rejected
+until the prior child is truly NotRunning and `stopped` has transitioned the
+manager back to `Stopped`.
 
-- [ ] **Step 6: Run manager and all KTM tests**
+The destructor must not call `waitForStarted`, `waitForFinished`, or run a local
+event loop on the UI thread. Move a still-running process together with its
+lock into an application-lifetime internal reaper that performs asynchronous
+terminate/kill, observes `finished`/`NotRunning`, and only then unlocks and
+deletes the process context. Thus destruction returns promptly without either
+orphaning a child or releasing the lock while that child still exists.
+
+- [ ] **Step 8: Run manager and all KTM tests**
 
 ```powershell
 rtk cmake --build build-test --target test_Xc2BackendManager --parallel
 rtk ctest --test-dir build-test --output-on-failure -L ktm
 ```
 
-Expected: manager reaches Ready only after health responds and shuts down the
-fake child without leaving a process.
+Expected: Ready is gated by the selected child PID plus strict health/user
+results; dynamic-port overrides, lock/collision recovery, stale-generation
+suppression, output bounds/redaction, and all stop/destruction paths pass with
+no child residue. The valid 8082 decoy and redirect/port-steal traps remain
+alive and receive no unauthorized shutdown.
 
-- [ ] **Step 7: Commit the owned manager**
+- [ ] **Step 9: Commit the owned manager**
 
 ```powershell
 rtk git add CMakeLists.txt src/ktm/xc2/Xc2BackendManager.* tests/ktm/fake_xc2_sidecar.cpp tests/ktm/test_Xc2BackendManager.cpp
