@@ -1840,30 +1840,75 @@ rtk git commit -m "feat: add XC2 STOMP WebSocket transport"
 ## Task 8: Job Registry and Foundation Contract Probe
 
 **Files:**
+- Modify: `src/ktm/xc2/Xc2ContractProfile.h`
+- Modify: `src/ktm/xc2/Xc2ContractProfile.cpp`
 - Create: `src/ktm/xc2/Xc2JobRegistry.h`
 - Create: `src/ktm/xc2/Xc2JobRegistry.cpp`
+- Modify: `tests/ktm/test_Xc2ContractProfile.cpp`
 - Create: `tests/ktm/test_Xc2JobRegistry.cpp`
 - Create: `tests/ktm/xc2_contract_probe.cpp`
+- Create: `tests/ktm/test_Xc2ContractProbe.cpp`
 - Create: `tests/ktm/run_xc2_mock_contract.ps1`
+- Modify: `tests/ktm/FakeXc2TransportServer.h`
+- Modify: `tests/ktm/FakeXc2TransportServer.cpp`
+- Create: `.github/workflows/ktm-xc2-foundation.yml`
 - Modify: `CMakeLists.txt`
+- Modify: `docs/superpowers/specs/2026-07-16-ktm-xc2-integration-design.md`
 - Modify: `docs/superpowers/plans/2026-07-16-ktm-xc2-foundation-plan.md`
 
 **Interfaces:**
-- Consumes: strict job progress model/codec from Task 2 and `/topic/progress` messages from Task 7.
-- Produces: `Xc2JobRegistry`, terminal job records, a read-only live contract probe, and completed plan checkboxes.
+- Consumes: the frozen profile from Task 1, strict progress model/codec from
+  Task 2, authority-bound REST session from Task 5, and generation/message
+  identity plus bounded abort/disconnect behavior from Task 7.
+- Produces: `Xc2JobEvent`, `Xc2JobRecord`, deterministic `Xc2JobRegistry`, an
+  explicitly scoped read-only live probe, its real-process fake integration
+  suite, and three-platform completion evidence.
+
+**Intentional boundaries:**
+
+- The registry records backend facts. It does not infer that an event belongs to
+  the only active job, enforce VCI ownership, or synthesize progress after a
+  visibility gap. The later session controller owns concurrency gates.
+- Probe success validates only the approved read-only foundation surface. It
+  neither proves the selected service came from the approved JAR hash nor
+  authorizes device, vehicle, ECU, flow, measurement, or flash operations.
+- The probe never includes or instantiates `Xc2InstallationProbe`,
+  `Xc2BackendManager`, `QProcess`, Java, or a JAR. CI starts only the probe child
+  and the in-process loopback fake; it never starts an XC2 artifact.
 
 - [ ] **Step 1: Write failing job-registry tests**
 
-Cover:
+Use `QSignalSpy` and data rows for all four terminal states. Add:
 
 ```cpp
 void acceptedJobStartsCreated();
+void duplicateAcceptIsIdempotentAndNeverResets();
+void rejectsBlankAndRetiredJobIdsAtomically();
 void progressTransitionsCreatedToInProgressToFinished();
-void terminalJobRejectsFurtherProgress();
+void everyTerminalStateRejectsEveryLaterProgress();
 void unknownJobIsCreatedFromProgressWithoutLosingEvent();
-void visibilityLossPreservesStateAndLaterProgressRecovers();
-void clearRemovesOnlyRequestedTerminalJob();
+void progressNeverAttachesToAnotherActiveJob();
+void duplicateDeliveryIsIdempotent();
+void reusedDeliveryIdentityWithDifferentPayloadIsContractError();
+void identicalPayloadWithDifferentIdentityRemainsOrdered();
+void semanticValidationRejectsInvalidAndRegressiveProgress();
+void terminalTransitionEmitsChangedThenTerminalExactlyOnce();
+void activeJobsHaveStableFirstObservedOrder();
+void repeatedVisibilityLossIsIdempotentAndOrdered();
+void laterGenerationProgressRecoversOnlyItsExactJob();
+void staleGenerationCannotRecoverVisibility();
+void clearRemovesOnlyRequestedTerminalAndEmitsRemoved();
+void clearedTerminalCannotBeRecreatedByLateMessages();
+void malformedOrNonProgressMessageDoesNotMutate();
 ```
+
+Construct events with explicit Task 7 generation and `message-id`. Tests compare
+complete before/after snapshots on every rejected call and assert zero signals.
+An identical `(generation, message-id, payload)` replay is successful but has no
+mutation or signal. Reusing the same `(generation, message-id)` with a different
+payload is `Contract`; an equal payload under a different delivery identity is a
+distinct accepted event and is preserved. This avoids unsafe content-based
+deduplication.
 
 - [ ] **Step 2: Run registry tests to verify red behavior**
 
@@ -1873,13 +1918,19 @@ rtk cmake --build build-test --target test_Xc2JobRegistry --parallel
 
 Expected: missing-registry compile failure.
 
-- [ ] **Step 3: Implement registry interface and invariants**
+- [ ] **Step 3: Implement the delivery envelope and registry interface**
 
 ```cpp
+struct Xc2JobEvent {
+    Xc2StompGeneration generation = 0;
+    QString messageId;
+    Xc2JobProgress progress;
+};
+
 struct Xc2JobRecord {
     QString jobId;
     Xc2JobState state = Xc2JobState::Created;
-    QList<Xc2JobProgress> events;
+    QList<Xc2JobEvent> events;
     bool visibilityLost = false;
     bool terminal() const;
 };
@@ -1889,91 +1940,290 @@ class Xc2JobRegistry final : public QObject {
 public:
     explicit Xc2JobRegistry(QObject *parent = nullptr);
     bool accept(const Xc2JobAccepted &job, Xc2Error *error = nullptr);
-    bool apply(const Xc2JobProgress &progress, Xc2Error *error = nullptr);
-    void markVisibilityLost();
+    bool apply(const Xc2JobEvent &event, Xc2Error *error = nullptr);
+    bool applyMessage(const Xc2StompMessage &message,
+                      Xc2Error *error = nullptr);
+    void markVisibilityLost(Xc2StompGeneration generation);
     std::optional<Xc2JobRecord> job(const QString &jobId) const;
     QList<Xc2JobRecord> activeJobs() const;
-    bool clearTerminal(const QString &jobId);
+    bool clearTerminal(const QString &jobId, Xc2Error *error = nullptr);
 
 signals:
     void jobChanged(const Xc2JobRecord &);
     void jobTerminal(const Xc2JobRecord &);
+    void jobRemoved(const QString &jobId);
 };
 ```
 
-Allowed backend-state transitions are `Created -> InProgress -> terminal` and
-direct `Created -> terminal`. `markVisibilityLost()` sets the independent
-`visibilityLost` flag on non-terminal records without changing their last known
-backend state. The next accepted authoritative progress event for the same
-`jobId` clears that flag and may continue to `InProgress` or a terminal state.
-No event can change Finished/Canceled/Error/NotAuthorized to another state.
-Keep every accepted ordered progress event and test loss followed by recovered
-progress and completion.
+Declare `Q_DECLARE_METATYPE` outside the namespace for `Xc2JobEvent` and
+`Xc2JobRecord`, and register them before `QSignalSpy` use. `applyMessage()`
+requires `Topic::Progress`, the exact profile destination, non-empty Task 7
+`messageId`, and a strict successful `Xc2JsonCodec::jobProgress()` result before
+constructing an event. Do not trust topic text or parse the body a second way.
 
-- [ ] **Step 4: Add the read-only contract probe**
+- [ ] **Step 4: Implement one atomic transition and signal policy**
 
-`xc2_contract_probe` accepts `--base-url` and performs only:
+Validate the complete input before changing maps, ordering, visibility,
+tombstones, or event lists. Apply this exact table:
 
-1. loopback URL validation;
-2. `GET serviceStatus/status`;
-3. `GET auth/currentUser`;
-4. STOMP CONNECT plus subscriptions to status topics;
-5. clean DISCONNECT.
+| Operation | Result and mutation | Signals |
+|---|---|---|
+| first valid `accept(jobId)` | append jobId to first-observed order; create `Created`, empty events, visible | one `jobChanged` |
+| `accept` for an existing retained record, including terminal | successful idempotent replay; never reset state/events/visibility | none |
+| blank/whitespace or tombstoned `accept` | fail without mutation | none |
+| first valid event for an unknown job | create the exact jobId, preserve the event, set its reported state | `jobChanged`, then `jobTerminal` only if terminal |
+| exact delivery replay with identical payload | successful idempotent replay | none |
+| same delivery identity with different payload | `Contract` failure | none |
+| valid event for `Created`/`InProgress` | append once, transition, and clear visibility only under the generation rule below | `jobChanged`, then `jobTerminal` only if terminal |
+| any event for a terminal record | `Job` failure, including an identical terminal payload under a new identity | none |
+| first `markVisibilityLost(generation)` | set the independent flag on each non-terminal record in stable order; retain backend state | one ordered `jobChanged` per changed record |
+| repeated loss or loss with no active jobs | no-op | none |
+| clear unknown/non-terminal job | return false without mutation | none |
+| clear terminal job | remove only that visible record and retain a registry-lifetime tombstone | one `jobRemoved` |
 
-It must not call device lookup, vehicle detection, autoscan, ECU endpoints, flow,
-or flash. Exit codes are `0` compatible, `2` prerequisite/URL, `3` REST schema,
-`4` STOMP protocol, and `5` missing local session permission.
+Delivery identity is registry-global, not per job: reuse of the same pair for a
+different job is the same conflicting-payload `Contract` failure. Require a
+non-zero generation and non-empty message ID, and compare every progress field
+plus raw JSON when deciding whether a replay is identical.
 
-`run_xc2_mock_contract.ps1` takes mandatory `-BaseUrl`; it never starts a JAR.
-This prevents tests from selecting the wrong mock/production artifact. The
-current local mock at port 8082 can be probed explicitly after login; CI uses
-only fake/golden tests.
+`jobId` is an exact opaque key: never trim, normalize, case-fold, or attach an
+unknown event to the only active record. Reject an ID whose trimmed form is
+empty, but preserve every other accepted byte-for-byte QString value. Set
+`Xc2Error::jobId` on failures. Model-shape/event-identity failures are
+`Contract`; illegal lifecycle transitions are `Job`. Clear a supplied error on
+every successful call, including idempotent success.
 
-- [ ] **Step 5: Run the full foundation suite and optional local probe**
+`Created` is internal and invalid in an event. Require non-negative `ticks` and
+`totalTicks`; when total is positive require `ticks <= totalTicks`. For repeated
+`InProgress`, ticks cannot decrease, and a previously known positive total
+cannot return to zero or decrease. A terminal event remains authoritative after
+those basic range checks and is not rejected solely because its counters are
+lower than the last non-terminal counters; error/cancel payloads may report
+terminal-local counts.
 
-```powershell
-rtk cmake --build build-test --parallel
-rtk ctest --test-dir build-test --output-on-failure -L ktm
-rtk .\build-test\xc2_contract_probe.exe --base-url http://127.0.0.1:8082/xc2/1.0
+Store first-observed job IDs separately from lookup storage so `activeJobs()` is
+deterministic across processes and excludes terminal records without reordering
+the remainder. `markVisibilityLost(g)` remembers the lost generation. Only a
+valid event for that same job with `event.generation > g` clears the flag; an
+older/equal generation is stale and cannot mutate or restore visibility. A
+record from another job never clears it. Tombstones live for the registry's
+session lifetime; a later controller creates a new registry for a new sidecar
+session rather than silently reusing retired IDs.
+
+- [ ] **Step 5: Write the real-process probe integration tests before the probe**
+
+Extend Task 7's single-authority `FakeXc2TransportServer`; do not create an HTTP
+fake and WebSocket fake on different ports. Add scripts for strict health and
+current-user responses, current-user 204, valid/malformed error JSON, truncated
+and no-response REST, WebSocket/subprotocol failures, missing CONNECTED,
+STOMP ERROR, wrong/missing disconnect receipt, and close/deadline races. Capture
+all REST method/targets/bodies, upgrade headers, selected subprotocol, and STOMP
+frames. Count both profile-classified state-changing REST calls and every
+unexpected REST/STOMP operation.
+
+`test_Xc2ContractProbe` launches the actual `$<TARGET_FILE:xc2_contract_probe>`
+with `QProcess`; no in-process call may substitute for process exit behavior.
+Pass the target and script paths through compile definitions. Add:
+
+```cpp
+void happyPathUsesExactReadOnlyAllowlist();
+void happyPathUsesDerivedCookieAndV12Stomp();
+void invalidCliOrBaseExitsTwoBeforeNetwork_data();
+void invalidCliOrBaseExitsTwoBeforeNetwork();
+void restTransportAndOverallDeadlineExitTwo_data();
+void restTransportAndOverallDeadlineExitTwo();
+void malformedRestContractsExitThree_data();
+void malformedRestContractsExitThree();
+void stompFailuresExitFour_data();
+void stompFailuresExitFour();
+void unauthenticated204AndMissingPermissionExitFive_data();
+void unauthenticated204AndMissingPermissionExitFive();
+void finishAndDeadlineRaceExitsOnceAndCleansConnections();
+void outputNeverContainsCookieOrUserSentinels();
+void wrapperPreservesEveryProbeExitCode_data();
+void wrapperPreservesEveryProbeExitCode();
 ```
 
-Expected CTest result: `100% tests passed`. The optional probe returns `0` only
-when the explicitly selected backend has a current permitted local session; an
-unauthenticated mock returns exit `5` and is recorded as an environment result,
-not converted into a passing contract result.
-
-- [ ] **Step 6: Verify non-Windows builds exclude the feature**
-
-Run in Linux/macOS CI:
+For every row, require `QProcess::NormalExit`, the exact exit code, bounded wall
+time, no open fake connection after cleanup, zero state-changing requests, and
+zero unexpected requests/frames. The success capture is exactly:
 
 ```text
-cmake -B build -DRX14_KTM_XC2=OFF -DBUILD_TESTING=ON
-cmake --build build --parallel
-ctest --test-dir build --output-on-failure
+GET /xc2/1.0/serviceStatus/status
+GET /xc2/1.0/auth/currentUser
+GET /xc2-websocket  (WebSocket upgrade, derived Cookie, v12.stomp)
+CONNECT
+SUBSCRIBE /topic/vci/status
+SUBSCRIBE /topic/login
+DISCONNECT receipt:disconnect-<generation>
+RECEIPT receipt-id:disconnect-<generation>
+normal WebSocket close
 ```
 
-Expected: romHEX14 builds without searching for Qt WebSockets or Qt Test, and
-no KTM target/action is present.
+The fake returns observed `CONNECTED heart-beat:0,0`, so no heartbeat obscures
+the exact frame allowlist. Require zero shutdown, login, logout, device, vehicle,
+autoscan, ECU, measurement, flow, flash, SEND, ACK, NACK, or UNSUBSCRIBE calls.
+Success does not wait for a topic MESSAGE: the matching DISCONNECT receipt proves
+the broker processed the preceding ordered subscriptions without triggering a
+domain operation.
 
-- [ ] **Step 7: Mark every completed checkbox and self-review the implementation**
+- [ ] **Step 6: Register probe tests and verify both new targets are red**
 
-Run:
+Create `xc2_job_registry` with labels `unit;contract;ktm`. Create
+`xc2_contract_probe_integration` with labels `contract;integration;ktm` and a
+CTest `TIMEOUT` greater than the test's short injected deadlines but low enough
+to fail a hung child. Do not register the live probe itself as a CTest.
 
 ```powershell
-rtk rg -n "TBD|TODO|FIXME|PLACEHOLDER" src/ktm tests/ktm docs/superpowers/plans/2026-07-16-ktm-xc2-foundation-plan.md
+rtk cmake --build build-test --target test_Xc2JobRegistry test_Xc2ContractProbe --parallel
+```
+
+Expected: missing registry/probe compilation fails after CMake knows both
+targets; the optional port-8082 service is never contacted.
+
+- [ ] **Step 7: Implement the exact read-only contract probe**
+
+Add these immutable Task 1 policy values and tests:
+
+```cpp
+QList<Topic> foundationProbeTopics() const;          // VciStatus, Login
+QStringList foundationProbePermissions() const;     // EcuDiagnosticRead
+```
+
+Both lists are exact and ordered. Permission comparison is case-sensitive.
+Do not use `allTopics()` or accept arbitrary permission/topic CLI values.
+
+Parse arguments without letting `QCommandLineParser::process()` choose exit 1.
+Require exactly one `--base-url <raw-string>`, allow at most one
+`--timeout-ms <100..120000>` with default `30000`, reject all positional,
+duplicate, unknown, empty, overflow, and malformed values with exit 2 and zero
+network. `--help` is the conventional informational exit 0 with zero network and
+does not represent a compatibility result. Pass the raw base string to the Task
+5 strict loopback validator without prior URL normalization.
+
+After validation, start one `QDeadlineTimer`/single-shot wall-clock authority and
+run this asynchronous state sequence without nested event loops or blocking
+waits:
+
+1. `requestServiceStatus()` and require strict `alive`.
+2. `requestCurrentUser()` on the same owned manager/cookie jar.
+3. Require non-blank `loginName` and `name`, then exact `EcuDiagnosticRead`
+   permission. Blank identity is a REST contract failure, not an authenticated
+   permission failure.
+4. Queue exactly `VciStatus` and `Login` desires, then call Task 7
+   `connectToBackend(restClient)` so URL and Cookie cannot be retargeted.
+5. Wait for valid `v12.stomp` CONNECTED and exactly the two current-generation
+   `subscriptionSent` signals in profile order.
+6. Call `disconnectFromBackend()` and succeed only after Task 7 reports the
+   matching receipt and normal close with no terminal error.
+
+Track the current REST request ID, STOMP generation, stage, and a completed flag.
+Every callback first verifies identity and checks whether the outer deadline has
+expired. One `finishOnce(code)` stops timers, aborts a pending Task 5 request,
+calls Task 7 `abortCurrentGeneration()` when needed, closes resources, and exits
+the process once. The outer deadline includes Task 7's internal connect and
+graceful-disconnect work; those are backstops, not permission to exceed it.
+
+Use this complete result table:
+
+| Condition | Exit |
+|---|---:|
+| normal read-only sequence and receipt-confirmed close | `0` |
+| invalid CLI/base URL; REST transport/timeout; health or user backend unavailable; overall deadline while in REST | `2` |
+| REST `Contract`, including malformed success/error payload and health 204 | `3` |
+| WebSocket upgrade/subprotocol, STOMP negotiation/frame/subscription/receipt/close failure, or overall deadline after STOMP begins | `4` |
+| exact current-user HTTP 204 with empty body; strictly decoded HTTP 401/403 XC2 auth error; valid user missing exact `EcuDiagnosticRead` | `5` |
+
+Task 5 deliberately retains current-user 204 as `Contract`. Only the probe's
+known current-user stage plus exact `httpStatus == 204` and empty raw body maps
+that environment result to 5. A malformed 401/403 error remains 3; other backend
+errors remain 2. Health 204 never maps to 5.
+
+Write only a bounded diagnostic containing stage, category, HTTP status, XC2
+code, and sanitized summary. Never print response raw bytes, Cookie/Set-Cookie,
+login/name/dealer fields, permissions, sessionIndex, developer detail, or an
+arbitrary backend message. Exit 0 must not persist approval or enable any later
+state-changing capability.
+
+- [ ] **Step 8: Implement the strict PowerShell wrapper**
+
+`run_xc2_mock_contract.ps1` uses `[CmdletBinding()]` with mandatory raw string
+`-BaseUrl`, optional literal `-ProbePath` defaulting to the repository's exact
+`build-test/xc2_contract_probe.exe`, and validated `-TimeoutMs` defaulting to
+`30000`. Do not type `BaseUrl` as `[Uri]`, because PowerShell normalization would
+hide inputs that the C++ validator must reject. Resolve and require one existing
+leaf ProbePath, invoke it with an argument array, then immediately assign
+`$probeExitCode = $LASTEXITCODE` and finish with
+`exit [int]$probeExitCode` before running another command.
+
+The wrapper contains no default backend URL, Java/JAR lookup, installation
+inspection, process manager, `Start-Process`, login, or shutdown. A missing probe
+path is wrapper exit 2; it must never fall back to another build
+or executable. The integration test supplies the exact CMake target path and
+proves pass-through of `0`, `2`, `3`, `4`, and `5`, including a path containing
+spaces.
+
+- [ ] **Step 9: Run narrow Windows verification and the optional live probe**
+
+```powershell
+rtk cmake --build build-test --target test_Xc2JobRegistry test_Xc2ContractProbe --parallel
+rtk ctest --test-dir build-test --output-on-failure -R "^xc2_(job_registry|contract_probe_integration)$"
+rtk proxy powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\ktm\run_xc2_mock_contract.ps1 -BaseUrl http://127.0.0.1:8082/xc2/1.0 -ProbePath .\build-test\xc2_contract_probe.exe -TimeoutMs 30000
+```
+
+The first two commands are mandatory and deterministic. The third is optional
+environment evidence only. It returns 0 only for the narrowly defined read-only
+surface and a current user with `EcuDiagnosticRead`; an unauthenticated local
+mock returns 5 and is recorded, never converted into a passing test. It neither
+starts nor stops the explicitly selected service.
+
+- [ ] **Step 10: Add required three-platform CI evidence**
+
+Create `ktm-xc2-foundation.yml` for `pull_request` and branch pushes; do not use
+the manual packaging/release workflow as the only test gate. Its Windows job
+installs Qt WebSockets, configures `BUILD_TESTING=ON` and `RX14_KTM_XC2=ON`,
+builds, and runs `ctest --output-on-failure -L ktm`. It runs only fake/golden
+tests and never downloads or launches XC2/Java.
+
+Linux and macOS jobs explicitly configure
+`-DBUILD_TESTING=ON -DRX14_KTM_XC2=OFF`, build romHEX14, and run all registered
+base tests. Keep Qt WebSockets absent where the platform packaging allows it and
+assert from build-system target help/file-api data that `rx14_ktm_xc2`,
+`xc2_contract_probe`, and every KTM test target are absent. A successful Windows
+`RX14_KTM_XC2=OFF` configure is useful local evidence for the option-off branch,
+but it is not evidence of a non-Windows build. Do not check this step from the
+current Windows workstation; retain the Linux/macOS job URLs and commit SHA.
+
+- [ ] **Step 11: Self-review and commit the implementation to trigger CI**
+
+```powershell
+rtk rg -n "T[B]D|T[O]DO|F[I]XME|P[L]ACEHOLDER" src/ktm tests/ktm docs/superpowers/plans/2026-07-16-ktm-xc2-foundation-plan.md docs/superpowers/specs/2026-07-16-ktm-xc2-integration-design.md
 rtk git diff --check
 rtk git status --short
-```
-
-Expected: no implementation placeholders, no whitespace errors, and only the
-intentional plan checkbox update is uncommitted.
-
-- [ ] **Step 8: Commit registry, probe, and completed plan state**
-
-```powershell
-rtk git add CMakeLists.txt src/ktm/xc2/Xc2JobRegistry.* tests/ktm/test_Xc2JobRegistry.cpp tests/ktm/xc2_contract_probe.cpp tests/ktm/run_xc2_mock_contract.ps1 docs/superpowers/plans/2026-07-16-ktm-xc2-foundation-plan.md
+rtk git add CMakeLists.txt .github/workflows/ktm-xc2-foundation.yml src/ktm/xc2/Xc2ContractProfile.* src/ktm/xc2/Xc2JobRegistry.* tests/ktm/FakeXc2TransportServer.* tests/ktm/test_Xc2ContractProfile.cpp tests/ktm/test_Xc2JobRegistry.cpp tests/ktm/test_Xc2ContractProbe.cpp tests/ktm/xc2_contract_probe.cpp tests/ktm/run_xc2_mock_contract.ps1 docs/superpowers/specs/2026-07-16-ktm-xc2-integration-design.md docs/superpowers/plans/2026-07-16-ktm-xc2-foundation-plan.md
 rtk git commit -m "feat: complete the XC2 communication foundation"
 ```
+
+Before the commit, status may contain exactly the Task 8 implementation files
+listed above plus intentional checkbox changes; the old expectation that only a
+plan checkbox is uncommitted is invalid. Leave Step 10 and the final completion
+checkbox unchecked until the pushed commit's three jobs finish.
+
+- [ ] **Step 12: Record CI evidence, finish checkboxes, and commit docs**
+
+After the implementation commit is pushed, require green Windows, Linux, and
+macOS jobs for that exact SHA. Record their run URLs/SHA beside this step, mark
+only evidence-backed checkboxes, rerun `rtk git diff --check`, and commit the
+plan-only follow-up:
+
+```powershell
+rtk git add docs/superpowers/plans/2026-07-16-ktm-xc2-foundation-plan.md
+rtk git commit -m "docs: record XC2 foundation verification"
+```
+
+If any platform job is unavailable or red, keep this task and the Phase 1 gate
+open. A local Windows run, source inspection, or configured workflow file is not
+a substitute for non-Windows execution evidence.
 
 ## Phase 1 Completion Gate
 
@@ -1989,6 +2239,12 @@ artifacts rather than intent:
   retry.
 - STOMP handles fragmentation, heartbeats, content length, topic allowlisting,
   and visibility loss.
-- Terminal job transitions cannot be rewritten.
-- The optional live probe performs read-only contract operations only.
-- The main application still builds with `RX14_KTM_XC2=OFF`.
+- Job delivery identity, atomic signals, stable ordering, visibility recovery,
+  terminal tombstones, and non-regressive progress behave deterministically.
+- The real probe executable passes the single-authority fake allowlist with zero
+  state-changing/unexpected calls and every documented exit code.
+- The optional live probe performs only the two approved REST reads, two status
+  subscriptions, and receipt-confirmed disconnect under one deadline.
+- Green Windows-ON and Linux/macOS-OFF CI jobs exist for the same commit; the
+  main application builds with `RX14_KTM_XC2=OFF` without KTM targets or Qt
+  WebSockets/Test discovery.

@@ -182,12 +182,18 @@ generation immediately to enforce a wider REST-plus-WebSocket operation
 deadline; graceful success, graceful timeout, and caller cancellation remain
 distinguishable outcomes.
 
-### 6.4 `KtmJobRegistry`
+### 6.4 `Xc2JobRegistry`
 
-REST operations that start work return a `jobID`. `KtmJobRegistry` creates one
-record per job and correlates all subsequent progress events by that ID.
+REST operations that start work return a `jobID`. `Xc2JobRegistry` creates one
+record per exact job ID and correlates subsequent `/topic/progress` messages
+without guessing from the number or order of active jobs. Each accepted event
+retains its Task 7 connection generation, STOMP `message-id`, strict decoded
+progress model, and raw JSON. The pair `(generation, message-id)` is the delivery
+identity: an identical replay is idempotent, while reuse of that identity with a
+different payload is a contract error. Equal progress payloads delivered under
+different identities remain distinct ordered events.
 
-The normalized job states are:
+The normalized backend states are:
 
 - `Created`
 - `InProgress`
@@ -195,10 +201,27 @@ The normalized job states are:
 - `Canceled`
 - `Error`
 - `NotAuthorized`
-- `VisibilityLost`
+
+`VisibilityLost` is not a backend state and never replaces one of those values.
+It is an orthogonal record flag set when an established STOMP generation is
+lost. Repeating the same loss is idempotent. Only a valid authoritative event
+from a later generation clears the flag for that event's exact job ID; it does
+not clear other jobs or synthesize progress. Terminal backend states are
+immutable regardless of later transport activity.
+
+Registry mutations are validate-then-commit and emit value snapshots exactly
+once. A new REST acceptance creates `Created`; an existing acceptance is an
+idempotent replay and cannot reset progress. A valid first progress event may
+create an unknown job without losing that event. Progress may move `Created` to
+`InProgress` or directly terminal, and `InProgress` to another non-regressive
+`InProgress` event or terminal. Clearing a terminal record leaves a session-
+lifetime tombstone so a late acceptance or progress message cannot recreate it.
+Active records and visibility-change signals use stable first-observed order.
 
 Only one diagnostic or programming job may own the VCI at a time. Measurement
-streaming also counts as an active VCI operation until explicitly stopped.
+streaming also counts as an active VCI operation until explicitly stopped. That
+ownership gate belongs to `KtmSessionController`; the registry records facts and
+does not infer operation ownership from job order.
 
 ### 6.5 `KtmSessionController`
 
@@ -305,7 +328,9 @@ The journal is diagnostic evidence, not a generic resume token.
 3. Start the approved sidecar on a private loopback port.
 4. Wait for health readiness.
 5. Establish REST session and verify current-user permissions.
-6. Connect STOMP and subscribe to status topics.
+6. Connect STOMP and initially subscribe only to `/topic/vci/status` and
+   `/topic/login`; later controllers add other approved topics when their
+   workflow becomes active.
 7. Discover and select VCI2K.
 8. Enable vehicle operations only after `VciReady`.
 
@@ -448,6 +473,29 @@ The original XC2 mock JAR is used as an external test fixture to validate:
 
 Sanitized golden JSON/STOMP fixtures are committed for deterministic CI. The
 external JAR is not committed.
+
+An optional live foundation probe never starts Java or a JAR and never uses the
+backend manager. It accepts an explicit loopback REST base, performs only
+`GET serviceStatus/status`, `GET auth/currentUser`, an authority-bound
+`v12.stomp` connection using the REST cookie, subscriptions to
+`/topic/vci/status` and `/topic/login`, and a receipt-confirmed DISCONNECT. It
+uses one wall-clock deadline across REST and WebSocket work and requires the
+case-sensitive `EcuDiagnosticRead` permission. Its success means only that this
+read-only foundation surface is compatible; it does not approve artifact
+provenance or enable device, vehicle, ECU, flow, or flash operations.
+
+Probe exits are deterministic: 0 for that complete read-only sequence, 2 for
+CLI/URL/REST transport or backend availability, 3 for REST schema/contract, 4
+for WebSocket/STOMP/receipt failure, and 5 for the exact unauthenticated or
+missing-permission cases. Task 5 still classifies an empty current-user HTTP 204
+as `Contract`; only the probe's endpoint-aware environment mapping converts that
+exact response to 5. Malformed authentication errors remain contract failures.
+
+CI invokes the real probe executable as a child against one loopback fake
+authority serving both REST and WebSocket. The fake asserts the exact request,
+topic, Cookie, subprotocol, and frame allowlists, zero state-changing or
+unexpected calls, bounded cleanup, sanitized output, and every documented exit
+code. CI never starts or downloads the external XC2 JAR.
 
 ### 11.3 UI Tests
 
