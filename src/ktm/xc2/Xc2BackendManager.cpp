@@ -9,6 +9,7 @@
 #include "internal/Xc2ProcessOutput.h"
 
 #include <QCoreApplication>
+#include <QDeadlineTimer>
 #include <QDir>
 #include <QElapsedTimer>
 #include <QEvent>
@@ -19,6 +20,7 @@
 #include <QStandardPaths>
 #include <QTcpServer>
 #include <QTcpSocket>
+#include <QThread>
 #include <QTimer>
 
 #include <algorithm>
@@ -35,7 +37,26 @@ constexpr quint16 kForbiddenVendorPort = 8082;
 constexpr int kHealthRetryMs = 50;
 constexpr int kOwnershipRetryMs = 10;
 constexpr int kMaximumTimeoutMs = 120000;
+constexpr int kMaximumKillAttempts = 3;
+constexpr int kMaximumQtReconcileAttempts = 2;
 constexpr qsizetype kProcessReadBlockBytes = 4096;
+
+struct ProductionInspectionTestHooks {
+    std::function<void(const QString &)> observer;
+    int delayMs = 0;
+};
+
+ProductionInspectionTestHooks &productionInspectionTestHooks()
+{
+    static ProductionInspectionTestHooks hooks;
+    return hooks;
+}
+
+std::function<void()> &reaperRepostTestHook()
+{
+    static std::function<void()> hook;
+    return hook;
+}
 
 Xc2Error backendError(const QString &message)
 {
@@ -211,7 +232,8 @@ enum class ListenerProof {
 };
 
 ListenerProof proveListener(quint16 port, DWORD expectedPid, HANDLE handle,
-                            QString &failure)
+                            QString &failure,
+                            const std::function<void()> &afterSnapshot = {})
 {
     if (!processHandleIsLive(handle)) {
         failure = QStringLiteral("The captured child process HANDLE is signaled");
@@ -233,6 +255,12 @@ ListenerProof proveListener(quint16 port, DWORD expectedPid, HANDLE handle,
             continue;
         ++count;
         matching = &row;
+    }
+    if (afterSnapshot)
+        afterSnapshot();
+    if (!processHandleIsLive(handle)) {
+        failure = QStringLiteral("The captured child process HANDLE became signaled during listener proof");
+        return ListenerProof::Invalid;
     }
     if (count == 0) {
         failure = QStringLiteral("No IPv4 listener owns the selected port");
@@ -265,7 +293,9 @@ enum class ShutdownProof {
 
 ShutdownProof proveShutdownTuple(quint16 serverPort, quint16 clientPort,
                                  DWORD expectedPid, HANDLE handle,
-                                 QString &failure)
+                                 QString &failure,
+                                 const std::function<void()> &afterSnapshot = {},
+                                 int proofMutation = 0)
 {
     if (!processHandleIsLive(handle)) {
         failure = QStringLiteral("The captured child process HANDLE is signaled");
@@ -296,6 +326,18 @@ ShutdownProof proveShutdownTuple(quint16 serverPort, quint16 clientPort,
         }
         ++count;
         matching = &row;
+    }
+    if (afterSnapshot)
+        afterSnapshot();
+    if (!processHandleIsLive(handle)) {
+        failure = QStringLiteral("The captured child process HANDLE became signaled during shutdown proof");
+        return ShutdownProof::Invalid;
+    }
+    if (proofMutation == 1 && count == 1)
+        ++count;
+    if (proofMutation == 2 && count == 1) {
+        failure = QStringLiteral("The shutdown server four-tuple has conflicting ownership");
+        return ShutdownProof::Invalid;
     }
     if (count == 0 || matching == nullptr) {
         failure = QStringLiteral(
@@ -333,7 +375,7 @@ public:
             return;
         if (m_items.isEmpty()) {
             m_quitPending = false;
-            m_quitReposted = false;
+            m_repostedQuitEvent = nullptr;
             if (!m_filterInstalled && qApp != nullptr) {
                 qApp->installEventFilter(this);
                 m_filterInstalled = true;
@@ -360,20 +402,29 @@ public:
         if (!m_items.isEmpty())
             return;
 
-        if (m_filterInstalled && qApp != nullptr)
-            qApp->removeEventFilter(this);
-        m_filterInstalled = false;
-        if (m_quitPending && !m_quitReposted && qApp != nullptr) {
-            m_quitReposted = true;
-            QCoreApplication::postEvent(qApp, new QEvent(QEvent::Quit));
+        if (m_quitPending && m_repostedQuitEvent == nullptr
+            && qApp != nullptr) {
+            m_repostedQuitEvent = new QEvent(QEvent::Quit);
+            QCoreApplication::postEvent(qApp, m_repostedQuitEvent);
+            if (reaperRepostTestHook())
+                reaperRepostTestHook()();
+            return;
         }
+        removeFilter();
     }
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override
     {
-        if (watched == qApp && event->type() == QEvent::Quit
-            && !m_items.isEmpty()) {
+        if (watched != qApp || event->type() != QEvent::Quit)
+            return QObject::eventFilter(watched, event);
+        if (event == m_repostedQuitEvent) {
+            m_repostedQuitEvent = nullptr;
+            m_quitPending = false;
+            removeFilter();
+            return false;
+        }
+        if (!m_items.isEmpty() || m_quitPending) {
             m_quitPending = true;
             const QList<Item> snapshot = m_items;
             for (const Item &item : snapshot) {
@@ -386,10 +437,17 @@ protected:
     }
 
 private:
+    void removeFilter()
+    {
+        if (m_filterInstalled && qApp != nullptr)
+            qApp->removeEventFilter(this);
+        m_filterInstalled = false;
+    }
+
     QList<Item> m_items;
     bool m_filterInstalled = false;
     bool m_quitPending = false;
-    bool m_quitReposted = false;
+    QEvent *m_repostedQuitEvent = nullptr;
 };
 
 ApplicationReaper *applicationReaper()
@@ -433,6 +491,7 @@ struct Xc2BackendManager::RunContext final : QObject {
         HANDLE processHandle = nullptr;
         HANDLE jobHandle = nullptr;
         bool started = false;
+        bool processStartOutcomeObserved = false;
         bool mayBecomeReady = true;
         bool networkAuthorized = false;
         bool ownsChildForCleanup = false;
@@ -441,6 +500,11 @@ struct Xc2BackendManager::RunContext final : QObject {
         bool shutdownAttempted = false;
         bool shutdownWritten = false;
         int killAttempts = 0;
+        int finalReapPolls = 0;
+        int qtReconcileAttempts = 0;
+        bool finalKillBoundaryReached = false;
+        bool finalReapExhausted = false;
+        bool qtReconcileScheduled = false;
         bool collisionCleanup = false;
         bool collisionExhausted = false;
         bool finishedObserved = false;
@@ -467,6 +531,11 @@ struct Xc2BackendManager::RunContext final : QObject {
         connect(&totalDeadline, &QTimer::timeout, this, [this] {
             if (completed)
                 return;
+            if (!startupDeadline.hasExpired()) {
+                totalDeadline.start(static_cast<int>(qMax<qint64>(
+                    1, startupDeadline.remainingTime())));
+                return;
+            }
             fail(backendError(QStringLiteral("XC2 startup deadline expired")));
         });
     }
@@ -543,6 +612,7 @@ struct Xc2BackendManager::RunContext final : QObject {
         }
         totalDeadline.start(static_cast<int>(qMin<qint64>(
             remaining, std::numeric_limits<int>::max())));
+        startupDeadline.setRemainingTime(remaining, Qt::PreciseTimer);
 
         const QFileInfo lockInfo(plan.lockPath);
         if (!QDir().mkpath(lockInfo.absolutePath())) {
@@ -560,8 +630,14 @@ struct Xc2BackendManager::RunContext final : QObject {
 
     void beginFailure(Xc2Error error)
     {
-        QTimer::singleShot(0, this, [this, error = std::move(error)] {
-            fail(error);
+        if (!plannedFailure.has_value())
+            plannedFailure = std::move(error);
+        if (plannedFailureScheduled)
+            return;
+        plannedFailureScheduled = true;
+        QTimer::singleShot(0, this, [this] {
+            if (plannedFailure.has_value())
+                fail(plannedFailure.value());
         });
     }
 
@@ -569,6 +645,10 @@ struct Xc2BackendManager::RunContext final : QObject {
     {
         if (completed || stopRequested)
             return;
+        if (plannedFailure.has_value()) {
+            beginFailure(plannedFailure.value());
+            return;
+        }
         if (failureEmitted)
             return;
         stopRequested = true;
@@ -597,6 +677,11 @@ struct Xc2BackendManager::RunContext final : QObject {
             return;
         reaperOwned = true;
         owner.clear();
+        if (plannedFailure.has_value()) {
+            completed = true;
+            applicationReaper()->finished(this);
+            return;
+        }
         stopRequested = true;
         totalDeadline.stop();
         revokeReadinessAndRequests();
@@ -615,10 +700,13 @@ struct Xc2BackendManager::RunContext final : QObject {
         quint16 port = 0;
         for (int allocation = 0; allocation < 32; ++allocation) {
             const quint16 candidate = plan.candidateAllocator();
+            observe(QStringLiteral("candidate:%1").arg(candidate));
             if (candidate == 0)
                 break;
             if (candidate == kForbiddenVendorPort
                 || attemptedPorts.contains(candidate)) {
+                observe(QStringLiteral("candidate-rejected:%1")
+                            .arg(candidate));
                 continue;
             }
             port = candidate;
@@ -631,6 +719,7 @@ struct Xc2BackendManager::RunContext final : QObject {
         attemptedPorts.append(port);
 
         ++spawnedAttempts;
+        finalReapDeadlineStarted = false;
         attempt = std::make_unique<Attempt>(this);
         attempt->attemptId = nextAttemptId++;
         attempt->port = port;
@@ -643,6 +732,8 @@ struct Xc2BackendManager::RunContext final : QObject {
             {qMin(plan.startupDeadlineMs, 1000),
              qMin(plan.startupDeadlineMs, 750)});
         const QByteArray base = canonicalRestBase(port);
+        observe(QStringLiteral("rest-base:%1:%2")
+                    .arg(attemptId).arg(port));
         Xc2Error baseError;
         if (!attempt->restClient->setBaseUrl(base, &baseError)) {
             fail(baseError);
@@ -674,7 +765,10 @@ struct Xc2BackendManager::RunContext final : QObject {
         attempt->process = new QProcess;
         attempt->process->setProcessChannelMode(QProcess::SeparateChannels);
         attempt->process->setProgram(plan.program);
-        attempt->process->setArguments(plan.argumentsBuilder(port));
+        const QStringList arguments = plan.argumentsBuilder(port);
+        observe(QStringLiteral("arguments-built:%1:%2")
+                    .arg(attemptId).arg(port));
+        attempt->process->setArguments(arguments);
         attempt->process->setWorkingDirectory(plan.workingDirectory);
         attempt->process->setProcessEnvironment(plan.environment);
 
@@ -692,8 +786,18 @@ struct Xc2BackendManager::RunContext final : QObject {
                 qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
                 this, [this, attemptId](int exitCode,
                                         QProcess::ExitStatus exitStatus) {
-                    CallbackScope callback(this);
-                    onProcessFinished(attemptId, exitCode, exitStatus);
+                    const auto deliver = [this, attemptId, exitCode,
+                                          exitStatus] {
+                        CallbackScope callback(this);
+                        onProcessFinished(attemptId, exitCode, exitStatus);
+                    };
+                    if (plan.finishedNotificationDelayMsForTest > 0) {
+                        QTimer::singleShot(
+                            plan.finishedNotificationDelayMsForTest,
+                            this, deliver);
+                    } else {
+                        deliver();
+                    }
                 });
         connect(attempt->process, &QProcess::readyReadStandardOutput, this,
                 [this, attemptId] {
@@ -731,11 +835,21 @@ struct Xc2BackendManager::RunContext final : QObject {
         return expectedRunId == runId && isCurrentAttempt(attemptId);
     }
 
+    bool startupExpired(const QString &phase)
+    {
+        if (!startupDeadline.hasExpired())
+            return false;
+        observe(QStringLiteral("startup-deadline-expired:%1").arg(phase));
+        fail(backendError(QStringLiteral("XC2 startup deadline expired")));
+        return true;
+    }
+
     void onProcessStarted(quint64 attemptId)
     {
         if (!isCurrentAttempt(attemptId) || completed)
             return;
         Attempt &current = *attempt;
+        current.processStartOutcomeObserved = true;
         current.started = true;
         current.ownsChildForCleanup = true;
         current.capturedPid = static_cast<DWORD>(current.process->processId());
@@ -813,11 +927,14 @@ struct Xc2BackendManager::RunContext final : QObject {
     {
         if (!isCurrentAttempt(attemptId) || completed || stopRequested)
             return;
+        if (startupExpired(QStringLiteral("before-health-request")))
+            return;
         Attempt &current = *attempt;
         if (!current.mayBecomeReady || current.healthRequestId != 0
             || current.userRequestId != 0 || !current.restClient)
             return;
-        observe(QStringLiteral("health-request:%1").arg(attemptId));
+        observe(QStringLiteral("health-request:%1:%2")
+                    .arg(attemptId).arg(current.port));
         current.healthRequestId = current.restClient->requestServiceStatus();
         if (current.healthRequestId == 0) {
             fail(backendError(QStringLiteral("Cannot start the XC2 health request")));
@@ -844,11 +961,15 @@ struct Xc2BackendManager::RunContext final : QObject {
                                [this, attemptId] { requestHealth(attemptId); });
             return;
         }
+        if (startupExpired(QStringLiteral("before-listener-proof")))
+            return;
 
         QString proofFailure;
         const ListenerProof proof = proveListener(
             current.port, current.capturedPid, current.processHandle,
             proofFailure);
+        if (startupExpired(QStringLiteral("after-listener-proof")))
+            return;
         if (proof == ListenerProof::ProvenCollision) {
             beginCollisionCleanup();
             return;
@@ -858,6 +979,8 @@ struct Xc2BackendManager::RunContext final : QObject {
             return;
         }
 
+        observe(QStringLiteral("current-user-request:%1:%2")
+                    .arg(attemptId).arg(current.port));
         current.userRequestId = current.restClient->requestCurrentUser();
         if (current.userRequestId == 0) {
             fail(backendError(QStringLiteral("Cannot start the XC2 current-user request")));
@@ -888,17 +1011,28 @@ struct Xc2BackendManager::RunContext final : QObject {
             fail(backendError(QStringLiteral("XC2 current user identity is blank")));
             return;
         }
+        if (startupExpired(QStringLiteral("before-ready-proof")))
+            return;
 
         QString proofFailure;
         const ListenerProof proof = proveListener(
             current.port, current.capturedPid, current.processHandle,
-            proofFailure);
+            proofFailure, plan.afterListenerSnapshotForTest);
+        if (startupExpired(QStringLiteral("after-ready-proof")))
+            return;
         if (proof == ListenerProof::ProvenCollision) {
             beginCollisionCleanup();
             return;
         }
         if (proof != ListenerProof::Owned) {
             fail(backendError(proofFailure));
+            return;
+        }
+        if (startupExpired(QStringLiteral("before-ready")))
+            return;
+        if (!processHandleIsLive(current.processHandle)) {
+            fail(backendError(QStringLiteral(
+                "The captured child process HANDLE is signaled before Ready")));
             return;
         }
 
@@ -912,6 +1046,13 @@ struct Xc2BackendManager::RunContext final : QObject {
         endpoints.webSocketUrl.setHost(QStringLiteral("127.0.0.1"));
         endpoints.webSocketUrl.setPort(current.port);
         endpoints.webSocketUrl.setPath(QStringLiteral("/xc2-websocket"));
+        if (startupExpired(QStringLiteral("publish-ready")))
+            return;
+        if (!processHandleIsLive(current.processHandle)) {
+            fail(backendError(QStringLiteral(
+                "The captured child process HANDLE is signaled at Ready publication")));
+            return;
+        }
         if (owner)
             invokeManager([this, &endpoints, &result](
                               Xc2BackendManager *manager) {
@@ -923,12 +1064,11 @@ struct Xc2BackendManager::RunContext final : QObject {
     {
         if (!isCurrentAttempt(attemptId) || completed)
             return;
-        attempt->mayBecomeReady = false;
-        attempt->networkAuthorized = false;
-        if (owner)
-            owner->clearNetworkPublication();
+        attempt->processStartOutcomeObserved = true;
+        revokeReadinessAndRequests();
 
-        if (attempt->collisionCleanup || stopRequested) {
+        if (attempt->collisionCleanup
+            || (stopRequested && processError != QProcess::FailedToStart)) {
             QTimer::singleShot(0, this, [this, attemptId] {
                 finalizeAttemptWhenSafe(attemptId);
             });
@@ -947,9 +1087,18 @@ struct Xc2BackendManager::RunContext final : QObject {
         if (!isCurrentAttempt(attemptId) || completed)
             return;
         Attempt &current = *attempt;
+        current.processStartOutcomeObserved = true;
         current.finishedObserved = true;
         current.exitCode = exitCode;
         current.exitStatus = exitStatus;
+        const bool unexpected = !current.collisionCleanup
+            && !stopRequested && !failureEmitted;
+        if (unexpected) {
+            totalDeadline.stop();
+            revokeReadinessAndRequests();
+            markFailure(backendError(QStringLiteral(
+                "The XC2 backend exited before stop")));
+        }
         drainProcessOutput(attemptId,
                            Xc2ProcessOutput::Stream::StandardOutput);
         drainProcessOutput(attemptId,
@@ -958,9 +1107,6 @@ struct Xc2BackendManager::RunContext final : QObject {
         if (owner)
             owner->publishOwnedProcess(current.capturedPid, false);
 
-        if (!current.collisionCleanup && !stopRequested && !failureEmitted) {
-            fail(backendError(QStringLiteral("The XC2 backend exited before stop")));
-        }
         cleanupPhase = CleanupPhase::Finalizing;
         QTimer::singleShot(0, this, [this, attemptId] {
             finalizeAttemptWhenSafe(attemptId);
@@ -1055,6 +1201,8 @@ struct Xc2BackendManager::RunContext final : QObject {
             return;
         Attempt &current = *attempt;
         current.shutdownAttempted = true;
+        shutdownDeadline.setRemainingTime(plan.shutdownDeadlineMs,
+                                          Qt::PreciseTimer);
 
         QUrl shutdownUrl = current.restClient->baseUrl();
         shutdownUrl.setPath(QStringLiteral("/xc2/1.0/serviceStatus/shutdown"));
@@ -1100,19 +1248,35 @@ struct Xc2BackendManager::RunContext final : QObject {
                 || cleanupPhase == CleanupPhase::Killing
                 || cleanupPhase == CleanupPhase::Finalizing)
                 return;
-            shutdownFailed(QStringLiteral("The XC2 shutdown deadline expired"));
+            if (shutdownDeadline.hasExpired())
+                shutdownFailed(QStringLiteral("The XC2 shutdown deadline expired"));
         });
+    }
+
+    bool shutdownExpired(const QString &phase)
+    {
+        if (!shutdownDeadline.hasExpired())
+            return false;
+        observe(QStringLiteral("shutdown-deadline-expired:%1").arg(phase));
+        shutdownFailed(QStringLiteral("The XC2 shutdown deadline expired"));
+        return true;
     }
 
     void proveAndWriteShutdown(quint64 attemptId)
     {
         if (!isCurrentAttempt(attemptId) || completed || !attempt->shutdownSocket)
             return;
+        if (shutdownExpired(QStringLiteral("before-proof")))
+            return;
         Attempt &current = *attempt;
         QString proofFailure;
         const ShutdownProof proof = proveShutdownTuple(
             current.port, current.shutdownSocket->localPort(),
-            current.capturedPid, current.processHandle, proofFailure);
+            current.capturedPid, current.processHandle, proofFailure,
+            plan.afterShutdownSnapshotForTest,
+            static_cast<int>(plan.shutdownProofMutationForTest));
+        if (shutdownExpired(QStringLiteral("after-proof")))
+            return;
         if (proof != ShutdownProof::Owned) {
             if (proof == ShutdownProof::NotPresent
                 && current.shutdownSocket->state()
@@ -1126,7 +1290,6 @@ struct Xc2BackendManager::RunContext final : QObject {
             shutdownFailed(proofFailure);
             return;
         }
-
         QByteArray request = QByteArrayLiteral(
             "POST /xc2/1.0/serviceStatus/shutdown HTTP/1.1\r\nHost: 127.0.0.1:")
             + QByteArray::number(current.port)
@@ -1136,12 +1299,21 @@ struct Xc2BackendManager::RunContext final : QObject {
         if (!shutdownCookie.isEmpty())
             request += QByteArrayLiteral("Cookie: ") + shutdownCookie + "\r\n";
         request += "\r\n";
+        if (shutdownExpired(QStringLiteral("before-write")))
+            return;
+        if (!processHandleIsLive(current.processHandle)) {
+            shutdownFailed(QStringLiteral(
+                "The captured child process HANDLE is signaled before shutdown write"));
+            return;
+        }
         const qint64 accepted = current.shutdownSocket->write(request);
         if (accepted != request.size()) {
             current.shutdownSocket->abort();
             shutdownFailed(QStringLiteral("The XC2 shutdown write was partial"));
             return;
         }
+        observe(QStringLiteral("shutdown-write:%1:%2")
+                    .arg(attemptId).arg(current.port));
         current.shutdownWritten = true;
         cleanupPhase = CleanupPhase::ShutdownWait;
     }
@@ -1173,6 +1345,23 @@ struct Xc2BackendManager::RunContext final : QObject {
             current.shutdownSocket->abort();
         if (!current.process
             || current.process->state() == QProcess::NotRunning) {
+            if (current.process && !current.started
+                && !current.processStartOutcomeObserved) {
+                const quint64 attemptId = current.attemptId;
+                QTimer::singleShot(plan.terminateDeadlineMs, this,
+                                   [this, attemptId] {
+                    if (!isCurrentAttempt(attemptId) || completed)
+                        return;
+                    if (!attempt->processStartOutcomeObserved) {
+                        attempt->processStartOutcomeObserved = true;
+                        fail(backendError(QStringLiteral(
+                            "The XC2 backend process failed before a start outcome")));
+                        return;
+                    }
+                    beginTermination();
+                });
+                return;
+            }
             if (!current.outputFinalized)
                 finalizeOutput(current);
             QTimer::singleShot(0, this, [this, id = current.attemptId] {
@@ -1207,26 +1396,56 @@ struct Xc2BackendManager::RunContext final : QObject {
             finalizeAttemptWhenSafe(attemptId);
             return;
         }
+        if (attempt->finalKillBoundaryReached) {
+            finalizeAttemptWhenSafe(attemptId);
+            return;
+        }
         cleanupPhase = CleanupPhase::Killing;
         ++attempt->killAttempts;
-        attempt->process->kill();
-        const bool processTerminationRequested =
-            !processHandleIsLive(attempt->processHandle)
-            || TerminateProcess(attempt->processHandle, 1);
-        bool jobTerminationRequested = true;
-        if (attempt->jobHandle != nullptr) {
-            jobTerminationRequested =
-                TerminateJobObject(attempt->jobHandle, 1);
-            CloseHandle(attempt->jobHandle);
-            attempt->jobHandle = nullptr;
+        bool processTerminationRequested = false;
+        bool jobTerminationRequested = false;
+        if (!plan.failNativeTerminationForTest) {
+            attempt->process->kill();
+            processTerminationRequested =
+                !processHandleIsLive(attempt->processHandle)
+                || TerminateProcess(attempt->processHandle, 1);
+            jobTerminationRequested = attempt->jobHandle == nullptr
+                || TerminateJobObject(attempt->jobHandle, 1);
         }
         observe(QStringLiteral("force-kill:%1:%2:%3:%4")
                     .arg(attemptId)
                     .arg(attempt->killAttempts)
                     .arg(processTerminationRequested)
                     .arg(jobTerminationRequested));
+        if (attempt->killAttempts >= kMaximumKillAttempts) {
+            reachFinalKillBoundary(attemptId);
+            return;
+        }
         QTimer::singleShot(plan.terminateDeadlineMs, this,
                            [this, attemptId] { forceKill(attemptId); });
+    }
+
+    void reachFinalKillBoundary(quint64 attemptId)
+    {
+        if (!isCurrentAttempt(attemptId) || completed
+            || attempt->finalKillBoundaryReached) {
+            return;
+        }
+        attempt->finalKillBoundaryReached = true;
+        cleanupPhase = CleanupPhase::Finalizing;
+        if (attempt->jobHandle != nullptr) {
+            CloseHandle(attempt->jobHandle);
+            attempt->jobHandle = nullptr;
+        }
+        observe(QStringLiteral("final-kill-boundary:%1:%2")
+                    .arg(attemptId).arg(attempt->killAttempts));
+        finalReapDeadline.setRemainingTime(
+            qMax(500, plan.terminateDeadlineMs * 4), Qt::PreciseTimer);
+        finalReapDeadlineStarted = true;
+        QTimer::singleShot(kOwnershipRetryMs, this,
+                           [this, attemptId] {
+            finalizeAttemptWhenSafe(attemptId);
+        });
     }
 
     void fail(const Xc2Error &error)
@@ -1259,6 +1478,65 @@ struct Xc2BackendManager::RunContext final : QObject {
         });
     }
 
+    bool reconcileFinishedAfterNativeSignal(Attempt &current)
+    {
+        if (!processHandleIsSignaled(current.processHandle))
+            return false;
+        if (!current.process)
+            return processHandleIsSignaled(current.processHandle);
+        if (current.process->state() == QProcess::NotRunning)
+            return processHandleIsSignaled(current.processHandle);
+        if (current.qtReconcileAttempts >= kMaximumQtReconcileAttempts)
+            return false;
+        ++current.qtReconcileAttempts;
+        current.process->waitForFinished(0);
+        const bool handleStillSignaled =
+            processHandleIsSignaled(current.processHandle);
+        const bool reconciled = handleStillSignaled
+            && current.process->state() == QProcess::NotRunning;
+        observe(QStringLiteral("qt-finished-reconcile:%1:%2:%3:%4")
+                    .arg(current.attemptId)
+                    .arg(current.qtReconcileAttempts)
+                    .arg(handleStillSignaled)
+                    .arg(reconciled));
+        return reconciled;
+    }
+
+    void scheduleFinishedReconcile(quint64 attemptId)
+    {
+        if (!isCurrentAttempt(attemptId) || completed
+            || attempt->qtReconcileScheduled) {
+            return;
+        }
+        attempt->qtReconcileScheduled = true;
+        QTimer::singleShot(kOwnershipRetryMs, this, [this, attemptId] {
+            if (!isCurrentAttempt(attemptId) || completed)
+                return;
+            Attempt &current = *attempt;
+            current.qtReconcileScheduled = false;
+            if (!current.finalKillBoundaryReached
+                || !processHandleIsSignaled(current.processHandle)) {
+                current.finalReapExhausted = true;
+            } else if (reconcileFinishedAfterNativeSignal(current)) {
+                finalizeAttemptWhenSafe(attemptId);
+                return;
+            } else if (current.qtReconcileAttempts
+                       < kMaximumQtReconcileAttempts) {
+                scheduleFinishedReconcile(attemptId);
+                return;
+            } else {
+                current.finalReapExhausted = true;
+            }
+            observe(QStringLiteral("qt-finished-reconcile-exhausted:%1:%2")
+                        .arg(attemptId)
+                        .arg(current.qtReconcileAttempts));
+            if (!failureEmitted) {
+                markFailure(backendError(QStringLiteral(
+                    "QProcess could not reconcile the terminated XC2 child")));
+            }
+        });
+    }
+
     void finalizeAttemptWhenSafe(quint64 attemptId)
     {
         if (!isCurrentAttempt(attemptId) || completed)
@@ -1269,20 +1547,114 @@ struct Xc2BackendManager::RunContext final : QObject {
         }
         Attempt &current = *attempt;
         if (current.process && current.process->state() != QProcess::NotRunning) {
-            beginTermination();
-            return;
+            if (current.process->state() != QProcess::NotRunning) {
+                if (current.finalKillBoundaryReached) {
+                    ++current.finalReapPolls;
+                    if (finalReapDeadlineStarted
+                        && finalReapDeadline.hasExpired()) {
+                        const bool liveHandle =
+                            processHandleIsLive(current.processHandle);
+                        if (!liveHandle
+                            && processHandleIsSignaled(
+                                current.processHandle)) {
+                            scheduleFinishedReconcile(attemptId);
+                            return;
+                        }
+                        current.finalReapExhausted = true;
+                        observe(QStringLiteral(
+                            "final-reap-qprocess-running:%1:%2:%3")
+                                    .arg(attemptId)
+                                    .arg(current.finalReapPolls)
+                                    .arg(liveHandle));
+                        if (!failureEmitted) {
+                            markFailure(backendError(liveHandle
+                                ? QStringLiteral(
+                                    "XC2 final process reap could not prove termination")
+                                : QStringLiteral(
+                                    "QProcess remained Running after native XC2 termination")));
+                        }
+                        return;
+                    }
+                    QTimer::singleShot(kOwnershipRetryMs, this,
+                                       [this, attemptId] {
+                        finalizeAttemptWhenSafe(attemptId);
+                    });
+                    return;
+                } else {
+                    beginTermination();
+                    return;
+                }
+            }
+        }
+        if (current.process
+            && (current.process->state() == QProcess::NotRunning
+                || processHandleIsSignaled(current.processHandle))
+            && !current.outputFinalized) {
+            drainProcessOutput(attemptId,
+                               Xc2ProcessOutput::Stream::StandardOutput);
+            drainProcessOutput(attemptId,
+                               Xc2ProcessOutput::Stream::StandardError);
         }
         if (!current.outputFinalized)
             finalizeOutput(current);
         if (current.started && !current.finishedObserved) {
-            QTimer::singleShot(kOwnershipRetryMs, this,
-                               [this, attemptId] {
-                finalizeAttemptWhenSafe(attemptId);
-            });
-            return;
+            if (!finalReapDeadlineStarted) {
+                finalReapDeadline.setRemainingTime(
+                    qMax(500, plan.terminateDeadlineMs * 4),
+                    Qt::PreciseTimer);
+                finalReapDeadlineStarted = true;
+            }
+            if (!finalReapDeadline.hasExpired()) {
+                QTimer::singleShot(kOwnershipRetryMs, this,
+                                   [this, attemptId] {
+                    finalizeAttemptWhenSafe(attemptId);
+                });
+                return;
+            }
+            if (processHandleIsSignaled(current.processHandle)) {
+                current.finishedObserved = true;
+                current.exitCode = current.process
+                    ? current.process->exitCode() : -1;
+                current.exitStatus = current.process
+                    ? current.process->exitStatus() : QProcess::CrashExit;
+                observe(QStringLiteral("finished-notifier-lag-bypassed:%1")
+                            .arg(attemptId));
+            } else if (!current.finalKillBoundaryReached) {
+                reachFinalKillBoundary(attemptId);
+                return;
+            } else {
+                current.finalReapExhausted = true;
+                observe(QStringLiteral("final-reap-live-handle:%1")
+                            .arg(attemptId));
+                if (!failureEmitted) {
+                    markFailure(backendError(QStringLiteral(
+                        "XC2 final process reap could not prove termination")));
+                }
+                return;
+            }
         }
         if (current.processHandle != nullptr
             && !processHandleIsSignaled(current.processHandle)) {
+            if (!finalReapDeadlineStarted) {
+                finalReapDeadline.setRemainingTime(
+                    qMax(500, plan.terminateDeadlineMs * 4),
+                    Qt::PreciseTimer);
+                finalReapDeadlineStarted = true;
+            }
+            if (finalReapDeadline.hasExpired()) {
+                if (!current.finalKillBoundaryReached) {
+                    reachFinalKillBoundary(attemptId);
+                    return;
+                }
+                current.finalReapExhausted = true;
+                observe(QStringLiteral("final-reap-live-handle:%1")
+                            .arg(attemptId));
+                if (!failureEmitted) {
+                    markFailure(backendError(QStringLiteral(
+                        "XC2 final process reap could not prove termination")));
+                }
+                return;
+            }
             QTimer::singleShot(kOwnershipRetryMs, this,
                                [this, attemptId] {
                 finalizeAttemptWhenSafe(attemptId);
@@ -1363,6 +1735,9 @@ struct Xc2BackendManager::RunContext final : QObject {
     std::unique_ptr<QLockFile> lock;
     std::unique_ptr<Attempt> attempt;
     QTimer totalDeadline;
+    QDeadlineTimer startupDeadline;
+    QDeadlineTimer shutdownDeadline;
+    QDeadlineTimer finalReapDeadline;
     QByteArray shutdownCookie;
     QList<quint16> attemptedPorts;
     quint64 nextAttemptId = 1;
@@ -1370,12 +1745,15 @@ struct Xc2BackendManager::RunContext final : QObject {
     CleanupPhase cleanupPhase = CleanupPhase::None;
     bool stopRequested = false;
     bool failureEmitted = false;
+    std::optional<Xc2Error> plannedFailure;
+    bool plannedFailureScheduled = false;
     bool completed = false;
     bool reaperOwned = false;
     int callbackDepth = 0;
     bool pendingCleanup = false;
     bool cleanupQueued = false;
     bool pendingFinish = false;
+    bool finalReapDeadlineStarted = false;
     int deferredExitCode = -1;
     QProcess::ExitStatus deferredExitStatus = QProcess::CrashExit;
 };
@@ -1415,6 +1793,10 @@ bool Xc2BackendManager::startProduction(const QString &installRoot,
     clearNetworkPublication();
     QElapsedTimer startupClock;
     startupClock.start();
+    const ProductionInspectionTestHooks inspectionHooks =
+        productionInspectionTestHooks();
+    if (inspectionHooks.observer)
+        inspectionHooks.observer(QStringLiteral("deadline-start"));
 
     const QString cleanedRoot = QDir::cleanPath(
         QDir::fromNativeSeparators(installRoot));
@@ -1425,14 +1807,22 @@ bool Xc2BackendManager::startProduction(const QString &installRoot,
             startupClock.elapsed(), error);
     }
 
+    if (inspectionHooks.observer)
+        inspectionHooks.observer(QStringLiteral("inspect-start"));
+    if (inspectionHooks.delayMs > 0)
+        QThread::msleep(static_cast<unsigned long>(inspectionHooks.delayMs));
     const Xc2PrerequisiteReport report =
         Xc2InstallationProbe::inspectProduction(cleanedRoot);
     if (startupClock.elapsed() >= 15000) {
+        if (inspectionHooks.observer)
+            inspectionHooks.observer(QStringLiteral("inspect-fail:deadline"));
         return startAcceptedFailure(
             backendError(QStringLiteral("XC2 startup deadline expired during inspection")),
             startupClock.elapsed(), error);
     }
     if (!report.ok()) {
+        if (inspectionHooks.observer)
+            inspectionHooks.observer(QStringLiteral("inspect-fail:prerequisite"));
         const QString message = report.issues.isEmpty()
             ? QStringLiteral("XC2 production inspection failed")
             : report.issues.constFirst().message;
@@ -1459,6 +1849,7 @@ bool Xc2BackendManager::startProduction(const QString &installRoot,
     plan.shutdownDeadlineMs = 1500;
     plan.terminateDeadlineMs = 500;
     plan.maxPortAttempts = 3;
+    plan.lifecycleObserver = inspectionHooks.observer;
     plan.candidateAllocator = [] { return allocateLoopbackCandidate(); };
     plan.argumentsBuilder = [layout](quint16 port) {
         return productionArguments(layout, port);
@@ -1537,12 +1928,12 @@ bool Xc2BackendManager::startAcceptedFailure(const Xc2Error &failure,
         *error = {};
     PrivateLaunchPlan plan;
     RunContext *run = new RunContext(this, m_nextRunId++, std::move(plan));
+    run->beginFailure(failure);
     m_run = run;
     QPointer<Xc2BackendManager> guard(this);
     setBackendState(Xc2BackendState::Starting);
     if (!guard || m_run != run)
         return true;
-    run->beginFailure(failure);
     return true;
 }
 
@@ -1700,6 +2091,24 @@ bool Xc2BackendManager::shutdownRowsOwnedForTest(
                            row.owningPid});
     }
     return shutdownRowsOwned(nativeRows, serverPort, clientPort, processId);
+}
+
+void Xc2BackendManager::setProductionInspectionTestHooks(
+    std::function<void(const QString &)> observer, int delayMs)
+{
+    ProductionInspectionTestHooks &hooks = productionInspectionTestHooks();
+    hooks.observer = std::move(observer);
+    hooks.delayMs = qMax(0, delayMs);
+}
+
+void Xc2BackendManager::resetProductionInspectionTestHooks()
+{
+    productionInspectionTestHooks() = {};
+}
+
+void Xc2BackendManager::setReaperRepostTestHook(std::function<void()> hook)
+{
+    reaperRepostTestHook() = std::move(hook);
 }
 
 void Xc2BackendManager::setBackendState(Xc2BackendState state)

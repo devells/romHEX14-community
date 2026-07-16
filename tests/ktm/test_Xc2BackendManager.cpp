@@ -26,6 +26,7 @@
 #include <QTcpServer>
 #include <QTemporaryDir>
 #include <QTest>
+#include <QThread>
 
 #include <memory>
 #include <optional>
@@ -43,6 +44,8 @@ class Xc2BackendManagerTestAccess final {
 public:
     using RawTcpOwnerRow = Xc2BackendManager::RawTcpOwnerRow;
     using RawTcpConnectionRow = Xc2BackendManager::RawTcpConnectionRow;
+    using ShutdownProofMutation =
+        Xc2BackendManager::PrivateLaunchPlan::ShutdownProofMutation;
 
     enum class InvalidPlan {
         RelativeProgram,
@@ -106,7 +109,13 @@ public:
                           Xc2Error *error = nullptr,
                           std::shared_ptr<QStringList> lifecycleTrace = {},
                           bool invalidateShutdownCookieTarget = false,
-                          bool failJobSetup = false)
+                          bool failJobSetup = false,
+                          std::function<void()> afterListenerSnapshot = {},
+                          std::function<void()> afterShutdownSnapshot = {},
+                          bool failNativeTermination = false,
+                          int finishedNotificationDelayMs = 0,
+                          ShutdownProofMutation shutdownProofMutation =
+                              ShutdownProofMutation::None)
     {
         Xc2BackendManager::PrivateLaunchPlan plan;
         plan.program = QString::fromUtf8(FAKE_XC2_SIDECAR_PATH);
@@ -121,6 +130,14 @@ public:
         plan.invalidateShutdownCookieTargetForTest =
             invalidateShutdownCookieTarget;
         plan.failJobSetupForTest = failJobSetup;
+        plan.afterListenerSnapshotForTest =
+            std::move(afterListenerSnapshot);
+        plan.afterShutdownSnapshotForTest =
+            std::move(afterShutdownSnapshot);
+        plan.failNativeTerminationForTest = failNativeTermination;
+        plan.finishedNotificationDelayMsForTest =
+            finishedNotificationDelayMs;
+        plan.shutdownProofMutationForTest = shutdownProofMutation;
         if (lifecycleTrace) {
             plan.lifecycleObserver = [lifecycleTrace](const QString &event) {
                 lifecycleTrace->append(event);
@@ -260,6 +277,23 @@ public:
         return Xc2BackendManager::shutdownRowsOwnedForTest(
             rows, serverPort, clientPort, processId);
     }
+
+    static void setProductionInspectionHooks(
+        std::function<void(const QString &)> observer, int delayMs)
+    {
+        Xc2BackendManager::setProductionInspectionTestHooks(
+            std::move(observer), delayMs);
+    }
+
+    static void resetProductionInspectionHooks()
+    {
+        Xc2BackendManager::resetProductionInspectionTestHooks();
+    }
+
+    static void setReaperRepostHook(std::function<void()> hook)
+    {
+        Xc2BackendManager::setReaperRepostTestHook(std::move(hook));
+    }
 };
 
 } // namespace ktm::xc2
@@ -296,6 +330,22 @@ private:
         QByteArray value;
     };
     QList<Entry> m_entries;
+};
+
+class ProductionInspectionHooksReset final {
+public:
+    ~ProductionInspectionHooksReset()
+    {
+        Xc2BackendManagerTestAccess::resetProductionInspectionHooks();
+    }
+};
+
+class ReaperRepostHookReset final {
+public:
+    ~ReaperRepostHookReset()
+    {
+        Xc2BackendManagerTestAccess::setReaperRepostHook({});
+    }
 };
 
 QString privateLockPath(const QTemporaryDir &directory,
@@ -341,6 +391,20 @@ QList<QByteArray> eventBytes(const QString &path, const QString &event)
                 .toString().toLatin1()));
     }
     return values;
+}
+
+QList<qint64> connectionClosedByteTotals(const QString &path)
+{
+    QList<qint64> totals;
+    for (const QJsonObject &object : eventObjects(path)) {
+        if (object.value(QStringLiteral("event")).toString()
+            != QStringLiteral("CONNECTION_CLOSED")) {
+            continue;
+        }
+        totals.append(static_cast<qint64>(
+            object.value(QStringLiteral("totalBytes")).toDouble()));
+    }
+    return totals;
 }
 
 QList<qint64> eventPids(const QString &path, const QString &event)
@@ -454,6 +518,18 @@ bool handleIsSignaled(HANDLE handle)
         && WaitForSingleObject(handle, 0) == WAIT_OBJECT_0;
 }
 
+bool terminateProcess(qint64 processId, UINT exitCode = 9)
+{
+    HANDLE process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE,
+                                 static_cast<DWORD>(processId));
+    if (process == nullptr)
+        return false;
+    const bool terminated = TerminateProcess(process, exitCode)
+        && WaitForSingleObject(process, 3000) == WAIT_OBJECT_0;
+    CloseHandle(process);
+    return terminated;
+}
+
 bool lockIsAvailable(const QString &path)
 {
     QLockFile probe(path);
@@ -558,6 +634,24 @@ private slots:
             QStringLiteral("C:/XC2/resources/app/xc2_backend_patched.jar");
         const QStringList arguments =
             Xc2BackendManagerTestAccess::productionArguments(layout, 49123);
+        const QStringList expected{
+            QStringLiteral("-Dssc.includezip=true"),
+            QStringLiteral("-Dlogging.config=config/log.xml"),
+            QStringLiteral("-Dspring.config.additional-location=file:./config/custom-cloud.properties"),
+            QStringLiteral("-Dserver.address=127.0.0.1"),
+            QStringLiteral("-Dserver.port=49123"),
+            QStringLiteral("-Donelogin.saml2.sp.assertion_consumer_service.url=http://127.0.0.1:49123/xc2/1.0/auth/samlACS"),
+            QStringLiteral("-Donelogin.saml2.sp.single_logout_service.url=http://127.0.0.1:49123/xc2/1.0/auth/samlLogoutSLO"),
+            QStringLiteral("-Donelogin.saml2.idp.single_sign_on_service.url=http://127.0.0.1:49123/xc2/1.0/auth/mock"),
+            QStringLiteral("-Donelogin.saml2.idp.single_logout_service.url=http://127.0.0.1:49123/xc2/1.0/auth/mock"),
+            QStringLiteral("-Dcom.avl.ditest.xc2.gripsresource.prefix=http://127.0.0.1:49123/xc2/1.0/mock/streamer?file={0}"),
+            QStringLiteral("-Dloader.main=com.avl.ditest.xc2.Xc2NgApplication"),
+            QStringLiteral("-Dspring.profiles.active=dev"),
+            QStringLiteral("-Dcom.avl.ditest.xc2.developer=true"),
+            QStringLiteral("-jar"),
+            layout.backendJar,
+        };
+        QCOMPARE(arguments, expected);
         QCOMPARE(arguments.count(QStringLiteral("-jar")), 1);
         const int jarIndex = arguments.indexOf(QStringLiteral("-jar"));
         QCOMPARE(jarIndex, arguments.size() - 2);
@@ -646,6 +740,138 @@ private slots:
         }
     }
 
+    void productionInspectionTracePrecedesAllLaunchSideEffects()
+    {
+        ProductionInspectionHooksReset reset;
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString appRoot = directory.filePath("resources/app");
+        QVERIFY(QDir().mkpath(appRoot));
+        const QString productionLock =
+            Xc2BackendManagerTestAccess::productionLockPath(
+                QStandardPaths::writableLocation(
+                    QStandardPaths::AppLocalDataLocation));
+        const QFileInfo before(productionLock);
+        const bool existedBefore = before.exists();
+        const qint64 sizeBefore = before.size();
+        const QDateTime modifiedBefore = before.lastModified();
+
+        for (const int delayMs : {0, 15020}) {
+            auto trace = std::make_shared<QStringList>();
+            Xc2BackendManagerTestAccess::setProductionInspectionHooks(
+                [trace](const QString &event) { trace->append(event); },
+                delayMs);
+            Xc2BackendManager manager;
+            QSignalSpy failed(&manager, &Xc2BackendManager::failed);
+            QSignalSpy stopped(&manager, &Xc2BackendManager::stopped);
+            QElapsedTimer elapsed;
+            elapsed.start();
+            QVERIFY(manager.startProduction(appRoot));
+            QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 18000);
+            QTRY_COMPARE_WITH_TIMEOUT(stopped.count(), 1, 3000);
+            QCOMPARE(trace->size(), 3);
+            QCOMPARE(trace->at(0), QStringLiteral("deadline-start"));
+            QCOMPARE(trace->at(1), QStringLiteral("inspect-start"));
+            QVERIFY(trace->at(2).startsWith(QStringLiteral("inspect-fail:")));
+            for (const QString &event : std::as_const(*trace)) {
+                QVERIFY(!event.startsWith(QStringLiteral("candidate:")));
+                QVERIFY(!event.startsWith(QStringLiteral("arguments-built:")));
+                QVERIFY(!event.startsWith(QStringLiteral("attempt-start:")));
+                QVERIFY(!event.startsWith(QStringLiteral("process-started:")));
+            }
+            if (delayMs > 0) {
+                QVERIFY(elapsed.elapsed() >= 15000);
+                QCOMPARE(trace->at(2),
+                         QStringLiteral("inspect-fail:deadline"));
+            }
+            const QFileInfo after(productionLock);
+            QCOMPARE(after.exists(), existedBefore);
+            if (existedBefore) {
+                QCOMPARE(after.size(), sizeBefore);
+                QCOMPARE(after.lastModified(), modifiedBefore);
+            }
+        }
+    }
+
+    void acceptedValidationFailureCannotBeOverwrittenByStop()
+    {
+        for (const bool stopFromStarting : {false, true}) {
+            QTemporaryDir directory;
+            QVERIFY(directory.isValid());
+            Xc2BackendManager manager;
+            QList<Xc2BackendState> order;
+            QObject::connect(&manager, &Xc2BackendManager::stateChanged,
+                             &manager, [&](Xc2BackendState state) {
+                order.append(state);
+                if (stopFromStarting && state == Xc2BackendState::Starting)
+                    manager.stop();
+            });
+            QSignalSpy failed(&manager, &Xc2BackendManager::failed);
+            QSignalSpy stopped(&manager, &Xc2BackendManager::stopped);
+            auto argumentCalls = std::make_shared<int>(0);
+            auto candidateCalls = std::make_shared<int>(0);
+            QVERIFY(Xc2BackendManagerTestAccess::startInvalid(
+                manager,
+                Xc2BackendManagerTestAccess::InvalidPlan::RelativeProgram,
+                privateLockPath(directory), argumentCalls, candidateCalls));
+            if (!stopFromStarting)
+                manager.stop();
+            QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 3000);
+            QTRY_COMPARE_WITH_TIMEOUT(stopped.count(), 1, 3000);
+            QCOMPARE(stopped.constFirst().at(0).toInt(), -1);
+            QCOMPARE(qvariant_cast<QProcess::ExitStatus>(
+                         stopped.constFirst().at(1)),
+                     QProcess::CrashExit);
+            const QList<Xc2BackendState> expectedOrder{
+                Xc2BackendState::Starting,
+                Xc2BackendState::Failed,
+                Xc2BackendState::Stopped,
+            };
+            QCOMPARE(order, expectedOrder);
+            QCOMPARE(*argumentCalls, 0);
+            QCOMPARE(*candidateCalls, 0);
+        }
+    }
+
+    void acceptedPublicFailuresCannotBeOverwrittenByStop()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString incompleteRoot = directory.filePath("resources/app");
+        QVERIFY(QDir().mkpath(incompleteRoot));
+        const QList<QString> roots{
+            QStringLiteral("relative/resources/app"),
+            incompleteRoot,
+        };
+        for (qsizetype index = 0; index < roots.size(); ++index) {
+            Xc2BackendManager manager;
+            QList<Xc2BackendState> states;
+            QObject::connect(&manager, &Xc2BackendManager::stateChanged,
+                             &manager, [&](Xc2BackendState state) {
+                states.append(state);
+                if (index == 1 && state == Xc2BackendState::Starting)
+                    manager.stop();
+            });
+            QSignalSpy failed(&manager, &Xc2BackendManager::failed);
+            QSignalSpy stopped(&manager, &Xc2BackendManager::stopped);
+            QVERIFY(manager.startProduction(roots.at(index)));
+            if (index == 0)
+                manager.stop();
+            QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 3000);
+            QTRY_COMPARE_WITH_TIMEOUT(stopped.count(), 1, 3000);
+            QCOMPARE(stopped.constFirst().at(0).toInt(), -1);
+            QCOMPARE(qvariant_cast<QProcess::ExitStatus>(
+                         stopped.constFirst().at(1)),
+                     QProcess::CrashExit);
+            const QList<Xc2BackendState> expected{
+                Xc2BackendState::Starting,
+                Xc2BackendState::Failed,
+                Xc2BackendState::Stopped,
+            };
+            QCOMPARE(states, expected);
+        }
+    }
+
     void productionLockPathIsFixedAndRunIndependent()
     {
         const QString appData = QStringLiteral("C:/Users/test/AppData/Local/app");
@@ -723,6 +949,13 @@ private slots:
         auto argumentCalls = std::make_shared<int>(0);
         const QList<QByteArray> injectedNames{
             QByteArrayLiteral("JAVA_TOOL_OPTIONS"),
+            QByteArrayLiteral("_JAVA_OPTIONS"),
+            QByteArrayLiteral("JDK_JAVA_OPTIONS"),
+            QByteArrayLiteral("SPRING_APPLICATION_JSON"),
+            QByteArrayLiteral("SPRING_CONFIG_LOCATION"),
+            QByteArrayLiteral("SPRING_CONFIG_ADDITIONAL_LOCATION"),
+            QByteArrayLiteral("SPRING_PROFILES_ACTIVE"),
+            QByteArrayLiteral("SERVER_ADDRESS"),
             QByteArrayLiteral("SERVER_PORT"),
         };
         EnvironmentRestore restore(injectedNames);
@@ -752,6 +985,45 @@ private slots:
         QVERIFY(sawEnvironment);
         manager.stop();
         QTRY_COMPARE_WITH_TIMEOUT(stopped.count(), 1, 5000);
+    }
+
+    void fakeCliRejectsEveryAmbiguousOrUnsafeInvocation()
+    {
+        const QList<QStringList> invalidArguments{
+            {},
+            {QStringLiteral("--port"), QStringLiteral("0")},
+            {QStringLiteral("--port")},
+            {QStringLiteral("--port"), QStringLiteral("49123"),
+             QStringLiteral("--port"), QStringLiteral("49124")},
+            {QStringLiteral("--port"), QStringLiteral("49123"),
+             QStringLiteral("--never-health"),
+             QStringLiteral("--never-health")},
+            {QStringLiteral("--port"), QStringLiteral("49123"),
+             QStringLiteral("--hold-lock"), QStringLiteral("relative.lock")},
+            {QStringLiteral("--port"), QStringLiteral("49123"),
+             QStringLiteral("--release-listener-after-ready"),
+             QStringLiteral("relative.trigger")},
+            {QStringLiteral("--port"), QStringLiteral("49123"),
+             QStringLiteral("--event-log"), QStringLiteral("relative.jsonl")},
+            {QStringLiteral("--port"), QStringLiteral("49123"),
+             QStringLiteral("--unknown")},
+            {QStringLiteral("--port"), QStringLiteral("49123"),
+             QStringLiteral("--event-log"),
+             QStringLiteral("--never-health")},
+        };
+        for (const QStringList &arguments : invalidArguments) {
+            QProcess process;
+            process.setProgram(QString::fromUtf8(FAKE_XC2_SIDECAR_PATH));
+            process.setArguments(arguments);
+            process.setWorkingDirectory(
+                QFileInfo(process.program()).absolutePath());
+            process.start();
+            QVERIFY2(process.waitForStarted(3000),
+                     qPrintable(arguments.join(QLatin1Char(' '))));
+            QVERIFY(process.waitForFinished(3000));
+            QCOMPARE(process.exitStatus(), QProcess::NormalExit);
+            QCOMPARE(process.exitCode(), 2);
+        }
     }
 
     void privateLaunchValidationFailsBeforeLockAllocatorOrBuilder()
@@ -957,25 +1229,51 @@ private slots:
         QVERIFY(ownedPort > 0 && ownedPort != 8082);
         auto candidateCalls = std::make_shared<int>(0);
         auto argumentCalls = std::make_shared<int>(0);
+        auto trace = std::make_shared<QStringList>();
         Xc2BackendManager manager;
         QSignalSpy ready(&manager, &Xc2BackendManager::ready);
         QSignalSpy stopped(&manager, &Xc2BackendManager::stopped);
         QVERIFY(Xc2BackendManagerTestAccess::startFake(
             manager, privateLockPath(directory), {8082, ownedPort}, {},
             directory.filePath("owned.jsonl"), 6000, 1000, 200, 1,
-            argumentCalls, candidateCalls));
+            argumentCalls, candidateCalls, nullptr, trace));
         QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 8000);
         QCOMPARE(*candidateCalls, 2);
         QCOMPARE(*argumentCalls, 1);
         QCOMPARE(manager.endpoints().restBaseUrl.port(), ownedPort);
         QVERIFY(ownedPort != 8082);
+        QVERIFY(trace->contains(QStringLiteral("candidate:8082")));
+        QVERIFY(trace->contains(QStringLiteral("candidate-rejected:8082")));
         manager.stop();
         QTRY_COMPARE_WITH_TIMEOUT(stopped.count(), 1, 5000);
+        for (const QString &prefix : {
+                 QStringLiteral("attempt-start:"),
+                 QStringLiteral("arguments-built:"),
+                 QStringLiteral("rest-base:"),
+                 QStringLiteral("health-request:"),
+                 QStringLiteral("current-user-request:"),
+                 QStringLiteral("shutdown-write:"),
+             }) {
+            int selectedEvents = 0;
+            for (const QString &event : std::as_const(*trace)) {
+                if (!event.startsWith(prefix))
+                    continue;
+                QVERIFY2(!event.endsWith(QStringLiteral(":8082")),
+                         qPrintable(event));
+                QVERIFY2(event.endsWith(QStringLiteral(":%1").arg(ownedPort)),
+                         qPrintable(event));
+                ++selectedEvents;
+            }
+            QVERIFY2(selectedEvents >= 1, qPrintable(prefix));
+        }
 
         if (testOwnsDecoy) {
             QCOMPARE(decoy.state(), QProcess::Running);
             QCOMPARE(eventCount(decoyLog, QStringLiteral("REQUEST")), 0);
             QCOMPARE(eventCount(decoyLog, QStringLiteral("SHUTDOWN")), 0);
+            QCOMPARE(eventCount(decoyLog, QStringLiteral("RAW_BYTES")), 0);
+            QCOMPARE(eventCount(decoyLog,
+                                QStringLiteral("CONNECTION_ACCEPTED")), 0);
             stopStandaloneProcess(decoy);
         } else {
             QTcpServer stillOccupied;
@@ -1315,6 +1613,161 @@ private slots:
         CloseHandle(child);
     }
 
+    void stableHandleIsRecheckedAfterReadyAndShutdownSnapshots()
+    {
+        {
+            QTemporaryDir directory;
+            QVERIFY(directory.isValid());
+            Xc2BackendManager manager;
+            auto hookCalled = std::make_shared<int>(0);
+            QSignalSpy ready(&manager, &Xc2BackendManager::ready);
+            QSignalSpy failed(&manager, &Xc2BackendManager::failed);
+            QSignalSpy stopped(&manager, &Xc2BackendManager::stopped);
+            const auto terminateAfterSnapshot = [&manager, hookCalled] {
+                ++*hookCalled;
+                QVERIFY(terminateProcess(manager.ownedProcessId(), 31));
+            };
+            QVERIFY(Xc2BackendManagerTestAccess::startFake(
+                manager, privateLockPath(directory),
+                {Xc2BackendManagerTestAccess::allocateCandidate()}, {},
+                directory.filePath("ready-handle.jsonl"),
+                5000, 500, 100, 1, {}, {}, nullptr, {}, false, false,
+                terminateAfterSnapshot));
+            QTRY_COMPARE_WITH_TIMEOUT(stopped.count(), 1, 5000);
+            QCOMPARE(*hookCalled, 1);
+            QCOMPARE(ready.count(), 0);
+            QCOMPARE(failed.count(), 1);
+        }
+
+        {
+            QTemporaryDir directory;
+            QVERIFY(directory.isValid());
+            const QString eventLog =
+                directory.filePath("shutdown-handle.jsonl");
+            Xc2BackendManager manager;
+            auto hookCalled = std::make_shared<int>(0);
+            QSignalSpy ready(&manager, &Xc2BackendManager::ready);
+            QSignalSpy failed(&manager, &Xc2BackendManager::failed);
+            QSignalSpy stopped(&manager, &Xc2BackendManager::stopped);
+            const auto terminateAfterSnapshot = [&manager, hookCalled] {
+                ++*hookCalled;
+                QVERIFY(terminateProcess(manager.ownedProcessId(), 32));
+            };
+            QVERIFY(Xc2BackendManagerTestAccess::startFake(
+                manager, privateLockPath(directory),
+                {Xc2BackendManagerTestAccess::allocateCandidate()}, {},
+                eventLog, 5000, 500, 100, 1, {}, {}, nullptr, {},
+                false, false, {}, terminateAfterSnapshot));
+            QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 7000);
+            const int rawBefore = eventCount(
+                eventLog, QStringLiteral("RAW_BYTES"));
+            const int acceptedBefore = eventCount(
+                eventLog, QStringLiteral("CONNECTION_ACCEPTED"));
+            manager.stop();
+            QTRY_COMPARE_WITH_TIMEOUT(stopped.count(), 1, 5000);
+            QCOMPARE(*hookCalled, 1);
+            QCOMPARE(failed.count(), 1);
+            QCOMPARE(eventCount(eventLog, QStringLiteral("SHUTDOWN")), 0);
+            QCOMPARE(eventCount(eventLog, QStringLiteral("RAW_BYTES")),
+                     rawBefore);
+            QCOMPARE(eventCount(eventLog,
+                                QStringLiteral("CONNECTION_ACCEPTED")),
+                     acceptedBefore + 1);
+        }
+    }
+
+    void absoluteDeadlinesRejectLateReadyAndShutdownWrite()
+    {
+        {
+            QTemporaryDir directory;
+            QVERIFY(directory.isValid());
+            Xc2BackendManager manager;
+            QSignalSpy ready(&manager, &Xc2BackendManager::ready);
+            QSignalSpy failed(&manager, &Xc2BackendManager::failed);
+            QSignalSpy stopped(&manager, &Xc2BackendManager::stopped);
+            const auto blockPastDeadline = [] { QThread::msleep(350); };
+            QVERIFY(Xc2BackendManagerTestAccess::startFake(
+                manager, privateLockPath(directory),
+                {Xc2BackendManagerTestAccess::allocateCandidate()}, {},
+                directory.filePath("late-ready.jsonl"),
+                300, 300, 100, 1, {}, {}, nullptr, {}, false, false,
+                blockPastDeadline));
+            QTRY_COMPARE_WITH_TIMEOUT(stopped.count(), 1, 5000);
+            QCOMPARE(ready.count(), 0);
+            QCOMPARE(failed.count(), 1);
+        }
+
+        {
+            QTemporaryDir directory;
+            QVERIFY(directory.isValid());
+            const QString eventLog =
+                directory.filePath("late-shutdown.jsonl");
+            Xc2BackendManager manager;
+            QSignalSpy ready(&manager, &Xc2BackendManager::ready);
+            QSignalSpy failed(&manager, &Xc2BackendManager::failed);
+            QSignalSpy stopped(&manager, &Xc2BackendManager::stopped);
+            const auto blockPastDeadline = [] { QThread::msleep(250); };
+            QVERIFY(Xc2BackendManagerTestAccess::startFake(
+                manager, privateLockPath(directory),
+                {Xc2BackendManagerTestAccess::allocateCandidate()}, {},
+                eventLog, 5000, 150, 100, 1, {}, {}, nullptr, {},
+                false, false, {}, blockPastDeadline));
+            QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 7000);
+            const int rawBefore = eventCount(
+                eventLog, QStringLiteral("RAW_BYTES"));
+            const int closedBefore = connectionClosedByteTotals(eventLog).size();
+            manager.stop();
+            QTRY_COMPARE_WITH_TIMEOUT(stopped.count(), 1, 5000);
+            QCOMPARE(failed.count(), 1);
+            QCOMPARE(eventCount(eventLog, QStringLiteral("SHUTDOWN")), 0);
+            QCOMPARE(eventCount(eventLog, QStringLiteral("RAW_BYTES")),
+                     rawBefore);
+            QTRY_COMPARE_WITH_TIMEOUT(
+                connectionClosedByteTotals(eventLog).size(),
+                closedBefore + 1, 3000);
+            QCOMPARE(connectionClosedByteTotals(eventLog).constLast(), 0);
+        }
+    }
+
+    void duplicateAndConflictingShutdownProofsWriteZeroRawBytes()
+    {
+        using Mutation = Xc2BackendManagerTestAccess::ShutdownProofMutation;
+        for (const Mutation mutation : {
+                 Mutation::Duplicate,
+                 Mutation::Conflicting,
+             }) {
+            QTemporaryDir directory;
+            QVERIFY(directory.isValid());
+            const QString eventLog = directory.filePath(
+                mutation == Mutation::Duplicate
+                    ? "duplicate-proof.jsonl"
+                    : "conflicting-proof.jsonl");
+            Xc2BackendManager manager;
+            QSignalSpy ready(&manager, &Xc2BackendManager::ready);
+            QSignalSpy failed(&manager, &Xc2BackendManager::failed);
+            QSignalSpy stopped(&manager, &Xc2BackendManager::stopped);
+            QVERIFY(Xc2BackendManagerTestAccess::startFake(
+                manager, privateLockPath(directory),
+                {Xc2BackendManagerTestAccess::allocateCandidate()}, {},
+                eventLog, 5000, 500, 100, 1, {}, {}, nullptr, {},
+                false, false, {}, {}, false, 0, mutation));
+            QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 7000);
+            const int rawBefore = eventCount(
+                eventLog, QStringLiteral("RAW_BYTES"));
+            const int closedBefore = connectionClosedByteTotals(eventLog).size();
+            manager.stop();
+            QTRY_COMPARE_WITH_TIMEOUT(stopped.count(), 1, 5000);
+            QCOMPARE(failed.count(), 1);
+            QCOMPARE(eventCount(eventLog, QStringLiteral("SHUTDOWN")), 0);
+            QCOMPARE(eventCount(eventLog, QStringLiteral("RAW_BYTES")),
+                     rawBefore);
+            QTRY_COMPARE_WITH_TIMEOUT(
+                connectionClosedByteTotals(eventLog).size(),
+                closedBefore + 1, 3000);
+            QCOMPARE(connectionClosedByteTotals(eventLog).constLast(), 0);
+        }
+    }
+
     void shutdownCookieExportFailureWritesZeroBytes()
     {
         QTemporaryDir directory;
@@ -1424,6 +1877,10 @@ private slots:
         QCOMPARE(eventCount(ownedLog, QStringLiteral("SHUTDOWN")), 0);
         QCOMPARE(eventCount(decoyLog, QStringLiteral("REQUEST")), 0);
         QCOMPARE(eventCount(decoyLog, QStringLiteral("SHUTDOWN")), 0);
+        QCOMPARE(eventCount(decoyLog, QStringLiteral("RAW_BYTES")), 0);
+        QTRY_COMPARE_WITH_TIMEOUT(
+            connectionClosedByteTotals(decoyLog),
+            QList<qint64>({0}), 3000);
         QCOMPARE(decoy.state(), QProcess::Running);
         QVERIFY(handleIsSignaled(child));
         CloseHandle(child);
@@ -1464,6 +1921,63 @@ private slots:
         QCOMPARE(qvariant_cast<Xc2Error>(
                      failed.constFirst().constFirst()).category,
                  Xc2ErrorCategory::Backend);
+        CloseHandle(child);
+    }
+
+    void nativeTerminationFailureAndNotifierLagConvergeAtJobBoundary()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString lockPath = privateLockPath(directory);
+        const QString eventLog = directory.filePath("bounded-reap.jsonl");
+        auto trace = std::make_shared<QStringList>();
+        Xc2BackendManager manager;
+        HANDLE child = nullptr;
+        bool stoppedAfterDeathBeforeUnlock = false;
+        QObject::connect(&manager, &Xc2BackendManager::stopped,
+                         &manager, [&] {
+            stoppedAfterDeathBeforeUnlock = child != nullptr
+                && handleIsSignaled(child)
+                && !manager.ownsProcess()
+                && lockIsAvailable(lockPath);
+        });
+        QSignalSpy ready(&manager, &Xc2BackendManager::ready);
+        QSignalSpy failed(&manager, &Xc2BackendManager::failed);
+        QSignalSpy stopped(&manager, &Xc2BackendManager::stopped);
+        QVERIFY(Xc2BackendManagerTestAccess::startFake(
+            manager, lockPath,
+            {Xc2BackendManagerTestAccess::allocateCandidate()},
+            {QStringLiteral("--ignore-shutdown")}, eventLog,
+            5000, 120, 40, 1, {}, {}, nullptr, trace,
+            false, false, {}, {}, true, 1500));
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 7000);
+        child = openStableHandle(manager.ownedProcessId());
+        QVERIFY(child != nullptr && handleIsLive(child));
+        QElapsedTimer elapsed;
+        elapsed.start();
+        manager.stop();
+        QTRY_COMPARE_WITH_TIMEOUT(stopped.count(), 1, 4000);
+        QCOMPARE(failed.count(), 1);
+        QVERIFY(elapsed.elapsed() < 2500);
+        QVERIFY(stoppedAfterDeathBeforeUnlock);
+        QCOMPARE(eventCount(eventLog, QStringLiteral("SHUTDOWN")), 1);
+        int killEvents = 0;
+        int boundaryEvents = 0;
+        int lagBypassEvents = 0;
+        for (const QString &event : std::as_const(*trace)) {
+            if (event.startsWith(QStringLiteral("force-kill:")))
+                ++killEvents;
+            if (event.startsWith(QStringLiteral("final-kill-boundary:")))
+                ++boundaryEvents;
+            if (event.startsWith(
+                    QStringLiteral("finished-notifier-lag-bypassed:"))) {
+                ++lagBypassEvents;
+            }
+        }
+        QCOMPARE(killEvents, 3);
+        QCOMPARE(boundaryEvents, 1);
+        QCOMPARE(lagBypassEvents, 1);
+        QVERIFY(handleIsSignaled(child));
         CloseHandle(child);
     }
 
@@ -1537,15 +2051,29 @@ private slots:
         QVERIFY(directory.isValid());
         const QString lockPath = privateLockPath(directory);
         Xc2BackendManager manager;
+        bool failedStateWasSynchronous = false;
+        QObject::connect(&manager, &Xc2BackendManager::stateChanged,
+                         &manager, [&](Xc2BackendState state) {
+            if (state != Xc2BackendState::Failed)
+                return;
+            failedStateWasSynchronous =
+                manager.endpoints().restBaseUrl.isEmpty()
+                && manager.endpoints().webSocketUrl.isEmpty()
+                && !manager.currentUser().has_value()
+                && manager.ownsProcess()
+                && !lockIsAvailable(lockPath);
+        });
         QSignalSpy ready(&manager, &Xc2BackendManager::ready);
         QSignalSpy failed(&manager, &Xc2BackendManager::failed);
         QSignalSpy stopped(&manager, &Xc2BackendManager::stopped);
         QVERIFY(Xc2BackendManagerTestAccess::startFake(
             manager, lockPath,
-            {Xc2BackendManagerTestAccess::allocateCandidate()},
-            {QStringLiteral("--never-health")},
+            {Xc2BackendManagerTestAccess::allocateCandidate()}, {},
             directory.filePath("crash.jsonl"), 4000, 500, 100, 1));
-        QTRY_VERIFY_WITH_TIMEOUT(manager.ownsProcess(), 2000);
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 7000);
+        QVERIFY(!manager.endpoints().restBaseUrl.isEmpty());
+        QVERIFY(manager.currentUser().has_value());
+        QVERIFY(manager.ownsProcess());
         const qint64 childPid = manager.ownedProcessId();
         HANDLE child = openStableHandle(childPid);
         QVERIFY(child != nullptr && handleIsLive(child));
@@ -1555,10 +2083,11 @@ private slots:
         QVERIFY(TerminateProcess(terminator, 9));
         CloseHandle(terminator);
         QTRY_COMPARE_WITH_TIMEOUT(failed.count(), 1, 4000);
+        QVERIFY(failedStateWasSynchronous);
         QVERIFY(manager.endpoints().restBaseUrl.isEmpty());
         QVERIFY(!manager.currentUser().has_value());
         QTRY_COMPARE_WITH_TIMEOUT(stopped.count(), 1, 4000);
-        QCOMPARE(ready.count(), 0);
+        QCOMPARE(ready.count(), 1);
         QVERIFY(handleIsSignaled(child));
         QLockFile recovered(lockPath);
         recovered.setStaleLockTime(0);
@@ -1851,6 +2380,67 @@ private slots:
         QVERIFY(manager.endpoints().restBaseUrl.isEmpty());
     }
 
+    void unexpectedEofPartialRevokesBeforeOutputCallback()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString trigger = directory.filePath("exit.trigger");
+        Xc2BackendManager manager;
+        QSignalSpy ready(&manager, &Xc2BackendManager::ready);
+        QSignalSpy failed(&manager, &Xc2BackendManager::failed);
+        QSignalSpy stopped(&manager, &Xc2BackendManager::stopped);
+        QStringList order;
+        bool sawPartial = false;
+        bool publicationCleared = false;
+        bool failureWasImmutable = false;
+        QObject::connect(&manager, &Xc2BackendManager::failed,
+                         &manager, [&order] { order.append("failed"); });
+        QObject::connect(&manager, &Xc2BackendManager::outputLine,
+                         &manager, [&](bool standardError,
+                                       const QString &line) {
+            if (standardError
+                || line != QStringLiteral("unexpected-eof-partial")) {
+                return;
+            }
+            sawPartial = true;
+            order.append("output");
+            publicationCleared =
+                manager.state() == Xc2BackendState::Failed
+                && manager.endpoints().restBaseUrl.isEmpty()
+                && manager.endpoints().webSocketUrl.isEmpty()
+                && !manager.currentUser().has_value();
+            manager.stop();
+            failureWasImmutable = manager.state() == Xc2BackendState::Failed;
+        });
+        QObject::connect(&manager, &Xc2BackendManager::stopped,
+                         &manager, [&order] { order.append("stopped"); });
+        QVERIFY(Xc2BackendManagerTestAccess::startFake(
+            manager, privateLockPath(directory),
+            {Xc2BackendManagerTestAccess::allocateCandidate()},
+            {QStringLiteral("--exit-trigger"), trigger},
+            directory.filePath("unexpected-exit.jsonl"),
+            5000, 500, 100, 1));
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 7000);
+        HANDLE child = openStableHandle(manager.ownedProcessId());
+        QVERIFY(child != nullptr && handleIsLive(child));
+        QFile triggerFile(trigger);
+        QVERIFY(triggerFile.open(QIODevice::WriteOnly));
+        triggerFile.write("exit");
+        triggerFile.close();
+        QTRY_COMPARE_WITH_TIMEOUT(stopped.count(), 1, 5000);
+        QCOMPARE(failed.count(), 1);
+        QVERIFY(sawPartial);
+        QVERIFY(publicationCleared);
+        QVERIFY(failureWasImmutable);
+        QCOMPARE(order.count("failed"), 1);
+        QCOMPARE(order.count("output"), 1);
+        QCOMPARE(order.count("stopped"), 1);
+        QVERIFY(order.indexOf("failed") < order.indexOf("output"));
+        QVERIFY(order.indexOf("output") < order.indexOf("stopped"));
+        QVERIFY(handleIsSignaled(child));
+        CloseHandle(child);
+    }
+
     void stopDuringStartNeverEmitsReady()
     {
         QTemporaryDir directory;
@@ -2095,6 +2685,11 @@ private slots:
         file.close();
         const QString lockPath = privateLockPath(directory);
         Xc2BackendManager manager;
+        QList<Xc2BackendState> order;
+        QObject::connect(&manager, &Xc2BackendManager::stateChanged,
+                         &manager, [&](Xc2BackendState state) {
+            order.append(state);
+        });
         QSignalSpy ready(&manager, &Xc2BackendManager::ready);
         QSignalSpy failed(&manager, &Xc2BackendManager::failed);
         QSignalSpy stopped(&manager, &Xc2BackendManager::stopped);
@@ -2104,12 +2699,19 @@ private slots:
         manager.stop();
         QTRY_COMPARE_WITH_TIMEOUT(stopped.count(), 1, 4000);
         QCOMPARE(ready.count(), 0);
-        QVERIFY(failed.count() <= 1);
-        if (!failed.isEmpty()) {
-            QCOMPARE(qvariant_cast<Xc2Error>(
-                         failed.constFirst().constFirst()).category,
-                     Xc2ErrorCategory::Backend);
-        }
+        QCOMPARE(failed.count(), 1);
+        QCOMPARE(qvariant_cast<Xc2Error>(
+                     failed.constFirst().constFirst()).category,
+                 Xc2ErrorCategory::Backend);
+        QCOMPARE(stopped.constFirst().at(0).toInt(), -1);
+        QCOMPARE(qvariant_cast<QProcess::ExitStatus>(
+                     stopped.constFirst().at(1)), QProcess::CrashExit);
+        const QList<Xc2BackendState> expectedOrder{
+            Xc2BackendState::Starting,
+            Xc2BackendState::Failed,
+            Xc2BackendState::Stopped,
+        };
+        QCOMPARE(order, expectedOrder);
         QCOMPARE(manager.state(), Xc2BackendState::Stopped);
         QVERIFY(lockIsAvailable(lockPath));
     }
@@ -2282,8 +2884,13 @@ private slots:
 
     void reaperHandlesMultipleContextsAndRepeatedQuitAcrossCycles()
     {
+        ReaperRepostHookReset reset;
         QuitSink sink;
         qApp->installEventFilter(&sink);
+        Xc2BackendManagerTestAccess::setReaperRepostHook([] {
+            QCoreApplication::postEvent(
+                qApp, new QEvent(QEvent::Quit), Qt::HighEventPriority);
+        });
         for (int cycle = 0; cycle < 2; ++cycle) {
             QTemporaryDir directory;
             QVERIFY(directory.isValid());

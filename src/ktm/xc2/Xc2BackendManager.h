@@ -62,6 +62,12 @@ private:
     friend class Xc2BackendManagerTestAccess;
 
     struct PrivateLaunchPlan {
+        enum class ShutdownProofMutation {
+            None,
+            Duplicate,
+            Conflicting,
+        };
+
         QString program;
         QString workingDirectory;
         QProcessEnvironment environment;
@@ -74,8 +80,14 @@ private:
         std::function<QStringList(quint16)> argumentsBuilder;
         std::function<quint16()> candidateAllocator;
         std::function<void(const QString &)> lifecycleObserver;
+        std::function<void()> afterListenerSnapshotForTest;
+        std::function<void()> afterShutdownSnapshotForTest;
         bool invalidateShutdownCookieTargetForTest = false;
         bool failJobSetupForTest = false;
+        bool failNativeTerminationForTest = false;
+        int finishedNotificationDelayMsForTest = 0;
+        ShutdownProofMutation shutdownProofMutationForTest =
+            ShutdownProofMutation::None;
     };
 
     struct RawTcpOwnerRow {
@@ -118,6 +130,10 @@ private:
     static bool shutdownRowsOwnedForTest(
         const QList<RawTcpConnectionRow> &rows, quint16 serverPort,
         quint16 clientPort, quint32 processId);
+    static void setProductionInspectionTestHooks(
+        std::function<void(const QString &)> observer, int delayMs);
+    static void resetProductionInspectionTestHooks();
+    static void setReaperRepostTestHook(std::function<void()> hook);
 
     void setBackendState(Xc2BackendState state);
     void publishOwnedProcess(qint64 processId, bool owned);

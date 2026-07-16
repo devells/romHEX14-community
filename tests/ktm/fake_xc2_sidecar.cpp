@@ -1,4 +1,5 @@
 #include <QCoreApplication>
+#include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QFileInfo>
@@ -9,6 +10,7 @@
 #include <QLockFile>
 #include <QPointer>
 #include <QProcess>
+#include <QSet>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTimer>
@@ -35,6 +37,7 @@ struct Options {
     QString holdLockPath;
     QString userMode = QStringLiteral("valid");
     QString releaseTriggerPath;
+    QString exitTriggerPath;
     QString eventLogPath;
 };
 
@@ -43,7 +46,7 @@ bool takeValue(const QStringList &arguments, int &index, QString &value)
     if (index + 1 >= arguments.size())
         return false;
     value = arguments.at(++index);
-    return true;
+    return !value.isEmpty() && !value.startsWith(QStringLiteral("--"));
 }
 
 bool takeInteger(const QStringList &arguments, int &index, int &value)
@@ -61,11 +64,18 @@ bool takeInteger(const QStringList &arguments, int &index, int &value)
 
 bool parseOptions(const QStringList &arguments, Options &options)
 {
+    QSet<QString> seen;
     for (int i = 1; i < arguments.size(); ++i) {
         const QString argument = arguments.at(i);
+        if (!argument.startsWith(QStringLiteral("--"))
+            || seen.contains(argument)) {
+            return false;
+        }
+        seen.insert(argument);
         if (argument == QStringLiteral("--port")) {
             int port = 0;
-            if (!takeInteger(arguments, i, port) || port > 65535)
+            if (!takeInteger(arguments, i, port)
+                || port <= 0 || port > 65535)
                 return false;
             options.port = static_cast<quint16>(port);
         } else if (argument == QStringLiteral("--ready-delay-ms")) {
@@ -106,6 +116,9 @@ bool parseOptions(const QStringList &arguments, Options &options)
                    == QStringLiteral("--release-listener-after-ready")) {
             if (!takeValue(arguments, i, options.releaseTriggerPath))
                 return false;
+        } else if (argument == QStringLiteral("--exit-trigger")) {
+            if (!takeValue(arguments, i, options.exitTriggerPath))
+                return false;
         } else if (argument == QStringLiteral("--event-log")) {
             if (!takeValue(arguments, i, options.eventLogPath))
                 return false;
@@ -122,7 +135,18 @@ bool parseOptions(const QStringList &arguments, Options &options)
         QStringLiteral("missing-permissions"),
         QStringLiteral("malformed"),
     };
-    return userModes.contains(options.userMode);
+    if (options.port == 0 || !userModes.contains(options.userMode))
+        return false;
+    for (const QString &path : {
+             options.holdLockPath,
+             options.releaseTriggerPath,
+             options.exitTriggerPath,
+             options.eventLogPath,
+         }) {
+        if (!path.isEmpty() && !QDir::isAbsolutePath(path))
+            return false;
+    }
+    return true;
 }
 
 class EventLog final {
@@ -331,6 +355,23 @@ public:
 
     void start()
     {
+        if (!m_options.exitTriggerPath.isEmpty()) {
+            auto *timer = new QTimer(this);
+            timer->setInterval(5);
+            connect(timer, &QTimer::timeout, this, [this, timer] {
+                if (!QFileInfo::exists(m_options.exitTriggerPath))
+                    return;
+                timer->stop();
+                QFile output;
+                output.open(stdout, QIODevice::WriteOnly,
+                            QFileDevice::DontCloseHandle);
+                output.write("unexpected-eof-partial");
+                output.flush();
+                m_log->write(QStringLiteral("EXIT_TRIGGERED"));
+                QCoreApplication::exit(9);
+            });
+            timer->start();
+        }
         if (m_options.exitBeforeReady) {
             m_log->write(QStringLiteral("EXIT_BEFORE_READY"));
             QTimer::singleShot(m_options.readyDelayMs, qApp,
@@ -342,6 +383,25 @@ public:
     }
 
 private:
+    struct ConnectionState {
+        quint64 id = 0;
+        qint64 totalBytes = 0;
+        QByteArray buffer;
+        bool handled = false;
+        bool closedLogged = false;
+    };
+
+    void logConnectionClosed(const std::shared_ptr<ConnectionState> &state)
+    {
+        if (state->closedLogged)
+            return;
+        state->closedLogged = true;
+        m_log->write(QStringLiteral("CONNECTION_CLOSED"),
+                     {{QStringLiteral("connectionId"),
+                       static_cast<qint64>(state->id)},
+                      {QStringLiteral("totalBytes"), state->totalBytes}});
+    }
+
     void beginListening()
     {
         if (!m_server.listen(QHostAddress::LocalHost, m_options.port)) {
@@ -374,20 +434,43 @@ private:
     {
         while (QTcpSocket *socket = m_server.nextPendingConnection()) {
             socket->setParent(this);
-            auto buffer = std::make_shared<QByteArray>();
+            auto state = std::make_shared<ConnectionState>();
+            state->id = ++m_nextConnectionId;
+            m_log->write(QStringLiteral("CONNECTION_ACCEPTED"),
+                         {{QStringLiteral("connectionId"),
+                           static_cast<qint64>(state->id)}});
+            connect(socket, &QTcpSocket::disconnected, this,
+                    [this, state] { logConnectionClosed(state); });
+            connect(socket, &QObject::destroyed, this,
+                    [this, state] { logConnectionClosed(state); });
             connect(socket, &QTcpSocket::readyRead, this,
-                    [this, socket, buffer] {
-                        buffer->append(socket->readAll());
-                        if (buffer->size() > 64 * 1024) {
+                    [this, socket, state] {
+                        const QByteArray bytes = socket->readAll();
+                        state->totalBytes += bytes.size();
+                        m_log->write(QStringLiteral("RAW_BYTES"),
+                                     {{QStringLiteral("connectionId"),
+                                       static_cast<qint64>(state->id)},
+                                      {QStringLiteral("bytes"), bytes.size()},
+                                      {QStringLiteral("totalBytes"),
+                                       state->totalBytes},
+                                      {QStringLiteral("bytesBase64"),
+                                       QString::fromLatin1(bytes.toBase64())}});
+                        if (state->handled) {
                             socket->abort();
                             return;
                         }
-                        const qsizetype headerEnd = buffer->indexOf("\r\n\r\n");
+                        state->buffer.append(bytes);
+                        if (state->buffer.size() > 64 * 1024) {
+                            socket->abort();
+                            return;
+                        }
+                        const qsizetype headerEnd =
+                            state->buffer.indexOf("\r\n\r\n");
                         if (headerEnd < 0)
                             return;
                         qsizetype contentLength = 0;
                         const QList<QByteArray> headers =
-                            buffer->left(headerEnd).split('\n');
+                            state->buffer.left(headerEnd).split('\n');
                         for (QByteArray header : headers) {
                             header = header.trimmed();
                             if (header.left(15).compare(
@@ -403,14 +486,15 @@ private:
                             }
                         }
                         const qsizetype total = headerEnd + 4 + contentLength;
-                        if (buffer->size() < total)
+                        if (state->buffer.size() < total)
                             return;
-                        if (buffer->size() != total) {
+                        if (state->buffer.size() != total) {
                             socket->abort();
                             return;
                         }
-                        const QByteArray request = buffer->left(total);
-                        socket->disconnect(this);
+                        const QByteArray request =
+                            state->buffer.left(total);
+                        state->handled = true;
                         handleRequest(socket, request);
                     });
         }
@@ -488,7 +572,8 @@ private:
             qint64 processId = 0;
             m_descendantStarted = QProcess::startDetached(
                 QCoreApplication::applicationFilePath(),
-                {QStringLiteral("--descendant")},
+                {QStringLiteral("--port"), QStringLiteral("1"),
+                 QStringLiteral("--descendant")},
                 QFileInfo(QCoreApplication::applicationFilePath())
                     .absolutePath(),
                 &processId);
@@ -559,6 +644,7 @@ private:
     int m_concurrentHealth = 0;
     int m_maxConcurrentHealth = 0;
     bool m_descendantStarted = false;
+    quint64 m_nextConnectionId = 0;
 };
 
 } // namespace
