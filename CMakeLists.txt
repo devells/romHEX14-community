@@ -74,6 +74,8 @@ if(RX14_KTM_XC2)
         src/ktm/xc2/Xc2JsonCodec.h
         src/ktm/xc2/Xc2Models.cpp
         src/ktm/xc2/Xc2Models.h
+        src/ktm/xc2/Xc2StompCodec.cpp
+        src/ktm/xc2/Xc2StompCodec.h
     )
     target_include_directories(rx14_ktm_xc2 PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -569,6 +571,19 @@ if(BUILD_TESTING AND RX14_KTM_XC2)
     )
     add_test(NAME xc2_json_codec COMMAND test_Xc2JsonCodec)
     set_tests_properties(xc2_json_codec PROPERTIES LABELS "unit;contract;ktm")
+
+    add_executable(test_Xc2StompCodec
+        tests/ktm/test_Xc2StompCodec.cpp
+    )
+    target_compile_definitions(test_Xc2StompCodec PRIVATE
+        KTM_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/ktm/fixtures"
+    )
+    target_link_libraries(test_Xc2StompCodec PRIVATE
+        rx14_ktm_xc2
+        Qt6::Test
+    )
+    add_test(NAME xc2_stomp_codec COMMAND test_Xc2StompCodec)
+    set_tests_properties(xc2_stomp_codec PROPERTIES LABELS "unit;contract;ktm")
 endif()
 
 # ── Map auto-detect corpus harness (issue #25) ─────────────────────────────

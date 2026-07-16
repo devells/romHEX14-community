@@ -8,6 +8,19 @@
     "deviceSerialsRetained": false,
     "networkAddressesRetained": false
   },
+  "stompCompatibilityEvidence": {
+    "date": "2026-07-16",
+    "endpoint": "ws://127.0.0.1:8082/xc2-websocket",
+    "subprotocol": "v12.stomp",
+    "operations": [
+      "CONNECT",
+      "DISCONNECT"
+    ],
+    "readOnly": true,
+    "clientHeartBeat": "10000,10000",
+    "connectedVersion": "1.2",
+    "connectedHeartBeat": "0,0"
+  },
   "fixtures": [
     {
       "path": "rest/service-status-alive.txt",
@@ -36,6 +49,19 @@
     {
       "path": "rest/contract-missing-field.json",
       "route": "auth/currentUser"
+    },
+    {
+      "path": "stomp/connected.frame",
+      "command": "CONNECTED"
+    },
+    {
+      "path": "stomp/progress-message.frame",
+      "command": "MESSAGE",
+      "topic": "/topic/progress"
+    },
+    {
+      "path": "stomp/error.frame",
+      "command": "ERROR"
     }
   ]
 }
