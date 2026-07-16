@@ -144,6 +144,29 @@ private slots:
                  QStringLiteral("synthetic progress"));
     }
 
+    void jobProgressAcceptsUtf8BomAtDocumentStart()
+    {
+        const QByteArray payload = QByteArray::fromHex("efbbbf")
+            + QByteArrayLiteral(" \t\r\n")
+            + jobProgressPayload(
+                QByteArrayLiteral("\"IN_PROGRESS\""),
+                QByteArrayLiteral("-2147483648"),
+                QByteArrayLiteral("2147483647"),
+                QByteArrayLiteral(
+                    R"({"id":9223372036854775807,"text":"bom progress"})"));
+
+        const auto progress = Xc2JsonCodec::jobProgress(payload);
+
+        QVERIFY2(progress.ok(), qPrintable(progress.error.message));
+        QCOMPARE(progress.value->ticks, std::numeric_limits<qint32>::min());
+        QCOMPARE(progress.value->totalTicks,
+                 std::numeric_limits<qint32>::max());
+        QVERIFY(progress.value->message.has_value());
+        QCOMPARE(progress.value->message->id,
+                 std::numeric_limits<qint64>::max());
+        QCOMPARE(progress.value->message->text, QStringLiteral("bom progress"));
+    }
+
     void jobProgressAcceptsLocalizedTextObjectAndNull_data()
     {
         QTest::addColumn<QByteArray>("message");

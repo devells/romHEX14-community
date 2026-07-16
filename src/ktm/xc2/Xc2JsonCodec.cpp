@@ -603,6 +603,8 @@ Xc2Result<Xc2JobProgress> Xc2JsonCodec::jobProgress(const QByteArray &body)
 
     const QJsonObject object = document.object();
     qsizetype objectStart = 0;
+    if (body.startsWith(QByteArrayLiteral("\xEF\xBB\xBF")))
+        objectStart = 3;
     skipJsonWhitespace(body, objectStart);
     Xc2JobProgress progress;
     QString status;
