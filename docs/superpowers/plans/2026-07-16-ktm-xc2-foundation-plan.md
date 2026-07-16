@@ -1434,30 +1434,195 @@ rtk git commit -m "feat: manage the XC2 sidecar lifecycle"
 **Files:**
 - Create: `src/ktm/xc2/Xc2StompClient.h`
 - Create: `src/ktm/xc2/Xc2StompClient.cpp`
+- Create: `tests/ktm/FakeStompWebSocketServer.h`
+- Create: `tests/ktm/FakeStompWebSocketServer.cpp`
 - Create: `tests/ktm/test_Xc2StompClient.cpp`
 - Modify: `CMakeLists.txt`
 
 **Interfaces:**
-- Consumes: STOMP codec from Task 3, cookie header from Task 5, topic allowlist from Task 1.
-- Produces: `Xc2StompState`, `Xc2StompSession`, `Xc2StompMessage`, and connection/subscription events.
+- Consumes: STOMP codec from Task 3, the authority-bound REST session from
+  Task 5, and the topic allowlist from Task 1.
+- Produces: `Xc2StompState`, `Xc2StompSession`, `Xc2StompMessage`, bounded
+  connection generations, sent-subscription events, errors, and visibility-loss
+  events. It never reconnects itself.
 
-- [ ] **Step 1: Write failing loopback WebSocket/STOMP tests**
+**Observed compatibility and intentional boundaries:**
 
-Use `QWebSocketServer` in the test process. Assert:
+- The actively served application and patched JAR both use the native endpoint
+  `/xc2-websocket`; the JAR registers a `/topic` simple broker and no SockJS
+  transport. Do not append a SockJS session or `/websocket` suffix.
+- A direct local probe of the approved patched sidecar required WebSocket
+  subprotocol `v12.stomp` and returned STOMP `version:1.2`. The actively served
+  application bundles an older STOMP library that advertises v10/v11; live
+  runtime evidence wins, so do not copy that obsolete offer.
+- The observed `CONNECTED` frame has `heart-beat:0,0`. That is a successful
+  negotiation with both heartbeat directions disabled, not a timeout condition.
+- The eight Task 1 topics match the in-scope status, vehicle, ECU, job, flow, and
+  measurement topics. `/topic/dealernet` and `/topic/semantic` also exist in the
+  legacy application but remain deliberately outside the approved product scope.
+- Subscription IDs are client-scoped opaque values. Stable semantic IDs need not
+  reproduce the legacy client's dynamic `sub-N` values; the golden progress
+  fixture already freezes `progress-subscription`.
+- Task 3 already proves STOMP byte-stream fragmentation/coalescing, CRLF,
+  content-length/NUL handling, duplicate-header precedence, and the 8 MiB codec
+  cap. This task proves the WebSocket/message/generation integration without
+  duplicating those parser tests.
+
+- [ ] **Step 1: Build deterministic loopback WebSocket test servers**
+
+Create `FakeStompWebSocketServer` around `QWebSocketServer`. It must bind only
+`QHostAddress::LocalHost` on port zero, set `QNetworkProxy::NoProxy`, call
+`setSupportedSubprotocols({QStringLiteral("v12.stomp")})`, retain each accepted
+socket, and expose its `requestUrl()`, negotiated subprotocol, upgrade request
+headers, text/binary message kind, and incrementally decoded STOMP frames. It
+must script CONNECTED, MESSAGE, RECEIPT, ERROR, heartbeat, fragmented/coalesced
+payloads, delayed close, and no-response behavior.
+
+Also add a minimal raw `QTcpServer` helper in the same test support files for
+pre-upgrade cases that `QWebSocketServer` cannot express. It captures the exact
+HTTP upgrade request and can accept without responding or return a `302` to an
+independent trap listener. Neither helper may listen on a wildcard or
+non-loopback address. Tests use signals and bounded `QSignalSpy` waits, never
+sleep-based guesses.
+
+Use `QTEST_GUILESS_MAIN`, not `QTEST_APPLESS_MAIN`, so `QCoreApplication`,
+timers, sockets, and the event dispatcher exist. Add `Q_DECLARE_METATYPE` for
+the public state/session/message types used by `QSignalSpy`.
+
+- [ ] **Step 2: Write failing authority, handshake, protocol, and state tests**
+
+Add these cases first:
 
 ```cpp
-void sendsConnectThenSubscribesAfterConnected();
-void passesCookieHeaderInHandshake();
-void routesAllowedTopicMessage();
-void rejectsTopicOutsideProfile();
-void heartbeatTimeoutEmitsVisibilityLost();
-void destructiveModeDisablesAutomaticReconnect();
+void derivesExactUrlAndCookieFromRestClient();
+void cannotRetargetCookieToAnotherAuthority();
+void ownedSocketBypassesApplicationProxy();
+void handshakeRedirectNeverReachesTrapOrLeaksCookie();
+void offersAndRequiresOnlyV12StompSubprotocol();
+void sendsTextConnectWithExactRequiredHeaders();
+void subscribesOnlyAfterValidConnected();
+void rejectsInvalidConnectedFrames_data();
+void rejectsInvalidConnectedFrames();
+void errorFrameTerminatesGenerationExactlyOnce();
+void totalDeadlineCoversUpgradeAndStompNegotiation_data();
+void totalDeadlineCoversUpgradeAndStompNegotiation();
+void connectIsSingleFlightAndStaleGenerationSignalsAreIgnored();
 ```
 
-The fake server validates CONNECT headers, responds with CONNECTED, captures
-SUBSCRIBE frames, and sends the golden progress MESSAGE.
+The Task 5 integration test first obtains a synthetic session cookie from the
+loopback HTTP fake. The STOMP client must open exactly
+`restClient.webSocketUrl()` and send exactly the successful
+`restClient.cookieHeaderFor(restClient.webSocketUrl())` result. There is no
+public API that accepts an arbitrary WebSocket URL and Cookie pair. Temporarily
+install an application proxy whose trap listener counts connections and prove
+the WebSocket still connects directly. A raw origin returning `302` to a second
+loopback port must fail without contacting the trap or replaying Cookie.
 
-- [ ] **Step 2: Run the client target to verify red behavior**
+The positive server selects `v12.stomp`. Negative rows select no subprotocol or
+a different subprotocol and assert that no STOMP CONNECT is sent. A successful
+upgrade must receive one text WebSocket message containing CONNECT with exact
+headers:
+
+```text
+accept-version:1.2
+host:<canonical validated URL host, without port>
+heart-beat:10000,10000
+```
+
+The client remains in STOMP negotiation and sends no SUBSCRIBE until one valid
+CONNECTED frame has `version:1.2`. Reject missing/downgraded/duplicate version,
+CONNECTED in the wrong state, MESSAGE or RECEIPT before CONNECTED, malformed
+heartbeat values, and unknown server commands. An ERROR before or after
+CONNECTED preserves its `message` header and body in one `Xc2Error`, terminates
+that generation, and cannot double-complete when the server then closes.
+
+Use short injected deadlines for three total-deadline rows: TCP accepted but no
+upgrade response, WebSocket upgraded but no CONNECTED, and periodic partial
+STOMP bytes that never complete CONNECTED. All must terminate once near the one
+wall-clock deadline measured from `connectToBackend`; activity never extends it.
+Call connect twice while the first call is in flight and prove one server
+connection. Then abort generation A, connect generation B, and make A deliver a
+queued error/close/timer callback; B must remain unaffected.
+
+- [ ] **Step 3: Write failing heartbeat, subscription, routing, fragmentation,
+  disconnect, and visibility tests**
+
+Add these cases:
+
+```cpp
+void negotiatesHeartbeatMatrix_data();
+void negotiatesHeartbeatMatrix();
+void zeroZeroHeartbeatNeverTimesOut();
+void incomingActivityUsesMonotonicDeadline();
+void outgoingHeartbeatIsSentOnlyAfterOutboundSilence();
+void websocketAndStompFragmentationDeliverExactlyOnce_data();
+void websocketAndStompFragmentationDeliverExactlyOnce();
+void codecBufferDoesNotCrossConnectionGeneration();
+void stableSubscriptionsQueueDeduplicateAndKeepOrder();
+void unsubscribeUsesTheStableIdExactlyOnce();
+void rejectsInvalidTopicValueWithoutWriting();
+void messageRoutingRequiresConsistentHeaders_data();
+void messageRoutingRequiresConsistentHeaders();
+void matchingDisconnectReceiptClosesGracefully();
+void wrongOrMissingDisconnectReceiptUsesBoundedAbort();
+void disconnectReceiptCloseAndTimeoutRaceCompletesOnce();
+void unexpectedEstablishedLossEmitsVisibilityOnceAndNeverReconnects();
+void connectFailureAndIntentionalDisconnectDoNotLoseVisibility();
+```
+
+Heartbeat data rows cover server `0,0`, `0,N`, `N,0`, and `N,M`, plus a missing
+header and negative, non-numeric, incomplete, and overflow values. The observed
+`0,0` row must remain connected past the injected grace window with no heartbeat
+or visibility-loss event. Incoming heartbeat, partial STOMP, and ordinary
+MESSAGE traffic each reset the monotonic incoming-activity deadline. A real
+outgoing frame resets outbound activity so an LF is not sent early.
+
+Fragmentation rows cover one STOMP frame split across several WebSocket
+messages, several STOMP frames coalesced into one WebSocket message, one
+WebSocket message fragmented into frames with `setOutgoingFrameSize()`, and
+both text and binary WebSocket messages. Each logical STOMP frame is decoded
+once. A partial frame left by generation A cannot complete from bytes received
+on generation B.
+
+Freeze the subscription map and ordering:
+
+| Topic | Subscription ID |
+|---|---|
+| `VciStatus` | `vci-status-subscription` |
+| `VehicleInfo` | `vehicle-info-subscription` |
+| `Ecu` | `ecu-subscription` |
+| `Progress` | `progress-subscription` |
+| `MeasurementValues` | `measurement-values-subscription` |
+| `FlowGui` | `flow-gui-subscription` |
+| `FlowProgress` | `flow-progress-subscription` |
+| `Login` | `login-subscription` |
+
+When several topics are desired, emit SUBSCRIBE frames in
+`Xc2ContractProfile::allTopics()` order. Each has exact `id`, `destination`, and
+`ack:auto` headers. Duplicate subscribe is idempotent. Unsubscribe before
+CONNECTED removes only the queued desire; after CONNECTED it sends one
+UNSUBSCRIBE containing the same `id`. A later controller-requested connection
+generation resubscribes the still-desired topics once, but the transport never
+opens that generation itself.
+
+MESSAGE rows require non-empty `destination`, `subscription`, and `message-id`.
+The subscription must be active in the current generation and its Topic must
+map to exactly that destination in Task 1. Cover missing headers, unknown
+subscription, allowed destination paired with another subscription, known
+subscription paired with another or out-of-profile destination, and a message
+after unsubscribe. Each invalid row reports a Contract error and drops the
+body without `messageReceived`; the golden progress MESSAGE is delivered once
+with its message ID preserved.
+
+Graceful disconnect sends one receipt-bearing DISCONNECT, waits only for the
+matching receipt-id, and closes normally. A wrong/stale receipt cannot complete
+it. No receipt and a receipt/close/timeout collision both finish once within the
+injected disconnect deadline; timeout force-aborts. An unexpected loss after
+CONNECTED emits one visibility-loss event and never opens another connection.
+A connection that never reached CONNECTED and an intentional disconnect have no
+established visibility to lose.
+
+- [ ] **Step 4: Run the client target to verify red behavior**
 
 ```powershell
 rtk cmake --build build-test --target test_Xc2StompClient --parallel
@@ -1465,68 +1630,196 @@ rtk cmake --build build-test --target test_Xc2StompClient --parallel
 
 Expected: missing-client compile failure.
 
-- [ ] **Step 3: Implement the client interface**
+- [ ] **Step 5: Implement the bounded public interface**
 
 ```cpp
-enum class Xc2StompState { Disconnected, Connecting, Connected, Failed };
+using Xc2StompGeneration = quint64;
+
+enum class Xc2StompState {
+    Disconnected,
+    WebSocketConnecting,
+    StompConnecting,
+    Connected,
+    Disconnecting,
+    Failed
+};
+
+struct Xc2StompClientOptions {
+    int connectDeadlineMs = 10000;
+    int disconnectDeadlineMs = 2000;
+    qint64 clientOutgoingHeartbeatMs = 10000;
+    qint64 clientIncomingHeartbeatMs = 10000;
+    int heartbeatGraceMultiplier = 2;
+    quint64 maximumIncomingMessageBytes = 8 * 1024 * 1024;
+};
 
 struct Xc2StompSession {
+    Xc2StompGeneration generation = 0;
     QString version;
-    int outgoingHeartbeatMs = 0;
-    int incomingHeartbeatMs = 0;
+    qint64 outgoingHeartbeatMs = 0;
+    qint64 incomingHeartbeatMs = 0;
 };
 
 struct Xc2StompMessage {
+    Xc2StompGeneration generation = 0;
+    Topic topic = Topic::VciStatus;
     QString destination;
     QString subscriptionId;
+    QString messageId;
     QByteArray body;
 };
 
 class Xc2StompClient final : public QObject {
     Q_OBJECT
 public:
-    explicit Xc2StompClient(QObject *parent = nullptr);
-    void connectToBackend(const QUrl &url, const QByteArray &cookieHeader);
+    explicit Xc2StompClient(Xc2StompClientOptions options = {},
+                            QObject *parent = nullptr);
+    bool connectToBackend(const Xc2RestClient &restClient,
+                          Xc2Error *error = nullptr);
     bool subscribe(Topic topic, Xc2Error *error = nullptr);
-    void unsubscribe(Topic topic);
+    bool unsubscribe(Topic topic, Xc2Error *error = nullptr);
     void disconnectFromBackend();
-    void setDestructiveJobActive(bool active);
     Xc2StompState state() const;
+    Xc2StompGeneration generation() const;
 
 signals:
+    void stateChanged(Xc2StompGeneration, Xc2StompState);
     void connected(const Xc2StompSession &);
+    void subscriptionSent(Topic, const QString &subscriptionId);
+    void unsubscriptionSent(Topic, const QString &subscriptionId);
     void messageReceived(const Xc2StompMessage &);
-    void protocolError(const Xc2Error &);
-    void visibilityLost();
-    void disconnected();
+    void errorOccurred(Xc2StompGeneration, const Xc2Error &);
+    void visibilityLost(Xc2StompGeneration, const Xc2Error &);
+    void disconnected(Xc2StompGeneration);
 };
 ```
 
-- [ ] **Step 4: Implement handshake, heartbeat, and subscription rules**
+- [ ] **Step 6: Implement authority-bound handshake and one connection generation**
 
-Open `QWebSocket` with a `QNetworkRequest` carrying the Cookie header. Send
-STOMP CONNECT with `accept-version:1.2` and `heart-beat:10000,10000`. Queue
-requested topics until CONNECTED, then send stable subscription IDs derived
-from the `Topic` enum. Feed all binary/text messages to `Xc2StompCodec`.
-Negotiate heartbeat intervals per STOMP 1.2, emit LF on the outgoing timer, and
-emit `visibilityLost()` when incoming traffic exceeds twice the negotiated
-interval. Do not implement automatic reconnect in this class; the later
-controller decides whether reconnect is allowed. In destructive mode, a socket
-loss emits visibility loss and remains disconnected.
+`connectToBackend` accepts only a configured `Xc2RestClient`. In the same call,
+copy its canonical `webSocketUrl()` and request
+`cookieHeaderFor(webSocketUrl())`; a failed cookie result fails synchronously
+without creating a socket. There is no overload accepting caller-provided URL
+or Cookie bytes. This preserves the Task 5 guarantee that REST and WebSocket use
+the same validated host and explicit port.
 
-- [ ] **Step 5: Run STOMP client and codec tests**
+Create a fresh `QWebSocket` for each accepted call. Set its proxy to
+`QNetworkProxy::NoProxy` before opening it. Build `QNetworkRequest` from only the
+canonical URL, set `QNetworkRequest::ManualRedirectPolicy`, set maximum redirects
+to zero, and add the derived Cookie header. Open it with
+`QWebSocketHandshakeOptions` containing only `v12.stomp`. After the upgrade,
+require `subprotocol()` to equal `v12.stomp` before changing to
+`StompConnecting` or sending CONNECT. Configure the WebSocket incoming message
+and frame limits before open.
+
+Start one total connect timer at method entry. It is not an inactivity timer and
+no network or STOMP activity restarts it. Reject another connect while state is
+WebSocketConnecting, StompConnecting, Connected, or Disconnecting, with no
+second socket. A call from Disconnected or a fully cleaned Failed state begins a
+new monotonically increasing generation.
+
+Every socket callback and timer captures both the generation and socket
+identity. Ignore callbacks that do not match the current pair. Reset the codec,
+active subscriptions, heartbeat clocks, and all timers at generation start and
+terminal cleanup. Route timeout, WebSocket error, disconnected, STOMP ERROR, and
+protocol failure through one `finishOnce(generation, ...)` path so each
+generation emits at most one terminal error, visibility-loss event, and
+disconnected event.
+
+- [ ] **Step 7: Implement strict STOMP negotiation and frame dispatch**
+
+Encode all client frames with `Xc2StompCodec` and send CONNECT, SUBSCRIBE,
+UNSUBSCRIBE, DISCONNECT, and heartbeat LF as text WebSocket messages. CONNECT
+uses only `accept-version:1.2`, the canonical URL host in `host`, and the two
+configured heartbeat offer values. The production defaults therefore remain
+the observed `10000,10000` offer.
+
+Only a single CONNECTED while StompConnecting can establish the session. Its
+required `version` must equal `1.2`; parse an absent `heart-beat` as `0,0` and
+otherwise require exactly two checked non-negative decimal 64-bit values.
+Reject overflow before converting a duration or multiplying the grace factor.
+Stop the total connect deadline only after the valid CONNECTED has been fully
+processed. Then emit connected and flush desired subscriptions.
+
+Recognize MESSAGE, RECEIPT, and ERROR after negotiation. ERROR is terminal and
+preserves its header/body evidence. A decoder error, duplicate or misplaced
+CONNECTED, or unknown server command is a terminal Contract failure. An
+unrouteable MESSAGE and an unrelated RECEIPT are reported and dropped without
+being treated as a valid application event.
+
+Feed only complete `textMessageReceived` and `binaryMessageReceived` payloads
+to the incremental codec. Use text/binary frame signals only to update incoming
+activity; never feed both frame and message signals, which would decode bytes
+twice. Complete-message delivery lets QWebSocket reassemble TCP and WebSocket
+frame fragmentation, while the codec independently handles STOMP frames split
+across WebSocket messages or coalesced in one message.
+
+- [ ] **Step 8: Implement heartbeat, stable subscriptions, and strict routing**
+
+For CONNECT `heart-beat:<cx>,<cy>` and CONNECTED
+`heart-beat:<sx>,<sy>`, calculate:
+
+```text
+outgoing = disabled if cx == 0 or sy == 0, otherwise max(cx, sy)
+incoming = disabled if sx == 0 or cy == 0, otherwise max(sx, cy)
+```
+
+Never create a timer for a disabled direction. Use `QElapsedTimer` for incoming
+and outgoing activity. Any incoming data frame, including a heartbeat or a
+partial STOMP payload, refreshes incoming activity. Any successfully queued
+client STOMP frame or LF refreshes outgoing activity. On the outgoing timer,
+send LF only after a full negotiated interval of silence. On an incoming timer
+firing before the checked grace threshold, reschedule the remaining duration;
+only silence exceeding `heartbeatGraceMultiplier * incoming` aborts the socket
+and reports visibility loss once.
+
+Keep a persistent desired-topic set and a per-generation active-subscription
+map using the frozen table from Step 3. Validate every Topic against
+`Xc2ContractProfile::allTopics()`; an invalid enum value returns false without a
+write. Queue valid desires before CONNECTED, flush them once in profile order,
+and make duplicate subscribe/unsubscribe idempotent. `subscriptionSent` and
+`unsubscriptionSent` mean that the exact frame was queued, not that the server
+confirmed it.
+
+For MESSAGE, compare the raw decoded `destination` and `subscription` values to
+the active map before converting them for the public struct. Require and retain
+the non-empty `message-id`. Only a consistent current-generation tuple produces
+`messageReceived`; report and drop every mismatch or missing field. Never expose
+an arbitrary string subscription API.
+
+- [ ] **Step 9: Implement receipt-bounded disconnect and visibility semantics**
+
+From Connected, stop heartbeat timers, enter Disconnecting, and send exactly one
+DISCONNECT with `receipt:disconnect-<generation>`. Keep the socket open until a
+RECEIPT has exactly that `receipt-id`, then request a normal WebSocket close. A
+single disconnect deadline remains authoritative through the close handshake;
+on expiry call `abort()`. A server close, error, matching receipt, and timeout in
+the same event-loop turn still complete once. From WebSocketConnecting or
+StompConnecting, disconnect aborts without sending a STOMP DISCONNECT. From
+Disconnected it is idempotent.
+
+`Xc2StompClient` has no destructive-job setter and never schedules or opens a
+reconnection. Unexpected socket loss or heartbeat timeout after a valid
+CONNECTED emits one generic visibilityLost event. Pre-session failures and
+intentional disconnect do not. The later session controller consumes this event
+and may explicitly start a fresh generation only when its destructive-job gate
+allows it; Task 8 records degraded visibility without changing job state.
+
+- [ ] **Step 10: Run only STOMP client and codec tests**
 
 ```powershell
 rtk cmake --build build-test --target test_Xc2StompClient test_Xc2StompCodec --parallel
-rtk ctest --test-dir build-test --output-on-failure -L ktm
+rtk ctest --test-dir build-test --output-on-failure -R "^xc2_(stomp_client|stomp_codec)$"
 ```
 
-Expected: handshake, cookie, routing, and visibility-loss tests pass.
+Expected: authority/cookie traps, v12 handshake, protocol/state/deadline races,
+heartbeat matrix, fragmentation, stable routing, receipt-bounded disconnect,
+and visibility semantics all pass with no external process.
 
-- [ ] **Step 6: Commit the WebSocket client**
+- [ ] **Step 11: Commit the WebSocket client**
 
 ```powershell
-rtk git add CMakeLists.txt src/ktm/xc2/Xc2StompClient.* tests/ktm/test_Xc2StompClient.cpp
+rtk git add CMakeLists.txt src/ktm/xc2/Xc2StompClient.* tests/ktm/FakeStompWebSocketServer.* tests/ktm/test_Xc2StompClient.cpp
 rtk git commit -m "feat: add XC2 STOMP WebSocket transport"
 ```
 

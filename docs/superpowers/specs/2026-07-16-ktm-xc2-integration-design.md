@@ -151,8 +151,12 @@ have an idempotency classification and are never automatically repeated.
 ### 6.3 `Xc2StompClient`
 
 The STOMP client uses Qt WebSockets and implements the subset required by XC2:
-CONNECT, CONNECTED, SUBSCRIBE, MESSAGE, ERROR, heartbeat, UNSUBSCRIBE, and
-DISCONNECT. It subscribes after the REST session exists.
+CONNECT, CONNECTED, SUBSCRIBE, MESSAGE, RECEIPT, ERROR, heartbeat, UNSUBSCRIBE,
+and DISCONNECT. It subscribes after the REST session exists. The WebSocket URL
+and Cookie header are derived together from the validated REST session; the
+transport cannot be given an unrelated authority or caller-built Cookie header.
+The client offers and requires WebSocket subprotocol `v12.stomp`, then requires
+STOMP `version:1.2` before treating the session as connected.
 
 Required topics include:
 
@@ -166,9 +170,14 @@ Required topics include:
 - `/topic/login`
 
 Unknown messages are logged with their topic and schema version but are not
-silently accepted. Reconnection is allowed only when no destructive job is
-active. During a flash, loss of the WebSocket marks visibility as degraded and
-does not restart the backend or resubmit the job.
+silently accepted. `Xc2StompClient` never reconnects itself. It emits a generic
+visibility-loss event only when an established session is lost unexpectedly.
+The session controller may initiate a fresh connection generation only when no
+destructive job is active. During a flash, it propagates that event to the job
+registry as degraded visibility and does not restart the backend, reconnect the
+transport, or resubmit the job. An intentional disconnect sends a generation-
+unique receipt request, waits for the matching RECEIPT, and force-aborts after a
+bounded graceful-disconnect deadline.
 
 ### 6.4 `KtmJobRegistry`
 
