@@ -1434,8 +1434,8 @@ rtk git commit -m "feat: manage the XC2 sidecar lifecycle"
 **Files:**
 - Create: `src/ktm/xc2/Xc2StompClient.h`
 - Create: `src/ktm/xc2/Xc2StompClient.cpp`
-- Create: `tests/ktm/FakeStompWebSocketServer.h`
-- Create: `tests/ktm/FakeStompWebSocketServer.cpp`
+- Create: `tests/ktm/FakeXc2TransportServer.h`
+- Create: `tests/ktm/FakeXc2TransportServer.cpp`
 - Create: `tests/ktm/test_Xc2StompClient.cpp`
 - Modify: `CMakeLists.txt`
 
@@ -1470,20 +1470,25 @@ rtk git commit -m "feat: manage the XC2 sidecar lifecycle"
 
 - [ ] **Step 1: Build deterministic loopback WebSocket test servers**
 
-Create `FakeStompWebSocketServer` around `QWebSocketServer`. It must bind only
-`QHostAddress::LocalHost` on port zero, set `QNetworkProxy::NoProxy`, call
-`setSupportedSubprotocols({QStringLiteral("v12.stomp")})`, retain each accepted
-socket, and expose its `requestUrl()`, negotiated subprotocol, upgrade request
-headers, text/binary message kind, and incrementally decoded STOMP frames. It
-must script CONNECTED, MESSAGE, RECEIPT, ERROR, heartbeat, fragmented/coalesced
-payloads, delayed close, and no-response behavior.
+Create `FakeXc2TransportServer` with one `QTcpServer` bound only to
+`QHostAddress::LocalHost` on port zero. The same listener authority must serve
+the minimal strict REST route used to establish the Task 5 cookie and the
+`/xc2-websocket` upgrade; two independently bound fake ports cannot prove the
+cookie-authority invariant. Peek, but do not consume, bytes through the complete
+HTTP header. Consume and answer a REST request, including a synthetic
+`Set-Cookie`, or pass an untouched upgrade socket to
+`QWebSocketServer::handleConnection()`. Configure that QWebSocketServer with
+`QNetworkProxy::NoProxy` and
+`setSupportedSubprotocols({QStringLiteral("v12.stomp")})`.
 
-Also add a minimal raw `QTcpServer` helper in the same test support files for
-pre-upgrade cases that `QWebSocketServer` cannot express. It captures the exact
-HTTP upgrade request and can accept without responding or return a `302` to an
-independent trap listener. Neither helper may listen on a wildcard or
-non-loopback address. Tests use signals and bounded `QSignalSpy` waits, never
-sleep-based guesses.
+Retain each accepted WebSocket and expose its `requestUrl()`, negotiated
+subprotocol, upgrade request headers, text/binary message kind, and incrementally
+decoded STOMP frames. Script CONNECTED, MESSAGE, RECEIPT, ERROR, heartbeat,
+fragmented/coalesced payloads, delayed close, and no-response behavior. Before
+handoff, the same TCP listener can instead accept without an upgrade response or
+return a `302` to an independent loopback trap listener. Neither listener may
+bind wildcard or non-loopback. Tests use signals and bounded `QSignalSpy` waits,
+never sleep-based guesses.
 
 Use `QTEST_GUILESS_MAIN`, not `QTEST_APPLESS_MAIN`, so `QCoreApplication`,
 timers, sockets, and the event dispatcher exist. Add `Q_DECLARE_METATYPE` for
@@ -1566,6 +1571,7 @@ void messageRoutingRequiresConsistentHeaders();
 void matchingDisconnectReceiptClosesGracefully();
 void wrongOrMissingDisconnectReceiptUsesBoundedAbort();
 void disconnectReceiptCloseAndTimeoutRaceCompletesOnce();
+void abortCurrentGenerationIsImmediateAndIdempotent();
 void unexpectedEstablishedLossEmitsVisibilityOnceAndNeverReconnects();
 void connectFailureAndIntentionalDisconnectDoNotLoseVisibility();
 ```
@@ -1679,6 +1685,7 @@ public:
     bool subscribe(Topic topic, Xc2Error *error = nullptr);
     bool unsubscribe(Topic topic, Xc2Error *error = nullptr);
     void disconnectFromBackend();
+    void abortCurrentGeneration();
     Xc2StompState state() const;
     Xc2StompGeneration generation() const;
 
@@ -1724,7 +1731,10 @@ active subscriptions, heartbeat clocks, and all timers at generation start and
 terminal cleanup. Route timeout, WebSocket error, disconnected, STOMP ERROR, and
 protocol failure through one `finishOnce(generation, ...)` path so each
 generation emits at most one terminal error, visibility-loss event, and
-disconnected event.
+disconnected event. `abortCurrentGeneration()` immediately invalidates and
+force-aborts the current socket, is idempotent, and completes with
+`Transport/Canceled`; it gives an owner such as the contract probe a hard stop
+when its outer REST-plus-WebSocket deadline expires.
 
 - [ ] **Step 7: Implement strict STOMP negotiation and frame dispatch**
 
@@ -1793,10 +1803,12 @@ From Connected, stop heartbeat timers, enter Disconnecting, and send exactly one
 DISCONNECT with `receipt:disconnect-<generation>`. Keep the socket open until a
 RECEIPT has exactly that `receipt-id`, then request a normal WebSocket close. A
 single disconnect deadline remains authoritative through the close handshake;
-on expiry call `abort()`. A server close, error, matching receipt, and timeout in
-the same event-loop turn still complete once. From WebSocketConnecting or
-StompConnecting, disconnect aborts without sending a STOMP DISCONNECT. From
-Disconnected it is idempotent.
+on expiry call the socket's `abort()` and emit one `Transport/Timeout` error. A
+matching receipt followed by a normal close emits no error. A server close,
+error, matching receipt, and timeout in the same event-loop turn still complete
+once. From WebSocketConnecting or StompConnecting, disconnect aborts without
+sending a STOMP DISCONNECT. From Disconnected it is idempotent. The explicit
+`abortCurrentGeneration()` path never waits for the graceful deadline.
 
 `Xc2StompClient` has no destructive-job setter and never schedules or opens a
 reconnection. Unexpected socket loss or heartbeat timeout after a valid
@@ -1819,7 +1831,7 @@ and visibility semantics all pass with no external process.
 - [ ] **Step 11: Commit the WebSocket client**
 
 ```powershell
-rtk git add CMakeLists.txt src/ktm/xc2/Xc2StompClient.* tests/ktm/FakeStompWebSocketServer.* tests/ktm/test_Xc2StompClient.cpp
+rtk git add CMakeLists.txt src/ktm/xc2/Xc2StompClient.* tests/ktm/FakeXc2TransportServer.* tests/ktm/test_Xc2StompClient.cpp
 rtk git commit -m "feat: add XC2 STOMP WebSocket transport"
 ```
 

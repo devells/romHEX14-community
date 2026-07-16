@@ -177,7 +177,10 @@ destructive job is active. During a flash, it propagates that event to the job
 registry as degraded visibility and does not restart the backend, reconnect the
 transport, or resubmit the job. An intentional disconnect sends a generation-
 unique receipt request, waits for the matching RECEIPT, and force-aborts after a
-bounded graceful-disconnect deadline.
+bounded graceful-disconnect deadline. Its owner can also force-abort the current
+generation immediately to enforce a wider REST-plus-WebSocket operation
+deadline; graceful success, graceful timeout, and caller cancellation remain
+distinguishable outcomes.
 
 ### 6.4 `KtmJobRegistry`
 
