@@ -226,9 +226,11 @@ Implement every enum value with the observed XC2 path/topic. Dynamic paths use n
 Use the observed device routes exactly: `device/lookup` (GET), `device/get`
 (GET), `device/getSelected` (GET), `device/apply` (JSON POST), and
 `device/close` (JSON POST). Device apply/close are state-changing. Later device
-filtering and apply code must compare the selected candidate's D-PDU API short
-name to `supportedPduApiShortName()` before issuing `device/apply`; do not expose
-an arbitrary provider override.
+filtering and apply code must compare the selected candidate's `internalName`
+to `supportedPduApiShortName()` before issuing `device/apply`; do not expose an
+arbitrary provider override. The apply/close JSON body is the complete strict
+`Xc2VciDevice` object (`id`, `name`, `internalName`, and optional
+`additionalModuleInformation`), never just a device ID.
 
 - [ ] **Step 4: Build and run the profile test**
 
@@ -274,13 +276,14 @@ rtk git commit -m "feat: define KTM XC2 contract profile"
 - Create: `tests/ktm/fixtures/rest/service-status-alive.txt`
 - Create: `tests/ktm/fixtures/rest/current-user.json`
 - Create: `tests/ktm/fixtures/rest/job-accepted.json`
+- Create: `tests/ktm/fixtures/rest/device-get.json`
 - Create: `tests/ktm/fixtures/rest/error.json`
 - Create: `tests/ktm/fixtures/rest/contract-missing-field.json`
 - Modify: `CMakeLists.txt`
 
 **Interfaces:**
 - Consumes: `Endpoint` and `Xc2ContractProfile` from Task 1.
-- Produces: `Xc2Error`, `Xc2Result<T>`, `Xc2ServiceStatus`, `Xc2CurrentUser`, `Xc2JobAccepted`, `Xc2JobProgress`, and strict `Xc2JsonCodec` parse functions.
+- Produces: `Xc2Error`, `Xc2Result<T>`, `Xc2ServiceStatus`, `Xc2CurrentUser`, `Xc2VciDevice`, `Xc2JobAccepted`, `Xc2JobProgress`, and strict `Xc2JsonCodec` parse/serialization functions.
 
 - [ ] **Step 1: Add red tests for valid, malformed, and missing-field payloads**
 
@@ -316,6 +319,23 @@ void Xc2JsonCodecTest::errorRetainsContext()
     QCOMPARE(result.httpStatus, 403);
     QCOMPARE(result.xc2Code, 403);
     QVERIFY(!result.rawPayload.isEmpty());
+}
+
+void Xc2JsonCodecTest::vciDeviceRoundTripsCompleteApplyPayload()
+{
+    const auto devices = Xc2JsonCodec::vciDevices(
+        loadFixture("rest/device-get.json"));
+    QVERIFY(devices.ok());
+    QCOMPARE(devices.value->size(), 1);
+    const Xc2VciDevice &device = devices.value->front();
+    QCOMPARE(device.internalName,
+             QStringLiteral("AVL Ditest VCI2K_DPDU_API"));
+    const QJsonObject body = Xc2JsonCodec::vciDeviceJson(device);
+    QCOMPARE(body.value(QStringLiteral("id")).toString(), device.id);
+    QCOMPARE(body.value(QStringLiteral("name")).toString(), device.name);
+    QCOMPARE(body.value(QStringLiteral("internalName")).toString(),
+             device.internalName);
+    QVERIFY(body.contains(QStringLiteral("additionalModuleInformation")));
 }
 ```
 
@@ -371,6 +391,13 @@ struct Xc2CurrentUser {
 };
 struct Xc2JobAccepted { QString jobId; };
 
+struct Xc2VciDevice {
+    QString id;
+    QString name;
+    QString internalName;
+    std::optional<QString> additionalModuleInformation;
+};
+
 enum class Xc2JobState {
     Created, InProgress, Finished, Canceled, Error, NotAuthorized
 };
@@ -396,6 +423,8 @@ class Xc2JsonCodec final {
 public:
     static Xc2Result<Xc2ServiceStatus> serviceStatus(const QByteArray &body);
     static Xc2Result<Xc2CurrentUser> currentUser(const QByteArray &body);
+    static Xc2Result<QList<Xc2VciDevice>> vciDevices(const QByteArray &body);
+    static QJsonObject vciDeviceJson(const Xc2VciDevice &device);
     static Xc2Result<Xc2JobAccepted> jobAccepted(const QByteArray &body);
     static Xc2Result<Xc2JobProgress> jobProgress(const QByteArray &body);
     static Xc2Error error(const QByteArray &body, int httpStatus,
@@ -403,7 +432,15 @@ public:
 };
 ```
 
-Each JSON function must use `QJsonParseError`, require an object, require every documented field with its exact type, reject unknown job terminal states, preserve raw bytes on failure, and never treat `{}` or `null` as a successful user/job payload. Accept both observed `jobID` and progress `jobId` only in their corresponding schemas; do not silently alias arbitrary casing.
+Each JSON function must use `QJsonParseError`, require the documented top-level
+kind, require every documented field with its exact type, reject unknown job
+terminal states, preserve raw bytes on failure, and never treat `{}` or `null`
+as a successful user/job payload. `vciDevices()` requires an array whose items
+contain string `id`, `name`, and `internalName`; it accepts
+`additionalModuleInformation` only as string, JSON null, or absent. Its
+serializer emits all four documented DTO property names and no arbitrary
+unknown fields. Accept both observed `jobID` and progress `jobId` only in their
+corresponding schemas; do not silently alias arbitrary casing.
 
 - [ ] **Step 5: Add sanitized golden fixtures**
 
@@ -419,6 +456,10 @@ Use these fixture semantics:
 ```
 
 `job-accepted.json` contains `{"jobID":"00000000-0000-0000-0000-000000000001"}`. `error.json` contains only synthetic IDs and a 403 missing-permission error. `manifest.json` records the approved backend profile ID, capture date `2026-07-16`, route/topic, and that VIN/dealer identifiers were replaced. Do not copy real VINs, credentials, or dealer data.
+
+`device-get.json` contains one synthetic device with all four documented DTO
+properties and `internalName` exactly `AVL Ditest VCI2K_DPDU_API`; no real VCI
+serial number or network address is retained.
 
 - [ ] **Step 6: Run codec and profile tests**
 
