@@ -1,0 +1,7 @@
+{
+  "status": 403,
+  "message": "synthetic error",
+  "code": 1007,
+  "devMessage": "synthetic detail",
+  "info": "synthetic info"
+}

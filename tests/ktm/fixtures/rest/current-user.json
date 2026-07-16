@@ -1,0 +1,19 @@
+{
+  "loginName": "xcd",
+  "name": "Development User",
+  "dealerId": "DEALER-REDACTED",
+  "country": "AT",
+  "address1": "REDACTED",
+  "address2": "",
+  "dealerType": "DEALER",
+  "audience": "KTM",
+  "permissions": [
+    "VehicleDetectExecute",
+    "AutoscanExecute",
+    "EcuDiagnosticRead",
+    "EcuFlashAuto",
+    "EcuFlashCustom",
+    "EcuFlashFile"
+  ],
+  "sessionIndex": "session-redacted"
+}

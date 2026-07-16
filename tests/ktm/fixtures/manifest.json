@@ -1,0 +1,41 @@
+{
+  "backendProfileId": "xc2-approved-2026-07-16",
+  "captureDate": "2026-07-16",
+  "sanitization": {
+    "vinIdentifiersReplaced": true,
+    "dealerIdentifiersReplaced": true,
+    "credentialsRetained": false,
+    "deviceSerialsRetained": false,
+    "networkAddressesRetained": false
+  },
+  "fixtures": [
+    {
+      "path": "rest/service-status-alive.txt",
+      "route": "serviceStatus/status"
+    },
+    {
+      "path": "rest/current-user.json",
+      "route": "auth/currentUser"
+    },
+    {
+      "path": "rest/job-accepted.json",
+      "route": "ecu/scan"
+    },
+    {
+      "path": "rest/job-progress.json",
+      "topic": "/topic/progress"
+    },
+    {
+      "path": "rest/device-get.json",
+      "route": "device/get"
+    },
+    {
+      "path": "rest/error.json",
+      "route": "ecu/scan"
+    },
+    {
+      "path": "rest/contract-missing-field.json",
+      "route": "auth/currentUser"
+    }
+  ]
+}
