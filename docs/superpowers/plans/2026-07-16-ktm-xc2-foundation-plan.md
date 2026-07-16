@@ -261,7 +261,7 @@ arbitrary provider override. The apply/close JSON body is the complete strict
 
 File selection is a native romHEX14 UI concern and is deliberately absent from
 `Endpoint`: the observed XC2 frontend uses a local file input and sends only
-the resulting path through JSON-form `ecu/flashFile`. Do not invent a
+the resulting path through form POST `ecu/flashFile`. Do not invent a
 `selectFlashFile` backend route.
 
 - [ ] **Step 4: Build and run the profile test**
