@@ -184,7 +184,7 @@ enum class Endpoint {
     EcuDomains, EcuOpen, EcuClose, EcuScan, EcuClearDtc,
     EcuFunctions, EcuMeasurementsGet, EcuMeasurementsStart,
     EcuMeasurementsStop, EcuExecuteFlow, FlowUpdateGui,
-    DownloadMapping, FlashAutomatic, SelectFlashFile, FlashFile
+    DownloadMapping, FlashAutomatic, FlashFile
 };
 
 enum class Topic {
@@ -231,6 +231,11 @@ to `supportedPduApiShortName()` before issuing `device/apply`; do not expose an
 arbitrary provider override. The apply/close JSON body is the complete strict
 `Xc2VciDevice` object (`id`, `name`, `internalName`, and optional
 `additionalModuleInformation`), never just a device ID.
+
+File selection is a native romHEX14 UI concern and is deliberately absent from
+`Endpoint`: the observed XC2 frontend uses a local file input and sends only
+the resulting path through JSON-form `ecu/flashFile`. Do not invent a
+`selectFlashFile` backend route.
 
 - [ ] **Step 4: Build and run the profile test**
 
