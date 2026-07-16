@@ -308,6 +308,7 @@ rtk git commit -m "feat: define KTM XC2 contract profile"
 - Create: `tests/ktm/fixtures/rest/service-status-alive.txt`
 - Create: `tests/ktm/fixtures/rest/current-user.json`
 - Create: `tests/ktm/fixtures/rest/job-accepted.json`
+- Create: `tests/ktm/fixtures/rest/job-progress.json`
 - Create: `tests/ktm/fixtures/rest/device-get.json`
 - Create: `tests/ktm/fixtures/rest/error.json`
 - Create: `tests/ktm/fixtures/rest/contract-missing-field.json`
@@ -334,7 +335,7 @@ void Xc2JsonCodecTest::currentUserRequiresIdentityAndPermissions()
 {
     const auto ok = Xc2JsonCodec::currentUser(loadFixture("rest/current-user.json"));
     QVERIFY(ok.ok());
-    QCOMPARE(ok.value->id, QStringLiteral("xcd"));
+    QCOMPARE(ok.value->loginName, QStringLiteral("xcd"));
     QVERIFY(ok.value->permissions.contains(QStringLiteral("EcuDiagnosticRead")));
 
     const auto bad = Xc2JsonCodec::currentUser(
@@ -349,7 +350,10 @@ void Xc2JsonCodecTest::errorRetainsContext()
     const auto result = Xc2JsonCodec::error(
         loadFixture("rest/error.json"), 403, QStringLiteral("ecu/scan"));
     QCOMPARE(result.httpStatus, 403);
-    QCOMPARE(result.xc2Code, 403);
+    QCOMPARE(result.xc2Status, 403);
+    QCOMPARE(result.xc2Code, 1007);
+    QCOMPARE(result.developerMessage, QStringLiteral("synthetic detail"));
+    QCOMPARE(result.info, QStringLiteral("synthetic info"));
     QVERIFY(!result.rawPayload.isEmpty());
 }
 
@@ -367,7 +371,35 @@ void Xc2JsonCodecTest::vciDeviceRoundTripsCompleteApplyPayload()
     QCOMPARE(body.value(QStringLiteral("name")).toString(), device.name);
     QCOMPARE(body.value(QStringLiteral("internalName")).toString(),
              device.internalName);
-    QVERIFY(body.contains(QStringLiteral("additionalModuleInformation")));
+    QVERIFY(!device.additionalModuleInformation.has_value());
+    QVERIFY(body.value(QStringLiteral("additionalModuleInformation")).isNull());
+}
+
+void Xc2JsonCodecTest::vciOptionalInformationIsStrict()
+{
+    QVERIFY(Xc2JsonCodec::vciDevices(
+        R"([{"id":"a","name":"A","internalName":"AVL Ditest VCI2K_DPDU_API"}])").ok());
+    QVERIFY(Xc2JsonCodec::vciDevices(
+        R"([{"id":"a","name":"A","internalName":"AVL Ditest VCI2K_DPDU_API","additionalModuleInformation":"synthetic"}])").ok());
+    QVERIFY(!Xc2JsonCodec::vciDevices(
+        R"([{"id":"a","name":"A","internalName":"AVL Ditest VCI2K_DPDU_API","additionalModuleInformation":7}])").ok());
+}
+
+void Xc2JsonCodecTest::jobSchemasUseExactWireFieldNamesAndStates()
+{
+    const auto accepted = Xc2JsonCodec::jobAccepted(
+        loadFixture("rest/job-accepted.json"));
+    QVERIFY(accepted.ok());
+
+    const auto progress = Xc2JsonCodec::jobProgress(
+        loadFixture("rest/job-progress.json"));
+    QVERIFY(progress.ok());
+    QCOMPARE(progress.value->state, Xc2JobState::InProgress);
+
+    QVERIFY(!Xc2JsonCodec::jobProgress(
+        R"({"jobId":"synthetic","state":"IN_PROGRESS","ticks":1,"totalTicks":2,"message":"x"})").ok());
+    QVERIFY(!Xc2JsonCodec::jobProgress(
+        R"({"jobId":"synthetic","status":"CREATED","ticks":1,"totalTicks":2,"message":"x"})").ok());
 }
 ```
 
@@ -397,7 +429,10 @@ struct Xc2Error {
     Xc2ErrorCategory category = Xc2ErrorCategory::None;
     QString message;
     int httpStatus = 0;
+    int xc2Status = 0;
     int xc2Code = 0;
+    QString developerMessage;
+    QString info;
     QString endpoint;
     QString jobId;
     QString ecuId;
@@ -416,10 +451,16 @@ struct Xc2Result {
 
 struct Xc2ServiceStatus { bool alive = false; };
 struct Xc2CurrentUser {
-    QString id;
+    QString loginName;
     QString name;
-    QString dealerBrand;
+    std::optional<QString> dealerId;
+    std::optional<QString> country;
+    std::optional<QString> address1;
+    std::optional<QString> address2;
+    std::optional<QString> dealerType;
+    std::optional<QString> audience;
     QStringList permissions;
+    std::optional<QString> sessionIndex;
 };
 struct Xc2JobAccepted { QString jobId; };
 
@@ -444,7 +485,11 @@ struct Xc2JobProgress {
 };
 ```
 
-Add `Q_DECLARE_METATYPE` for signal-carried types. Use `std::optional`, not sentinel empty strings, for result success.
+Place every type and codec in `namespace ktm::xc2`. Put
+`Q_DECLARE_METATYPE(ktm::xc2::...)` declarations outside that namespace for
+`Xc2Error`, each signal-carried model, and the concrete `Xc2Result<T>`
+specializations used by Tasks 5-8. Use `std::optional`, not sentinel empty
+strings, for result success or nullable DTO properties.
 
 - [ ] **Step 4: Implement strict codec functions**
 
@@ -467,12 +512,23 @@ public:
 Each JSON function must use `QJsonParseError`, require the documented top-level
 kind, require every documented field with its exact type, reject unknown job
 terminal states, preserve raw bytes on failure, and never treat `{}` or `null`
-as a successful user/job payload. `vciDevices()` requires an array whose items
+as a successful user/job payload. `currentUser()` maps wire `loginName` directly
+and requires string `loginName`, string `name`, and a string array
+`permissions`; it must not consume the mock data-source fields `id`,
+`dealerbrand`, or `rights`. The other documented user fields are nullable or
+absent strings. `jobProgress()` reads only wire field `status` and accepts only
+`IN_PROGRESS`, `FINISHED`, `CANCELED`, `ERROR`, and `NOT_AUTHORIZED`; `Created`
+is an internal registry state and is never accepted from the wire.
+`vciDevices()` requires an array whose items
 contain string `id`, `name`, and `internalName`; it accepts
 `additionalModuleInformation` only as string, JSON null, or absent. Its
 serializer emits all four documented DTO property names and no arbitrary
 unknown fields. Accept both observed `jobID` and progress `jobId` only in their
-corresponding schemas; do not silently alias arbitrary casing.
+corresponding schemas; do not silently alias arbitrary casing. `error()` keeps
+the HTTP status argument separate from wire `status` and `code`, parses the
+five wire properties `status`, `message`, `code`, `devMessage`, and `info`, and
+maps the last two into `developerMessage` and `info` without equating the XC2
+code to the HTTP status.
 
 - [ ] **Step 5: Add sanitized golden fixtures**
 
@@ -480,14 +536,27 @@ Use these fixture semantics:
 
 ```json
 {
-  "id": "xcd",
+  "loginName": "xcd",
   "name": "Development User",
-  "dealerbrand": "ktm",
-  "permissions": ["VehicleDetectExecute", "AutoscanExecute", "EcuDiagnosticRead", "EcuFlashAuto", "EcuFlashCustom", "EcuFlashFile"]
+  "dealerId": "DEALER-REDACTED",
+  "country": "AT",
+  "address1": "REDACTED",
+  "address2": "",
+  "dealerType": "DEALER",
+  "audience": "KTM",
+  "permissions": ["VehicleDetectExecute", "AutoscanExecute", "EcuDiagnosticRead", "EcuFlashAuto", "EcuFlashCustom", "EcuFlashFile"],
+  "sessionIndex": "session-redacted"
 }
 ```
 
-`job-accepted.json` contains `{"jobID":"00000000-0000-0000-0000-000000000001"}`. `error.json` contains only synthetic IDs and a 403 missing-permission error. `manifest.json` records the approved backend profile ID, capture date `2026-07-16`, route/topic, and that VIN/dealer identifiers were replaced. Do not copy real VINs, credentials, or dealer data.
+`job-accepted.json` contains
+`{"jobID":"00000000-0000-0000-0000-000000000001"}`.
+`job-progress.json` uses that ID plus exact fields `status:"IN_PROGRESS"`,
+integer `ticks`/`totalTicks`, and string `message`. `error.json` contains the
+five wire fields with `status:403`, `code:1007`, and only synthetic text.
+`manifest.json` records the approved backend profile ID, capture date
+`2026-07-16`, route/topic, and that VIN/dealer identifiers were replaced. Do
+not copy real VINs, credentials, or dealer data.
 
 `device-get.json` contains one synthetic device with all four documented DTO
 properties and `internalName` exactly `AVL Ditest VCI2K_DPDU_API`; no real VCI
@@ -505,7 +574,7 @@ Expected: both tests pass.
 - [ ] **Step 7: Commit models, codec, and fixtures**
 
 ```powershell
-rtk git add CMakeLists.txt src/ktm/xc2/Xc2Models.* src/ktm/xc2/Xc2JsonCodec.* tests/ktm
+rtk git add CMakeLists.txt src/ktm/xc2/Xc2Models.* src/ktm/xc2/Xc2JsonCodec.* tests/ktm/test_Xc2JsonCodec.cpp tests/ktm/fixtures/README.md tests/ktm/fixtures/manifest.json tests/ktm/fixtures/rest
 rtk git commit -m "feat: add strict XC2 contract models"
 ```
 
@@ -535,7 +604,11 @@ Cover all of these exact cases in `test_Xc2StompCodec.cpp`:
 void fragmentedAndCoalescedFrames();
 void heartbeatIsNotAFrame();
 void contentLengthAllowsEmbeddedNull();
-void headersEscapeRoundTrip();
+void contentLengthWaitsForFragmentedTerminator();
+void connectHeadersRemainUnescaped();
+void messageHeaderKeysAndValuesEscapeRoundTrip();
+void duplicateHeadersKeepFirstValue();
+void crlfHeartbeatAndTrailingEolAreIncremental();
 void malformedFrameReturnsProtocolError();
 void goldenConnectedProgressAndErrorFramesParse();
 ```
@@ -543,7 +616,11 @@ void goldenConnectedProgressAndErrorFramesParse();
 The fragmented test feeds `"MESS"`, then the remainder of a MESSAGE plus a
 complete ERROR frame, and asserts that zero then two frames are returned in
 order. The content-length test uses a body containing `A\0B` and asserts a
-three-byte body rather than stopping at the embedded NUL.
+three-byte body rather than stopping at the embedded NUL; construct it as
+`QByteArray("A\0B", 3)`, never with the NUL-truncating one-argument constructor.
+The terminator-fragment test feeds exactly through the declared body first and
+asserts no error, then feeds the terminating NUL and asserts one frame. A byte
+other than NUL after the complete declared body is the error case.
 
 - [ ] **Step 2: Run the parser test to verify red behavior**
 
@@ -578,17 +655,40 @@ private:
 };
 ```
 
-Implement STOMP 1.2 header escaping (`\\`/`\n`/`\r`/`\c`), LF heartbeats,
-CRLF tolerance, NUL termination, and `content-length`. Cap buffered data at
-8 MiB; overflow emits `Contract` error and resets. Reject invalid escape
-sequences, negative/non-numeric content length, missing command, and a frame
-whose declared body is not followed by NUL.
+Implement STOMP 1.2 framing without globally rewriting the byte stream:
+
+- `CONNECT` and `CONNECTED` header keys/values remain byte-for-byte unescaped;
+  all other commands escape/unescape both keys and values for
+  `\\`, `\n`, `\r`, and `\c`. Unknown escapes are fatal and spaces are never
+  trimmed.
+- Duplicate decoded headers keep the first wire value.
+- Accept LF or CRLF line endings. A CR and LF split across `feed()` calls is
+  one heartbeat/EOL. Permit CRLF/LF after a terminating NUL before the next
+  frame without touching binary body bytes.
+- Parse `content-length` into a checked 64-bit value. A declared value over
+  8 MiB fails immediately; total buffered data over 8 MiB also emits
+  `Contract` and resets.
+- Once the complete declared body is buffered, wait for another fragment when
+  no terminator byte is available. Reject only when an available next byte is
+  not NUL.
+- `encode()` always replaces a caller-provided `content-length` with the actual
+  body size and adds it when the body contains NUL.
+
+Reject negative/non-numeric content length, missing command, invalid escapes,
+and a complete declared body followed by a non-NUL byte.
 
 - [ ] **Step 4: Add and parse sanitized STOMP fixtures**
 
-`connected.frame` negotiates `version:1.2` and `heart-beat:10000,10000`.
-`progress-message.frame` targets `/topic/progress` and carries the synthetic
-job ID from Task 2. `error.frame` has an artificial protocol error only.
+`connected.frame` records the observed local mock negotiation
+`version:1.2` and `heart-beat:0,0` after the client offered
+`heart-beat:10000,10000`. Compatibility evidence is a
+read-only `CONNECT`/`DISCONNECT` at `ws://127.0.0.1:8082/xc2-websocket` using
+subprotocol `v12.stomp` on `2026-07-16`; record it in the fixture manifest.
+`progress-message.frame` targets `/topic/progress`, includes required
+`destination`, `message-id`, and `subscription` headers, and carries the
+synthetic job ID from Task 2. `error.frame` has an artificial protocol error
+only. Every `.frame` is a binary fixture ending in a real `0x00` byte, not the
+two text characters `\\0`; tests assert the terminator and exact byte count.
 
 - [ ] **Step 5: Run all pure contract tests**
 
@@ -602,7 +702,7 @@ Expected: all KTM tests pass with no network process.
 - [ ] **Step 6: Commit the STOMP codec**
 
 ```powershell
-rtk git add CMakeLists.txt src/ktm/xc2/Xc2StompCodec.* tests/ktm
+rtk git add CMakeLists.txt src/ktm/xc2/Xc2StompCodec.* tests/ktm/test_Xc2StompCodec.cpp tests/ktm/fixtures/manifest.json tests/ktm/fixtures/stomp
 rtk git commit -m "feat: add incremental XC2 STOMP codec"
 ```
 
@@ -1206,7 +1306,7 @@ intentional plan checkbox update is uncommitted.
 - [ ] **Step 8: Commit registry, probe, and completed plan state**
 
 ```powershell
-rtk git add CMakeLists.txt src/ktm/xc2/Xc2JobRegistry.* tests/ktm docs/superpowers/plans/2026-07-16-ktm-xc2-foundation-plan.md
+rtk git add CMakeLists.txt src/ktm/xc2/Xc2JobRegistry.* tests/ktm/test_Xc2JobRegistry.cpp tests/ktm/xc2_contract_probe.cpp tests/ktm/run_xc2_mock_contract.ps1 docs/superpowers/plans/2026-07-16-ktm-xc2-foundation-plan.md
 rtk git commit -m "feat: complete the XC2 communication foundation"
 ```
 
