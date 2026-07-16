@@ -203,10 +203,8 @@ private slots:
             QVERIFY(jsonOutput.contains(QLatin1Char('}')));
 
             output.reset();
-            lines = feedBoundary(QByteArrayLiteral("password="));
-            QCOMPARE(lines.size(), 1);
-            verifyState(lines);
-            lines = feedBoundary(QByteArrayLiteral("\"") + keySecretA);
+            lines = feedBoundary(QByteArrayLiteral("password=\"")
+                                 + keySecretA);
             QCOMPARE(lines.size(), 1);
             verifyState(lines);
             verifyState(output.feed(
@@ -218,6 +216,82 @@ private slots:
             QVERIFY(keyOutput.contains(QStringLiteral("[redacted]")));
             QVERIFY(keyOutput.contains(QStringLiteral("visible=ok")));
         }
+
+        const QByteArray crossLineSecret =
+            QByteArrayLiteral("CROSS-LINE-SECRET");
+        const QList<QByteArray> crossLinePrefixes = {
+            QByteArrayLiteral("password=\n"),
+            QByteArrayLiteral("{\"token\":\n"),
+        };
+        for (const QByteArray &prefix : crossLinePrefixes) {
+            output.reset();
+            const QStringList prefixLines =
+                output.feed(kStdout, QByteArrayView(prefix));
+            QCOMPARE(prefixLines.size(), 1);
+            verifyAbsent(prefixLines.front().toUtf8(), {crossLineSecret});
+            verifyAbsent(output.pendingLineUtf8(kStdout), {crossLineSecret});
+            QVERIFY(output.feed(kStdout,
+                                QByteArrayView("Authorization: CROSS-LINE-"))
+                        .isEmpty());
+            verifyAbsent(output.pendingLineUtf8(kStdout), {crossLineSecret});
+            const QStringList headerLine = output.feed(
+                kStdout, QByteArrayView("SECRET\n"));
+            QCOMPARE(headerLine.size(), 1);
+            verifyAbsent(headerLine.front().toUtf8(), {crossLineSecret});
+            QVERIFY(headerLine.front().contains(
+                QStringLiteral("Authorization")));
+            QVERIFY(headerLine.front().contains(QStringLiteral("[redacted]")));
+            for (const QString &line : output.recentOutput(kStdout))
+                verifyAbsent(line.toUtf8(), {crossLineSecret});
+            QCOMPARE(output.recentOutput(kStdout).size(), 2);
+            QVERIFY(output.finish(kStdout).isEmpty());
+            QCOMPARE(output.recentOutput(kStdout).size(), 2);
+        }
+
+        output.reset();
+        QCOMPARE(output.feed(kStdout, QByteArrayView("{\"token\":\n")).size(),
+                 1);
+        const QStringList failedClosed = output.feed(
+            kStdout, QByteArrayView("NOT-A-FIELD CROSS-LINE-SECRET\n"));
+        QCOMPARE(failedClosed.size(), 1);
+        verifyAbsent(failedClosed.front().toUtf8(), {crossLineSecret});
+        QVERIFY(failedClosed.front().contains(QStringLiteral("[redacted]")));
+        for (const QString &line : output.recentOutput(kStdout))
+            verifyAbsent(line.toUtf8(), {crossLineSecret});
+        QVERIFY(output.finish(kStdout).isEmpty());
+
+        for (int boundary = 0; boundary < boundaryNames.size(); ++boundary) {
+            for (const QByteArray &prefix : {QByteArrayLiteral("{\"token\":"),
+                                             QByteArrayLiteral("password=")}) {
+                output.reset();
+                QByteArray terminated = prefix;
+                terminated += boundary == 0 ? '\n' : '\r';
+                const QStringList completed =
+                    output.feed(kStdout, QByteArrayView(terminated));
+                QCOMPARE(completed.size(), 1);
+                if (boundary == 2) {
+                    QVERIFY(output.feed(kStdout, QByteArrayView("\n")).isEmpty());
+                }
+                if (prefix == QByteArrayLiteral("password=")) {
+                    QVERIFY(completed.front().contains(
+                        QStringLiteral("[redacted]")));
+                }
+                const qsizetype ringSize = output.recentOutput(kStdout).size();
+                QVERIFY(output.finish(kStdout).isEmpty());
+                QCOMPARE(output.recentOutput(kStdout).size(), ringSize);
+                QVERIFY(output.finish(kStdout).isEmpty());
+                QCOMPARE(output.recentOutput(kStdout).size(), ringSize);
+            }
+        }
+
+        output.reset();
+        QCOMPARE(output.feed(kStdout, QByteArrayView("{\"token\":\n")).size(),
+                 1);
+        QVERIFY(output.feed(kStdout, QByteArrayView("   ")).isEmpty());
+        const QStringList owsEof = output.finish(kStdout);
+        QCOMPARE(owsEof.size(), 1);
+        QVERIFY(owsEof.front().contains(QStringLiteral("[redacted]")));
+        QCOMPARE(output.recentOutput(kStdout).size(), 2);
     }
 
     void outputLinesAndRingsAreBounded()

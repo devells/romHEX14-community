@@ -177,8 +177,10 @@ struct Xc2ProcessOutput::StreamState {
         KeyUnquotedValue,
         KeyQuotedValue,
         JsonBeforeValue,
+        JsonBeforeValueCrossLine,
         JsonUnquotedValue,
         JsonQuotedValue,
+        FailClosedLine,
     };
 
     QByteArray line;
@@ -190,6 +192,7 @@ struct Xc2ProcessOutput::StreamState {
     bool quotedCandidate = false;
     bool previousWasNameByte = false;
     bool lineTouched = false;
+    bool lineHadRawContent = false;
     bool sawCarriageReturn = false;
     bool oversized = false;
     bool finalized = false;
@@ -203,6 +206,7 @@ struct Xc2ProcessOutput::StreamState {
     ScannerState scannerState = ScannerState::Normal;
     char quotedValueDelimiter = 0;
     bool quotedValueEscape = false;
+    bool failClosedReprobe = false;
 
     void appendPending(QByteArrayView bytes)
     {
@@ -276,6 +280,7 @@ struct Xc2ProcessOutput::StreamState {
     void beginProbe(quint32 codePoint, bool quoted)
     {
         clearProbe();
+        failClosedReprobe = false;
         quotedCandidate = quoted;
         if (quoted) {
             probe += '"';
@@ -316,6 +321,12 @@ struct Xc2ProcessOutput::StreamState {
 
     void failProbeAndReprocess(quint32 codePoint)
     {
+        if (failClosedReprobe) {
+            clearProbe();
+            failClosedReprobe = false;
+            scannerState = ScannerState::FailClosedLine;
+            return;
+        }
         commitProbe();
         scannerState = ScannerState::Normal;
         consumeNormal(codePoint);
@@ -324,6 +335,7 @@ struct Xc2ProcessOutput::StreamState {
     void acceptSensitiveDelimiter(quint32 delimiter, bool jsonName)
     {
         appendCodePoint(delimiter);
+        failClosedReprobe = false;
         if (jsonName) {
             scannerState = ScannerState::JsonBeforeValue;
         } else if (delimiter == ':') {
@@ -382,6 +394,11 @@ struct Xc2ProcessOutput::StreamState {
 
         if (codePoint == ':' || codePoint == '=') {
             acceptSensitiveDelimiter(codePoint, false);
+            return;
+        }
+        if (failClosedReprobe) {
+            failClosedReprobe = false;
+            scannerState = ScannerState::FailClosedLine;
             return;
         }
         scannerState = ScannerState::Normal;
@@ -502,11 +519,36 @@ struct Xc2ProcessOutput::StreamState {
                 consumeJsonUnquotedValue(codePoint);
             }
             break;
+        case ScannerState::JsonBeforeValueCrossLine:
+            if (codePoint == ' ' || codePoint == '\t') {
+                appendCodePoint(codePoint);
+            } else if (codePoint == '"') {
+                appendCodePoint(codePoint);
+                appendMarker();
+                quotedValueDelimiter = '"';
+                quotedValueEscape = false;
+                scannerState = ScannerState::JsonQuotedValue;
+            } else {
+                appendMarker();
+                resetScanner();
+                if (isAsciiNameByte(codePoint)) {
+                    const char byte = static_cast<char>(codePoint);
+                    if (isCandidatePrefix(QByteArrayView(&byte, 1))) {
+                        beginProbe(codePoint, false);
+                        failClosedReprobe = true;
+                        break;
+                    }
+                }
+                scannerState = ScannerState::FailClosedLine;
+            }
+            break;
         case ScannerState::JsonUnquotedValue:
             consumeJsonUnquotedValue(codePoint);
             break;
         case ScannerState::JsonQuotedValue:
             consumeQuotedValue(codePoint);
+            break;
+        case ScannerState::FailClosedLine:
             break;
         }
     }
@@ -564,9 +606,10 @@ struct Xc2ProcessOutput::StreamState {
         scannerState = ScannerState::Normal;
         quotedValueDelimiter = 0;
         quotedValueEscape = false;
+        failClosedReprobe = false;
     }
 
-    void prepareScannerForBoundary(bool endOfStream)
+    void prepareScannerForBoundary(bool endOfStream, bool hasLineContent)
     {
         switch (scannerState) {
         case ScannerState::ProbeName:
@@ -581,7 +624,8 @@ struct Xc2ProcessOutput::StreamState {
                 resetScanner();
             break;
         case ScannerState::HeaderBeforeValue:
-            appendMarker();
+            if (!endOfStream || hasLineContent)
+                appendMarker();
             resetScanner();
             break;
         case ScannerState::HeaderValue:
@@ -590,9 +634,23 @@ struct Xc2ProcessOutput::StreamState {
             resetScanner();
             break;
         case ScannerState::KeyBeforeValue:
+            if (!endOfStream || hasLineContent)
+                appendMarker();
+            resetScanner();
+            break;
         case ScannerState::JsonBeforeValue:
             if (endOfStream) {
-                appendMarker();
+                if (hasLineContent)
+                    appendMarker();
+                resetScanner();
+            } else {
+                scannerState = ScannerState::JsonBeforeValueCrossLine;
+            }
+            break;
+        case ScannerState::JsonBeforeValueCrossLine:
+            if (endOfStream) {
+                if (hasLineContent)
+                    appendMarker();
                 resetScanner();
             }
             break;
@@ -601,6 +659,9 @@ struct Xc2ProcessOutput::StreamState {
             if (endOfStream)
                 resetScanner();
             break;
+        case ScannerState::FailClosedLine:
+            resetScanner();
+            break;
         case ScannerState::Normal:
             break;
         }
@@ -608,7 +669,9 @@ struct Xc2ProcessOutput::StreamState {
 
     void completeLine(QStringList &completed, bool delimited)
     {
-        prepareScannerForBoundary(!delimited);
+        const bool hasLineContent =
+            lineHadRawContent || lineTouched || !line.isEmpty();
+        prepareScannerForBoundary(!delimited, hasLineContent);
         ansiState = AnsiState::Normal;
 
         if (delimited || lineTouched || !line.isEmpty()) {
@@ -622,6 +685,7 @@ struct Xc2ProcessOutput::StreamState {
         line.clear();
         previousWasNameByte = false;
         lineTouched = false;
+        lineHadRawContent = false;
         oversized = false;
     }
 
@@ -642,6 +706,7 @@ struct Xc2ProcessOutput::StreamState {
         }
 
         sawCarriageReturn = false;
+        lineHadRawContent = true;
         consumeFiltered(codePoint);
     }
 
