@@ -35,7 +35,6 @@ QList<Endpoint> Xc2ContractProfile::allEndpoints()
         Endpoint::EcuClose,
         Endpoint::EcuScan,
         Endpoint::EcuClearDtc,
-        Endpoint::EcuFunctions,
         Endpoint::EcuMeasurementsGet,
         Endpoint::EcuMeasurementsStart,
         Endpoint::EcuMeasurementsStop,
@@ -169,9 +168,6 @@ EndpointSpec Xc2ContractProfile::endpoint(Endpoint endpoint) const
     case Endpoint::EcuClearDtc:
         return {QStringLiteral("ecu/clearDtc"), HttpMethod::PostForm,
                 Semantics::StateChanging, 0};
-    case Endpoint::EcuFunctions:
-        return {QStringLiteral("ecu/getFunctions/{ecuId}"), HttpMethod::Get,
-                Semantics::ReadOnly, 0};
     case Endpoint::EcuMeasurementsGet:
         return {QStringLiteral("ecu/measurements/{ecuId}"), HttpMethod::Get,
                 Semantics::ReadOnly, 0};

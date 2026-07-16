@@ -39,6 +39,206 @@ bool parseDocument(const QByteArray &body,
     return false;
 }
 
+void skipJsonWhitespace(const QByteArray &json, qsizetype &position)
+{
+    while (position < json.size()) {
+        const char byte = json.at(position);
+        if (byte != ' ' && byte != '\t' && byte != '\r' && byte != '\n')
+            break;
+        ++position;
+    }
+}
+
+bool skipJsonString(const QByteArray &json, qsizetype &position)
+{
+    if (position >= json.size() || json.at(position) != '"')
+        return false;
+    ++position;
+    while (position < json.size()) {
+        const char byte = json.at(position++);
+        if (byte == '"')
+            return true;
+        if (byte != '\\')
+            continue;
+        if (position >= json.size())
+            return false;
+        if (json.at(position++) == 'u') {
+            if (position + 4 > json.size())
+                return false;
+            position += 4;
+        }
+    }
+    return false;
+}
+
+bool skipJsonValue(const QByteArray &json, qsizetype &position);
+
+bool skipJsonObject(const QByteArray &json, qsizetype &position)
+{
+    if (position >= json.size() || json.at(position++) != '{')
+        return false;
+    skipJsonWhitespace(json, position);
+    if (position < json.size() && json.at(position) == '}') {
+        ++position;
+        return true;
+    }
+    while (position < json.size()) {
+        if (!skipJsonString(json, position))
+            return false;
+        skipJsonWhitespace(json, position);
+        if (position >= json.size() || json.at(position++) != ':')
+            return false;
+        if (!skipJsonValue(json, position))
+            return false;
+        skipJsonWhitespace(json, position);
+        if (position >= json.size())
+            return false;
+        const char delimiter = json.at(position++);
+        if (delimiter == '}')
+            return true;
+        if (delimiter != ',')
+            return false;
+        skipJsonWhitespace(json, position);
+    }
+    return false;
+}
+
+bool skipJsonArray(const QByteArray &json, qsizetype &position)
+{
+    if (position >= json.size() || json.at(position++) != '[')
+        return false;
+    skipJsonWhitespace(json, position);
+    if (position < json.size() && json.at(position) == ']') {
+        ++position;
+        return true;
+    }
+    while (position < json.size()) {
+        if (!skipJsonValue(json, position))
+            return false;
+        skipJsonWhitespace(json, position);
+        if (position >= json.size())
+            return false;
+        const char delimiter = json.at(position++);
+        if (delimiter == ']')
+            return true;
+        if (delimiter != ',')
+            return false;
+        skipJsonWhitespace(json, position);
+    }
+    return false;
+}
+
+bool skipJsonValue(const QByteArray &json, qsizetype &position)
+{
+    skipJsonWhitespace(json, position);
+    if (position >= json.size())
+        return false;
+    if (json.at(position) == '"')
+        return skipJsonString(json, position);
+    if (json.at(position) == '{')
+        return skipJsonObject(json, position);
+    if (json.at(position) == '[')
+        return skipJsonArray(json, position);
+
+    const qsizetype start = position;
+    while (position < json.size()) {
+        const char byte = json.at(position);
+        if (byte == ',' || byte == ']' || byte == '}' || byte == ' '
+            || byte == '\t' || byte == '\r' || byte == '\n') {
+            break;
+        }
+        ++position;
+    }
+    return position > start;
+}
+
+bool decodeJsonStringToken(const QByteArray &token, QString &value)
+{
+    const QJsonDocument wrapper = QJsonDocument::fromJson(
+        QByteArrayLiteral("[") + token + QByteArrayLiteral("]"));
+    if (!wrapper.isArray() || wrapper.array().size() != 1
+        || !wrapper.array().at(0).isString()) {
+        return false;
+    }
+    value = wrapper.array().at(0).toString();
+    return true;
+}
+
+bool jsonObjectMemberRange(const QByteArray &json,
+                           qsizetype objectStart,
+                           const QString &field,
+                           qsizetype &valueStart,
+                           qsizetype &valueEnd)
+{
+    qsizetype position = objectStart;
+    if (position >= json.size() || json.at(position++) != '{')
+        return false;
+    skipJsonWhitespace(json, position);
+
+    bool found = false;
+    while (position < json.size() && json.at(position) != '}') {
+        const qsizetype keyStart = position;
+        if (!skipJsonString(json, position))
+            return false;
+        QString key;
+        if (!decodeJsonStringToken(json.mid(keyStart, position - keyStart), key))
+            return false;
+        skipJsonWhitespace(json, position);
+        if (position >= json.size() || json.at(position++) != ':')
+            return false;
+        skipJsonWhitespace(json, position);
+        const qsizetype memberStart = position;
+        if (!skipJsonValue(json, position))
+            return false;
+        if (key == field) {
+            valueStart = memberStart;
+            valueEnd = position;
+            found = true;
+        }
+        skipJsonWhitespace(json, position);
+        if (position >= json.size() || json.at(position) == '}')
+            break;
+        if (json.at(position++) != ',')
+            return false;
+        skipJsonWhitespace(json, position);
+    }
+    return found;
+}
+
+bool parseInteger64Literal(const QByteArray &literal, qint64 &value)
+{
+    // Qt 6.8 can saturate an out-of-range JSON integer at qint64 minimum.
+    if (literal.isEmpty())
+        return false;
+    qsizetype position = 0;
+    const bool negative = literal.at(0) == '-';
+    if (negative && ++position == literal.size())
+        return false;
+
+    const quint64 positiveLimit =
+        quint64(std::numeric_limits<qint64>::max());
+    const quint64 limit = negative ? positiveLimit + 1 : positiveLimit;
+    quint64 magnitude = 0;
+    for (; position < literal.size(); ++position) {
+        const char byte = literal.at(position);
+        if (byte < '0' || byte > '9')
+            return false;
+        const quint64 digit = quint64(byte - '0');
+        if (magnitude > (limit - digit) / 10)
+            return false;
+        magnitude = magnitude * 10 + digit;
+    }
+
+    if (!negative) {
+        value = static_cast<qint64>(magnitude);
+    } else if (magnitude == positiveLimit + 1) {
+        value = std::numeric_limits<qint64>::min();
+    } else {
+        value = -static_cast<qint64>(magnitude);
+    }
+    return true;
+}
+
 bool requireString(const QJsonObject &object,
                    const QString &field,
                    QString &value,
@@ -122,16 +322,13 @@ bool requireInteger64(const QJsonObject &object,
         return false;
     }
 
-    constexpr qint64 minimumDefault = std::numeric_limits<qint64>::min();
-    constexpr qint64 maximumDefault = std::numeric_limits<qint64>::max();
-    const qint64 minimumResult = jsonValue.toInteger(minimumDefault);
-    const qint64 maximumResult = jsonValue.toInteger(maximumDefault);
-    if (minimumResult != maximumResult) {
+    const QVariant variant = jsonValue.toVariant();
+    if (variant.metaType().id() != QMetaType::LongLong) {
         failureMessage = QStringLiteral("Field '%1' must be a 64-bit integer")
                              .arg(field);
         return false;
     }
-    value = minimumResult;
+    value = variant.toLongLong();
     return true;
 }
 
@@ -150,6 +347,100 @@ bool requireInteger(const QJsonObject &object,
         return false;
     }
     value = static_cast<int>(parsed);
+    return true;
+}
+
+bool requireInteger32(const QJsonObject &object,
+                      const QString &field,
+                      const QByteArray &source,
+                      qsizetype objectStart,
+                      qint32 &value,
+                      QString &failureMessage)
+{
+    if (!object.contains(field)) {
+        failureMessage = QStringLiteral("Missing required field '%1'").arg(field);
+        return false;
+    }
+    if (!object.value(field).isDouble()) {
+        failureMessage = QStringLiteral("Field '%1' must be an integer").arg(field);
+        return false;
+    }
+    qsizetype valueStart = 0;
+    qsizetype valueEnd = 0;
+    qint64 parsed = 0;
+    if (!jsonObjectMemberRange(source, objectStart, field, valueStart, valueEnd)
+        || !parseInteger64Literal(
+            source.mid(valueStart, valueEnd - valueStart), parsed)) {
+        failureMessage = QStringLiteral("Field '%1' must be a 32-bit integer")
+                             .arg(field);
+        return false;
+    }
+    if (parsed < std::numeric_limits<qint32>::min()
+        || parsed > std::numeric_limits<qint32>::max()) {
+        failureMessage = QStringLiteral("Field '%1' must be a 32-bit integer")
+                             .arg(field);
+        return false;
+    }
+    value = static_cast<qint32>(parsed);
+    return true;
+}
+
+bool requireNullableLocalizedText(
+    const QJsonObject &object,
+    const QString &field,
+    const QByteArray &source,
+    qsizetype objectStart,
+    std::optional<Xc2LocalizedText> &value,
+    QString &failureMessage)
+{
+    if (!object.contains(field)) {
+        failureMessage = QStringLiteral("Missing required field '%1'").arg(field);
+        return false;
+    }
+
+    const QJsonValue jsonValue = object.value(field);
+    if (jsonValue.isNull()) {
+        value.reset();
+        return true;
+    }
+    if (!jsonValue.isObject()) {
+        failureMessage = QStringLiteral(
+                             "Field '%1' must be an object or null")
+                             .arg(field);
+        return false;
+    }
+
+    const QJsonObject localizedObject = jsonValue.toObject();
+    qsizetype localizedStart = 0;
+    qsizetype localizedEnd = 0;
+    if (!jsonObjectMemberRange(source, objectStart, field, localizedStart,
+                               localizedEnd)) {
+        failureMessage = QStringLiteral("Missing required field '%1'").arg(field);
+        return false;
+    }
+    Xc2LocalizedText localized;
+    if (!localizedObject.contains(QStringLiteral("id"))) {
+        failureMessage = QStringLiteral("Missing required field 'id'");
+    } else if (!localizedObject.value(QStringLiteral("id")).isDouble()) {
+        failureMessage = QStringLiteral("Field 'id' must be an integer");
+    } else {
+        qsizetype idStart = 0;
+        qsizetype idEnd = 0;
+        if (!jsonObjectMemberRange(source, localizedStart,
+                                   QStringLiteral("id"), idStart, idEnd)
+            || !parseInteger64Literal(source.mid(idStart, idEnd - idStart),
+                                      localized.id)) {
+            failureMessage = QStringLiteral("Field 'id' must be a 64-bit integer");
+        }
+    }
+    if (!failureMessage.isEmpty()
+        || !requireString(localizedObject, QStringLiteral("text"),
+                          localized.text, failureMessage)) {
+        failureMessage = QStringLiteral("Field '%1': %2")
+                             .arg(field, failureMessage);
+        return false;
+    }
+    value = std::move(localized);
     return true;
 }
 
@@ -311,18 +602,21 @@ Xc2Result<Xc2JobProgress> Xc2JsonCodec::jobProgress(const QByteArray &body)
     }
 
     const QJsonObject object = document.object();
+    qsizetype objectStart = 0;
+    skipJsonWhitespace(body, objectStart);
     Xc2JobProgress progress;
     QString status;
     if (!requireString(object, QStringLiteral("jobId"), progress.jobId,
                        failureMessage)
         || !requireString(object, QStringLiteral("status"), status,
                           failureMessage)
-        || !requireInteger64(object, QStringLiteral("ticks"), progress.ticks,
-                             failureMessage)
-        || !requireInteger64(object, QStringLiteral("totalTicks"),
-                             progress.totalTicks, failureMessage)
-        || !requireString(object, QStringLiteral("message"), progress.message,
-                          failureMessage)) {
+        || !requireInteger32(object, QStringLiteral("ticks"), body,
+                             objectStart, progress.ticks, failureMessage)
+        || !requireInteger32(object, QStringLiteral("totalTicks"), body,
+                             objectStart, progress.totalTicks, failureMessage)
+        || !requireNullableLocalizedText(
+            object, QStringLiteral("message"), body, objectStart,
+            progress.message, failureMessage)) {
         return contractFailure<Xc2JobProgress>(body, std::move(failureMessage));
     }
 

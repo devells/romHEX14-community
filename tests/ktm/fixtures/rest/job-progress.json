@@ -3,5 +3,8 @@
   "status": "IN_PROGRESS",
   "ticks": 1,
   "totalTicks": 2,
-  "message": "synthetic progress"
+  "message": {
+    "id": 42,
+    "text": "synthetic progress"
+  }
 }

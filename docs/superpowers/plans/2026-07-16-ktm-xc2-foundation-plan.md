@@ -133,6 +133,16 @@ private slots:
         QCOMPARE(p.endpoint(Endpoint::VehicleExecuteFlow).method,
                  HttpMethod::PostForm);
     }
+
+    void callableProfileExcludesStaleFrontendGetFunctions()
+    {
+        const QString deadRoute = QStringLiteral("ecu/getFunctions/{ecuId}");
+        for (Endpoint endpoint : Xc2ContractProfile::allEndpoints()) {
+            const EndpointSpec spec =
+                Xc2ContractProfile::approved().endpoint(endpoint);
+            QVERIFY2(spec.path != deadRoute, qPrintable(spec.path));
+        }
+    }
 };
 
 QTEST_APPLESS_MAIN(Xc2ContractProfileTest)
@@ -203,7 +213,7 @@ enum class Endpoint {
     VehicleDetect, VehicleManufacturers, VehicleSeries, VehicleModels,
     VehicleSelect, VehicleInfo, AutoScan,
     EcuDomains, EcuOpen, EcuClose, EcuScan, EcuClearDtc,
-    EcuFunctions, EcuMeasurementsGet, EcuMeasurementsStart,
+    EcuMeasurementsGet, EcuMeasurementsStart,
     EcuMeasurementsStop, EcuExecuteFlow, VehicleExecuteFlow, FlowUpdateGui,
     DownloadMapping, FlashAutomatic, FlashFile
 };
@@ -242,7 +252,20 @@ private:
 } // namespace ktm::xc2
 ```
 
-Implement every enum value with the observed XC2 path/topic. Dynamic paths use named templates such as `ecu/open/{ecuId}`; later clients replace only declared placeholders after percent-encoding. Classify discovery/jobs, selection, clear, flow, and flash endpoints as `StateChanging` with zero retries. `ServiceStatus`, `CurrentUser`, settings reads, vehicle info, ECU-domain/function reads, and measurement-definition reads are `ReadOnly`; keep their profile retry value zero because retry policy belongs to the caller.
+Implement every enum value with a callable path/topic supported by the pinned
+patched backend JAR. Dynamic paths use named templates such as
+`ecu/open/{ecuId}`; later clients replace only declared placeholders after
+percent-encoding. Classify discovery/jobs, selection, clear, flow, and flash
+endpoints as `StateChanging` with zero retries. `ServiceStatus`, `CurrentUser`,
+settings reads, vehicle info, ECU-domain reads, and measurement-definition reads
+are `ReadOnly`; keep their profile retry value zero because retry policy belongs
+to the caller.
+
+The served stale frontend/profile mentions `GET ecu/getFunctions/{ecuId}`, but
+the pinned patched JAR exposes no matching JAX endpoint. Keep that route and
+`Endpoint::EcuFunctions` out of the callable profile. Function and actuator
+metadata comes from `EcuDomain`, and execution uses the existing DIFLOW
+`ecu/executeFlow`/`vehicle/executeFlow` routes.
 
 Manual selection consumes the observed JSON POST routes
 `vehicle/manufacturer`, `vehicle/series`, and `vehicle/vehicle`, followed by
@@ -316,7 +339,7 @@ rtk git commit -m "feat: define KTM XC2 contract profile"
 
 **Interfaces:**
 - Consumes: `Endpoint` and `Xc2ContractProfile` from Task 1.
-- Produces: `Xc2Error`, `Xc2Result<T>`, `Xc2ServiceStatus`, `Xc2CurrentUser`, `Xc2VciDevice`, `Xc2JobAccepted`, `Xc2JobProgress`, and strict `Xc2JsonCodec` parse/serialization functions.
+- Produces: `Xc2Error`, `Xc2Result<T>`, `Xc2ServiceStatus`, `Xc2CurrentUser`, `Xc2VciDevice`, `Xc2JobAccepted`, `Xc2LocalizedText`, `Xc2JobProgress`, and strict `Xc2JsonCodec` parse/serialization functions.
 
 - [ ] **Step 1: Add red tests for valid, malformed, and missing-field payloads**
 
@@ -385,23 +408,33 @@ void Xc2JsonCodecTest::vciOptionalInformationIsStrict()
         R"([{"id":"a","name":"A","internalName":"AVL Ditest VCI2K_DPDU_API","additionalModuleInformation":7}])").ok());
 }
 
-void Xc2JsonCodecTest::jobSchemasUseExactWireFieldNamesAndStates()
-{
-    const auto accepted = Xc2JsonCodec::jobAccepted(
-        loadFixture("rest/job-accepted.json"));
-    QVERIFY(accepted.ok());
-
-    const auto progress = Xc2JsonCodec::jobProgress(
-        loadFixture("rest/job-progress.json"));
-    QVERIFY(progress.ok());
-    QCOMPARE(progress.value->state, Xc2JobState::InProgress);
-
-    QVERIFY(!Xc2JsonCodec::jobProgress(
-        R"({"jobId":"synthetic","state":"IN_PROGRESS","ticks":1,"totalTicks":2,"message":"x"})").ok());
-    QVERIFY(!Xc2JsonCodec::jobProgress(
-        R"({"jobId":"synthetic","status":"CREATED","ticks":1,"totalTicks":2,"message":"x"})").ok());
-}
+void jobAcceptanceUsesExactWireFieldName();
+void jobProgressFixtureUsesLocalizedTextObject();
+void jobProgressAcceptsLocalizedTextObjectAndNull_data();
+void jobProgressAcceptsLocalizedTextObjectAndNull();
+void jobProgressRejectsInvalidLocalizedText_data();
+void jobProgressRejectsInvalidLocalizedText();
+void jobProgressPreservesInt64LocalizedTextId_data();
+void jobProgressPreservesInt64LocalizedTextId();
+void jobProgressAcceptsInt32CounterBoundaries_data();
+void jobProgressAcceptsInt32CounterBoundaries();
+void jobProgressRejectsInvalidCounters_data();
+void jobProgressRejectsInvalidCounters();
+void jobProgressAcceptsOnlyFiveWireStatuses_data();
+void jobProgressAcceptsOnlyFiveWireStatuses();
+void jobProgressRejectsStatusAliasesAndFieldCasing_data();
+void jobProgressRejectsStatusAliasesAndFieldCasing();
+void jobProgressRetainsUnknownTopLevelFieldsInRaw();
 ```
+
+All status and field-casing rows must keep every unrelated field valid under the
+authoritative schema. Accept `message` only as a complete localized-text object
+or JSON null. Reject a legacy string, missing message, arrays/scalars, missing
+localized fields, wrong types, non-integral IDs, and values outside signed
+64-bit range. Test exact signed 64-bit ID boundaries. Test `ticks` and
+`totalTicks` independently at signed 32-bit minimum/maximum and reject overflow,
+fractional, string, null, and boolean values. Every failure retains the exact
+input in `rawPayload`.
 
 Register `xc2_json_codec` with labels `unit;contract;ktm` and compile definition `KTM_FIXTURE_DIR` pointing at `tests/ktm/fixtures`.
 
@@ -475,19 +508,24 @@ enum class Xc2JobState {
     Created, InProgress, Finished, Canceled, Error, NotAuthorized
 };
 
+struct Xc2LocalizedText {
+    qint64 id = 0;
+    QString text;
+};
+
 struct Xc2JobProgress {
     QString jobId;
     Xc2JobState state = Xc2JobState::Created;
-    qint64 ticks = 0;
-    qint64 totalTicks = 0;
-    QString message;
+    qint32 ticks = 0;
+    qint32 totalTicks = 0;
+    std::optional<Xc2LocalizedText> message;
     QJsonObject raw;
 };
 ```
 
 Place every type and codec in `namespace ktm::xc2`. Put
 `Q_DECLARE_METATYPE(ktm::xc2::...)` declarations outside that namespace for
-`Xc2Error`, each signal-carried model, and the concrete `Xc2Result<T>`
+`Xc2Error`, `Xc2LocalizedText`, each signal-carried model, and the concrete `Xc2Result<T>`
 specializations used by Tasks 5-8. Use `std::optional`, not sentinel empty
 strings, for result success or nullable DTO properties.
 
@@ -519,6 +557,15 @@ and requires string `loginName`, string `name`, and a string array
 absent strings. `jobProgress()` reads only wire field `status` and accepts only
 `IN_PROGRESS`, `FINISHED`, `CANCELED`, `ERROR`, and `NOT_AUTHORIZED`; `Created`
 is an internal registry state and is never accepted from the wire.
+Its exact wire object is
+`{jobId:string,status:string,ticks:int32,totalTicks:int32,message:{id:int64,text:string}|null}`.
+Both counter fields are required signed Java `int` values. `message` is required
+but nullable; a non-null value requires exact signed 64-bit integer `id` and
+string `text`. Reject the old string message representation, aliases, field
+casing changes, non-integral numbers, and numeric overflow. Qt 6.8 can saturate
+an out-of-range JSON integer at the signed 64-bit minimum, so validate the
+original integer token before conversion. Preserve unknown top-level fields
+only in `Xc2JobProgress::raw` and preserve the original bytes on every failure.
 `vciDevices()` requires an array whose items
 contain string `id`, `name`, and `internalName`; it accepts
 `additionalModuleInformation` only as string, JSON null, or absent. Its
@@ -552,11 +599,15 @@ Use these fixture semantics:
 `job-accepted.json` contains
 `{"jobID":"00000000-0000-0000-0000-000000000001"}`.
 `job-progress.json` uses that ID plus exact fields `status:"IN_PROGRESS"`,
-integer `ticks`/`totalTicks`, and string `message`. `error.json` contains the
+signed 32-bit integer `ticks`/`totalTicks`, and
+`message:{"id":42,"text":"synthetic progress"}`. `error.json` contains the
 five wire fields with `status:403`, `code:1007`, and only synthetic text.
-`manifest.json` records the approved backend profile ID, capture date
-`2026-07-16`, route/topic, and that VIN/dealer identifiers were replaced. Do
-not copy real VINs, credentials, or dealer data.
+`manifest.json` records the approved backend profile ID, a manifest revision
+date, route/topic, and that VIN/dealer identifiers were replaced. The REST and
+STOMP progress fixtures are `synthetic-contract-fixture`, have
+`schemaAuthority:"served-app+patched-backend-jar"`, and set
+`liveCapture:false`; a manifest-wide date must never imply they are live
+captures. Do not copy real VINs, credentials, or dealer data.
 
 `device-get.json` contains one synthetic device with all four documented DTO
 properties and `internalName` exactly `AVL Ditest VCI2K_DPDU_API`; no real VCI
@@ -593,7 +644,7 @@ rtk git commit -m "feat: add strict XC2 contract models"
 - Modify: `CMakeLists.txt`
 
 **Interfaces:**
-- Consumes: `Xc2Error` from Task 2.
+- Consumes: `Xc2Error` and strict `Xc2JsonCodec::jobProgress()` from Task 2.
 - Produces: `Xc2StompFrame`, `Xc2StompDecodeResult`, and `Xc2StompCodec::feed/encode`.
 
 - [ ] **Step 1: Write failing parser tests**
@@ -621,6 +672,10 @@ three-byte body rather than stopping at the embedded NUL; construct it as
 The terminator-fragment test feeds exactly through the declared body first and
 asserts no error, then feeds the terminating NUL and asserts one frame. A byte
 other than NUL after the complete declared body is the error case.
+The golden test requires the progress frame to be exactly 298 bytes with
+`content-length:144`, a 144-byte body, and a final real `0x00`; it then passes
+the decoded body through `Xc2JsonCodec::jobProgress()` and checks localized
+message ID/text rather than merely searching for the job ID.
 
 - [ ] **Step 2: Run the parser test to verify red behavior**
 
@@ -679,16 +734,20 @@ and a complete declared body followed by a non-NUL byte.
 
 - [ ] **Step 4: Add and parse sanitized STOMP fixtures**
 
-`connected.frame` records the observed local mock negotiation
+`connected.frame` records the observed read-only handshake negotiation
 `version:1.2` and `heart-beat:0,0` after the client offered
 `heart-beat:10000,10000`. Compatibility evidence is a
 read-only `CONNECT`/`DISCONNECT` at `ws://127.0.0.1:8082/xc2-websocket` using
 subprotocol `v12.stomp` on `2026-07-16`; record it in the fixture manifest.
 `progress-message.frame` targets `/topic/progress`, includes required
 `destination`, `message-id`, and `subscription` headers, and carries the
-synthetic job ID from Task 2. `error.frame` has an artificial protocol error
-only. Every `.frame` is a binary fixture ending in a real `0x00` byte, not the
-two text characters `\\0`; tests assert the terminator and exact byte count.
+synthetic job ID and 144-byte compact authoritative progress JSON from Task 2.
+It is a `synthetic-contract-fixture` whose schema authority is the served app
+plus pinned patched backend JAR, not a live MESSAGE capture. `connected.frame`
+alone is `observed-read-only-handshake`; `error.frame` is a
+`synthetic-protocol-fixture`. Every `.frame` is a binary fixture ending in a
+real `0x00` byte, not the two text characters `\\0`; tests assert the terminator
+and exact byte count (298 bytes for progress).
 
 - [ ] **Step 5: Run all pure contract tests**
 

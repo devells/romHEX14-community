@@ -28,7 +28,8 @@ The completed integration must provide, from a native Qt UI:
 - AVL DiTEST VCI2K discovery and connection through D-PDU API.
 - Automatic vehicle detection and manual vehicle selection fallback.
 - Vehicle information and ECU autoscan.
-- ECU identification, DTC and freeze-frame display, and confirmed DTC clear.
+- ECU identification, DTC display, and confirmed DTC clear. Freeze-frame is
+  deferred until a callable route and complete DTO are evidenced.
 - Live measurement selection, streaming, plotting, and clean stop.
 - ECU functions, actuators, learning, coding, and guided diagnostic workflows.
 - Automatic mapping selection and automatic firmware flashing.
@@ -210,9 +211,14 @@ URLs:
 - Service/session: health, current user, settings, shutdown.
 - VCI: lookup, available devices, selected device, selection.
 - Vehicle: detect, manufacturer/series/model selection, vehicle information.
-- ECU: domains, open, close, scan, identifiers, functions, measurements.
+- ECU: domains, open, close, scan, identifiers, measurements.
 - Jobs: autoscan, DTC clear, flow execution, mapping download, flashing.
 - Flow: submit the user's response to the currently displayed flow page.
+
+The stale served frontend/profile mentions `GET ecu/getFunctions/{ecuId}`, but
+the pinned patched backend JAR exposes no matching JAX endpoint. That dead route
+is not part of the callable REST profile. `EcuDomain` supplies function and
+actuator metadata, and execution uses the DIFLOW flow routes.
 
 Every response is validated before conversion to a C++ model. A successful HTTP
 status with missing required fields is a contract error. State-changing calls
@@ -264,6 +270,14 @@ progress model, and raw JSON. The pair `(generation, message-id)` is the deliver
 identity: an identical replay is idempotent, while reuse of that identity with a
 different payload is a contract error. Equal progress payloads delivered under
 different identities remain distinct ordered events.
+
+The authoritative progress wire object is
+`{jobId:string,status:status,ticks:int32,totalTicks:int32,message:{id:int64,text:string}|null}`.
+`message` is required even when null. Non-null localized text requires an exact
+signed 64-bit integer ID and string text; legacy string messages, numeric
+overflow, aliases, wrong casing, and wrong types are contract failures whose raw
+payload is retained. The only wire statuses are `IN_PROGRESS`, `FINISHED`,
+`CANCELED`, `ERROR`, and `NOT_AUTHORIZED`; `Created` remains registry-internal.
 
 The normalized backend states are:
 
@@ -325,7 +339,8 @@ romHEX14 adds a `KTM Service` action and a native Qt workspace with these pages:
 1. Connection and prerequisites.
 2. Vehicle detection/selection and vehicle information.
 3. ECU autoscan and ECU overview.
-4. ECU identification, DTC, and freeze-frame data.
+4. ECU identification and DTC data; freeze-frame remains excluded until its
+   callable route and complete DTO are evidenced.
 5. Live measurements and plots.
 6. ECU functions and guided workflows.
 7. Automatic and file flashing.
@@ -421,6 +436,11 @@ reported by the sidecar for the selected vehicle are displayed.
 Opening an ECU is explicit. Identification and DTC reads update an immutable
 snapshot used by the UI. DTC clear requires a second confirmation that names the
 vehicle and ECU; it is never included in a read/refresh operation.
+
+The currently evidenced freeze-frame DTO cannot be consumed safely by this
+strict profile. Freeze-frame UI remains unavailable until a callable pinned-JAR
+route and its complete DTO are evidenced; the stale served frontend alone does
+not authorize a guessed parser or request.
 
 Measurement configuration is loaded from the sidecar for the chosen ECU. Start
 and stop are explicit operations. Values are correlated by signal identity and
@@ -544,7 +564,11 @@ The original XC2 mock JAR is used as an external test fixture to validate:
 - STOMP topic names and terminal job statuses.
 
 Sanitized golden JSON/STOMP fixtures are committed for deterministic CI. The
-external JAR is not committed.
+external JAR is not committed. Fixture provenance is per artifact: the
+CONNECTED frame is an observed read-only handshake, while progress JSON/MESSAGE
+and the ERROR frame are synthetic contract/protocol fixtures. Progress schema
+authority is the served app plus pinned patched backend JAR, `liveCapture` is
+false, and no manifest-wide date may imply that a progress MESSAGE was captured.
 
 An optional live foundation probe never starts Java or a JAR and never uses the
 backend manager. It accepts an explicit loopback REST base, performs only

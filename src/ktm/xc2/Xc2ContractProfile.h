@@ -16,7 +16,7 @@ enum class Endpoint {
     VehicleDetect, VehicleManufacturers, VehicleSeries, VehicleModels,
     VehicleSelect, VehicleInfo, AutoScan,
     EcuDomains, EcuOpen, EcuClose, EcuScan, EcuClearDtc,
-    EcuFunctions, EcuMeasurementsGet, EcuMeasurementsStart,
+    EcuMeasurementsGet, EcuMeasurementsStart,
     EcuMeasurementsStop, EcuExecuteFlow, VehicleExecuteFlow, FlowUpdateGui,
     DownloadMapping, FlashAutomatic, FlashFile
 };

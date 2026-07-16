@@ -2,6 +2,7 @@
 
 #include <QFile>
 
+#include "ktm/xc2/Xc2JsonCodec.h"
 #include "ktm/xc2/Xc2StompCodec.h"
 
 using namespace ktm::xc2;
@@ -251,7 +252,7 @@ private slots:
         const QByteArray error = loadFixture(QStringLiteral("stomp/error.frame"));
 
         QCOMPARE(connected.size(), 39);
-        QCOMPARE(progress.size(), 281);
+        QCOMPARE(progress.size(), 298);
         QCOMPARE(error.size(), 107);
         QCOMPARE(connected.back(), '\0');
         QCOMPARE(progress.back(), '\0');
@@ -277,8 +278,19 @@ private slots:
         QCOMPARE(result.frames.at(1).headers.value(
                      QByteArrayLiteral("subscription")),
                  QByteArrayLiteral("progress-subscription"));
-        QVERIFY(result.frames.at(1).body.contains(
-            QByteArrayLiteral("00000000-0000-0000-0000-000000000001")));
+        QCOMPARE(result.frames.at(1).headers.value(
+                     QByteArrayLiteral("content-length")),
+                 QByteArrayLiteral("144"));
+        QCOMPARE(result.frames.at(1).body.size(), 144);
+        const auto jobProgress =
+            Xc2JsonCodec::jobProgress(result.frames.at(1).body);
+        QVERIFY2(jobProgress.ok(), qPrintable(jobProgress.error.message));
+        QCOMPARE(jobProgress.value->jobId,
+                 QStringLiteral("00000000-0000-0000-0000-000000000001"));
+        QVERIFY(jobProgress.value->message.has_value());
+        QCOMPARE(jobProgress.value->message->id, qint64{42});
+        QCOMPARE(jobProgress.value->message->text,
+                 QStringLiteral("synthetic progress"));
         QCOMPARE(result.frames.at(2).command, QByteArrayLiteral("ERROR"));
         QCOMPARE(result.frames.at(2).body,
                  QByteArrayLiteral("synthetic protocol error"));

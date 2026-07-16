@@ -76,6 +76,16 @@ private slots:
         QCOMPARE(p.endpoint(Endpoint::VehicleExecuteFlow).method,
                  HttpMethod::PostForm);
     }
+
+    void callableProfileExcludesStaleFrontendGetFunctions()
+    {
+        const QString deadRoute = QStringLiteral("ecu/getFunctions/{ecuId}");
+        for (Endpoint endpoint : Xc2ContractProfile::allEndpoints()) {
+            const EndpointSpec spec =
+                Xc2ContractProfile::approved().endpoint(endpoint);
+            QVERIFY2(spec.path != deadRoute, qPrintable(spec.path));
+        }
+    }
 };
 
 QTEST_APPLESS_MAIN(Xc2ContractProfileTest)

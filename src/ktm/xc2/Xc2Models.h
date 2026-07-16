@@ -93,12 +93,17 @@ enum class Xc2JobState {
     NotAuthorized
 };
 
+struct Xc2LocalizedText {
+    qint64 id = 0;
+    QString text;
+};
+
 struct Xc2JobProgress {
     QString jobId;
     Xc2JobState state = Xc2JobState::Created;
-    qint64 ticks = 0;
-    qint64 totalTicks = 0;
-    QString message;
+    qint32 ticks = 0;
+    qint32 totalTicks = 0;
+    std::optional<Xc2LocalizedText> message;
     QJsonObject raw;
 };
 
@@ -110,6 +115,7 @@ Q_DECLARE_METATYPE(ktm::xc2::Xc2ServiceStatus)
 Q_DECLARE_METATYPE(ktm::xc2::Xc2CurrentUser)
 Q_DECLARE_METATYPE(ktm::xc2::Xc2JobAccepted)
 Q_DECLARE_METATYPE(ktm::xc2::Xc2VciDevice)
+Q_DECLARE_METATYPE(ktm::xc2::Xc2LocalizedText)
 Q_DECLARE_METATYPE(ktm::xc2::Xc2JobProgress)
 Q_DECLARE_METATYPE(ktm::xc2::Xc2Result<ktm::xc2::Xc2ServiceStatus>)
 Q_DECLARE_METATYPE(ktm::xc2::Xc2Result<ktm::xc2::Xc2CurrentUser>)
