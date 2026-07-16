@@ -76,6 +76,10 @@ if(RX14_KTM_XC2)
         src/ktm/xc2/Xc2Models.h
         src/ktm/xc2/Xc2StompCodec.cpp
         src/ktm/xc2/Xc2StompCodec.h
+        src/ktm/xc2/Xc2Settings.cpp
+        src/ktm/xc2/Xc2Settings.h
+        src/ktm/xc2/Xc2InstallationProbe.cpp
+        src/ktm/xc2/Xc2InstallationProbe.h
     )
     target_include_directories(rx14_ktm_xc2 PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -584,6 +588,20 @@ if(BUILD_TESTING AND RX14_KTM_XC2)
     )
     add_test(NAME xc2_stomp_codec COMMAND test_Xc2StompCodec)
     set_tests_properties(xc2_stomp_codec PROPERTIES LABELS "unit;contract;ktm")
+
+    add_executable(test_Xc2InstallationProbe
+        tests/ktm/test_Xc2InstallationProbe.cpp
+    )
+    # Avoid Windows installer-name detection requesting elevation for the test.
+    set_target_properties(test_Xc2InstallationProbe PROPERTIES
+        OUTPUT_NAME test_xc2_probe
+    )
+    target_link_libraries(test_Xc2InstallationProbe PRIVATE
+        rx14_ktm_xc2
+        Qt6::Test
+    )
+    add_test(NAME xc2_installation COMMAND test_Xc2InstallationProbe)
+    set_tests_properties(xc2_installation PROPERTIES LABELS "unit;ktm")
 endif()
 
 # ── Map auto-detect corpus harness (issue #25) ─────────────────────────────

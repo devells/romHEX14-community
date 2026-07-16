@@ -39,13 +39,13 @@ inline constexpr auto kAppName = "romHEX14";
 inline constexpr auto kLegacyAppName = "RX14";
 
 // Returns a QSettings bound to the canonical (kOrgName, kAppName) store.
-// Identical to a no-arg QSettings() once QApplication has been
-// configured, but reads more clearly at the call site and stays correct
-// from worker threads / static factories that QApplication hasn't set
-// up yet.
+// The production default remains NativeFormat. Honouring an explicit
+// setDefaultFormat() keeps this equivalent to no-arg QSettings and lets
+// dedicated tests redirect IniFormat without touching the user registry.
 inline QSettings appSettings()
 {
-    return QSettings(QString::fromUtf8(kOrgName),
+    return QSettings(QSettings::defaultFormat(), QSettings::UserScope,
+                     QString::fromUtf8(kOrgName),
                      QString::fromUtf8(kAppName));
 }
 
