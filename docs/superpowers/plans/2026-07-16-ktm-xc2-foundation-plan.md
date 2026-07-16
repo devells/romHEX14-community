@@ -75,14 +75,17 @@ private slots:
         QCOMPARE(p.webSocketPath(), QStringLiteral("/xc2-websocket"));
     }
 
-    void pathsAndTopicsAreUniqueAndRelative()
+    void routesAndTopicsAreUniqueAndRelative()
     {
-        QSet<QString> paths;
+        QSet<QString> routes;
         for (Endpoint endpoint : Xc2ContractProfile::allEndpoints()) {
             const EndpointSpec spec = Xc2ContractProfile::approved().endpoint(endpoint);
             QVERIFY2(!spec.path.startsWith(QStringLiteral("http")), qPrintable(spec.path));
-            QVERIFY2(!paths.contains(spec.path), qPrintable(spec.path));
-            paths.insert(spec.path);
+            const QString routeKey = QStringLiteral("%1:%2")
+                .arg(static_cast<int>(spec.method))
+                .arg(spec.path);
+            QVERIFY2(!routes.contains(routeKey), qPrintable(routeKey));
+            routes.insert(routeKey);
         }
         QSet<QString> topics;
         for (Topic topic : Xc2ContractProfile::allTopics()) {
