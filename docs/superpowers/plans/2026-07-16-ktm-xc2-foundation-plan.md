@@ -720,7 +720,7 @@ rtk git commit -m "feat: add incremental XC2 STOMP codec"
 
 **Interfaces:**
 - Consumes: approved hashes/profile from Task 1 and `Xc2Error` from Task 2.
-- Produces: `Xc2Settings`, `Xc2InstallLayout`, `Xc2ValidationPolicy`, `Xc2PrerequisiteReport`, and `Xc2InstallationProbe::inspect`.
+- Produces: `Xc2Settings`, `Xc2InstallLayout`, `Xc2ValidationPolicy`, `Xc2RegistryRequest`, `Xc2PrerequisiteReport`, and separate production/test inspection entry points.
 
 - [ ] **Step 1: Write failing tests with a temporary synthetic installation**
 
@@ -728,16 +728,27 @@ Test these independent results:
 
 ```cpp
 void emptyRootReportsMissingRoot();
+void missingAndNonDirectoryRootsNeverResolveAgainstCwd();
 void missingJavaAndJarAreSeparateIssues();
+void missingRuntimeConfigFilesAreSeparateIssues();
 void hashMismatchBlocksProduction();
+void invalidHashPolicyIsBlocking();
+void x64JavaIsRejected();
 void x64ProviderIsRejected();
-void dpduRootXmlResolvesAvlLibraryUri();
+void malformedAndTruncatedPeFilesAreRejected();
+void registryLookupUsesLogicalKeyAndRegistry32View();
+void dpduRootXmlSelectsAvlVci2kAmongDecoys();
+void dpduLocalDriveUriAcceptsSlashVariantsAndSpaces();
+void dpduRemoteOrRelativeUriIsRejected();
 void settingsRoundTripUsesCanonicalStore();
 ```
 
 Create a synthetic PE by writing `MZ`, an `e_lfanew` at offset `0x3c`, `PE\0\0`,
 and machine `0x014c` or `0x8664`. Inject temporary expected hashes through
-`Xc2ValidationPolicy`; do not weaken the production approved profile.
+the explicitly test-only `Xc2ValidationPolicy`; do not weaken the production
+approved profile. Prepend a decoy `MVCI_PDU_API` node to the D-PDU XML so the
+test proves selection by `SHORT_NAME`, not by element order. Assert stable issue
+codes, not localized message text.
 
 - [ ] **Step 2: Run the probe test to verify red behavior**
 
@@ -762,6 +773,8 @@ struct Xc2InstallLayout {
     QString javaExe;
     QString backendJar;
     QString configDir;
+    QString logConfig;
+    QString runtimeConfig;
     QString dpduRootXml;
     QString providerDll;
 };
@@ -781,8 +794,17 @@ struct Xc2PrerequisiteReport {
 ```
 
 `Xc2Settings` reads/writes only `rx14::appSettings()` key
-`ktm/xc2InstallRoot`. Tests set temporary QSettings user scope and remove the
-key in cleanup.
+`ktm/xc2InstallRoot`. The stored path is specifically the XC2 application root
+whose path ends in `resources/app`, not the outer `XC_2` or `XC_2_Prog`
+directory. Resolve exactly `jre/bin/java.exe`, `xc2_backend_patched.jar`,
+`config/log.xml`, and `config/custom-cloud.properties` beneath it.
+
+Before the first settings object is created, the test saves the global
+QSettings format, switches the default to `IniFormat`, redirects
+`IniFormat/UserScope` to a `QTemporaryDir`, and verifies
+`rx14::appSettings().fileName()` lies there. Cleanup removes the key, calls
+`sync()`, and restores the prior default format; the redirected path remains
+process-local to the dedicated test executable.
 
 - [ ] **Step 4: Implement deterministic installation inspection**
 
@@ -792,24 +814,66 @@ Expose:
 struct Xc2ValidationPolicy {
     QByteArray backendSha256Hex;
     QByteArray providerSha256Hex;
-    QString dpduRootOverride;
 };
+
+struct Xc2RegistryRequest {
+    QSettings::Format format = QSettings::Registry32Format;
+    QString key = QStringLiteral(
+        "HKEY_LOCAL_MACHINE\\SOFTWARE\\D-PDU API");
+    QString valueName = QStringLiteral("Root File");
+};
+
+using Xc2RegistryReader = std::function<std::optional<QString>(
+    const Xc2RegistryRequest &request)>;
 
 class Xc2InstallationProbe final {
 public:
-    static Xc2PrerequisiteReport inspect(
+    static Xc2PrerequisiteReport inspectProduction(
+        const QString &installRoot);
+    static Xc2PrerequisiteReport inspectForTest(
         const QString &installRoot,
-        const Xc2ValidationPolicy &policy);
+        const Xc2ValidationPolicy &policy,
+        Xc2RegistryReader registryReader);
 };
 ```
 
-Resolve Java/JAR/config relative to the selected XC2 application root. If no
-test override is provided, read the 32-bit D-PDU root registry value and parse
-the root XML `LIBRARY_FILE URI`. Normalize the observed `file:/C:\\...` form
-without treating it as a remote URL. Hash with `QCryptographicHash::Sha256`,
-verify PE machine `0x014c`, and return all issues in one report rather than
-stopping at the first error. Inspection opens files read-only and never loads
-the provider DLL.
+`inspectProduction()` always derives both hashes and the supported provider
+short name from `Xc2ContractProfile::approved()` and uses the real Windows
+reader. `inspectForTest()` is the only injectable-policy entry point. An
+expected hash that is not exactly 64 hexadecimal characters, including an
+empty value, produces blocking `invalid_policy`; it never disables validation.
+
+The real registry reader opens the logical key
+`HKEY_LOCAL_MACHINE\\SOFTWARE\\D-PDU API` with
+`QSettings::Registry32Format` and reads value `Root File`. Do not combine the
+32-bit view with an explicit `Wow6432Node` segment. The injected reader receives
+`Xc2RegistryRequest`, allowing tests to assert all three fields before returning
+a temporary root XML path.
+
+In the XML, find the `MVCI_PDU_API` whose `SHORT_NAME` exactly equals
+`AVL Ditest VCI2K_DPDU_API`, then read `LIBRARY_FILE URI` from that same node.
+Accept only an absolute local drive form matching
+`file:/[A-Za-z]:[\\/...]`; normalize slash direction and spaces deliberately.
+Reject authority/host components, non-file schemes, UNC/network locations, and
+relative paths rather than passing this legacy value through a permissive
+generic URL resolver.
+
+Blank, missing, or non-directory roots produce a blocking root issue before
+any relative path is formed, so `QDir("")` can never fall back to the current
+working directory. For a valid root, collect independent Java, JAR, config,
+registry, XML, provider, hash, and PE issues in one report. Define `ok()` as
+"no blocking issue". Use stable codes including `missing_root`,
+`root_not_directory`, `missing_java`, `missing_backend`, `missing_log_config`,
+`missing_runtime_config`, `missing_dpdu_registry`, `invalid_dpdu_xml`,
+`unsupported_dpdu_provider`, `unsafe_provider_uri`, `file_unreadable`,
+`invalid_pe`, `wrong_java_arch`, `wrong_provider_arch`,
+`backend_hash_mismatch`, and `provider_hash_mismatch`.
+
+PE inspection checks minimum length, `MZ`, bounded `e_lfanew`, `PE\0\0`, exact
+reads, and machine `0x014c` independently for the bundled Java executable and
+provider DLL. The same package contains unrelated x64 Java, so path and machine
+checks are both mandatory. Hash with `QCryptographicHash::Sha256`. Every file
+is opened read-only; the provider DLL is never loaded.
 
 - [ ] **Step 5: Run the prerequisite tests**
 
@@ -818,7 +882,7 @@ rtk cmake --build build-test --target test_Xc2InstallationProbe --parallel
 rtk ctest --test-dir build-test --output-on-failure -R xc2_installation
 ```
 
-Expected: all six cases pass.
+Expected: all listed cases pass.
 
 - [ ] **Step 6: Commit settings and the read-only probe**
 
