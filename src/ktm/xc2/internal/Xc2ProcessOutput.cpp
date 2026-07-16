@@ -169,7 +169,8 @@ struct Xc2ProcessOutput::StreamState {
     enum class ScannerState {
         Normal,
         ProbeName,
-        ProbeAfterName,
+        UnquotedDelimiterWait,
+        JsonDelimiterWait,
         HeaderBeforeValue,
         HeaderValue,
         KeyBeforeValue,
@@ -320,16 +321,10 @@ struct Xc2ProcessOutput::StreamState {
         consumeNormal(codePoint);
     }
 
-    void acceptSensitiveDelimiter(quint32 delimiter)
+    void acceptSensitiveDelimiter(quint32 delimiter, bool jsonName)
     {
-        if (!appendProbe(delimiter)) {
-            failProbeAndReprocess(delimiter);
-            return;
-        }
-
-        const bool wasQuoted = quotedCandidate;
-        commitProbe();
-        if (wasQuoted) {
+        appendCodePoint(delimiter);
+        if (jsonName) {
             scannerState = ScannerState::JsonBeforeValue;
         } else if (delimiter == ':') {
             scannerState = ScannerState::HeaderBeforeValue;
@@ -346,21 +341,21 @@ struct Xc2ProcessOutput::StreamState {
                 failProbeAndReprocess(codePoint);
                 return;
             }
-            scannerState = ScannerState::ProbeAfterName;
+            commitProbe();
+            scannerState = ScannerState::JsonDelimiterWait;
             return;
         }
         if (!quotedCandidate && exact
             && (codePoint == ':' || codePoint == '=')) {
-            acceptSensitiveDelimiter(codePoint);
+            commitProbe();
+            acceptSensitiveDelimiter(codePoint, false);
             return;
         }
         if (!quotedCandidate && exact
             && (codePoint == ' ' || codePoint == '\t')) {
-            if (!appendProbe(codePoint)) {
-                failProbeAndReprocess(codePoint);
-                return;
-            }
-            scannerState = ScannerState::ProbeAfterName;
+            commitProbe();
+            appendCodePoint(codePoint);
+            scannerState = ScannerState::UnquotedDelimiterWait;
             return;
         }
 
@@ -378,24 +373,34 @@ struct Xc2ProcessOutput::StreamState {
         failProbeAndReprocess(codePoint);
     }
 
-    void consumeProbeAfterName(quint32 codePoint)
+    void consumeUnquotedDelimiterWait(quint32 codePoint)
     {
         if (codePoint == ' ' || codePoint == '\t') {
-            if (appendProbe(codePoint))
-                return;
-            failProbeAndReprocess(codePoint);
+            appendCodePoint(codePoint);
             return;
         }
 
-        if (quotedCandidate && codePoint == ':') {
-            acceptSensitiveDelimiter(codePoint);
+        if (codePoint == ':' || codePoint == '=') {
+            acceptSensitiveDelimiter(codePoint, false);
             return;
         }
-        if (!quotedCandidate && (codePoint == ':' || codePoint == '=')) {
-            acceptSensitiveDelimiter(codePoint);
+        scannerState = ScannerState::Normal;
+        consumeNormal(codePoint);
+    }
+
+    void consumeJsonDelimiterWait(quint32 codePoint)
+    {
+        if (codePoint == ' ' || codePoint == '\t') {
+            appendCodePoint(codePoint);
             return;
         }
-        failProbeAndReprocess(codePoint);
+
+        if (codePoint == ':') {
+            acceptSensitiveDelimiter(codePoint, true);
+            return;
+        }
+        scannerState = ScannerState::Normal;
+        consumeNormal(codePoint);
     }
 
     void consumeKeyUnquotedValue(quint32 codePoint)
@@ -445,8 +450,11 @@ struct Xc2ProcessOutput::StreamState {
         case ScannerState::ProbeName:
             consumeProbeName(codePoint);
             break;
-        case ScannerState::ProbeAfterName:
-            consumeProbeAfterName(codePoint);
+        case ScannerState::UnquotedDelimiterWait:
+            consumeUnquotedDelimiterWait(codePoint);
+            break;
+        case ScannerState::JsonDelimiterWait:
+            consumeJsonDelimiterWait(codePoint);
             break;
         case ScannerState::HeaderBeforeValue:
             if (codePoint == ' ' || codePoint == '\t') {
@@ -550,31 +558,57 @@ struct Xc2ProcessOutput::StreamState {
         }
     }
 
-    void closeScannerAtBoundary()
+    void resetScanner()
     {
-        switch (scannerState) {
-        case ScannerState::ProbeName:
-        case ScannerState::ProbeAfterName:
-            commitProbe();
-            break;
-        case ScannerState::HeaderBeforeValue:
-        case ScannerState::KeyBeforeValue:
-        case ScannerState::JsonBeforeValue:
-            appendMarker();
-            break;
-        default:
-            break;
-        }
-
         clearProbe();
         scannerState = ScannerState::Normal;
         quotedValueDelimiter = 0;
         quotedValueEscape = false;
     }
 
+    void prepareScannerForBoundary(bool endOfStream)
+    {
+        switch (scannerState) {
+        case ScannerState::ProbeName:
+            commitProbe();
+            resetScanner();
+            break;
+        case ScannerState::UnquotedDelimiterWait:
+            resetScanner();
+            break;
+        case ScannerState::JsonDelimiterWait:
+            if (endOfStream)
+                resetScanner();
+            break;
+        case ScannerState::HeaderBeforeValue:
+            appendMarker();
+            resetScanner();
+            break;
+        case ScannerState::HeaderValue:
+        case ScannerState::KeyUnquotedValue:
+        case ScannerState::JsonUnquotedValue:
+            resetScanner();
+            break;
+        case ScannerState::KeyBeforeValue:
+        case ScannerState::JsonBeforeValue:
+            if (endOfStream) {
+                appendMarker();
+                resetScanner();
+            }
+            break;
+        case ScannerState::KeyQuotedValue:
+        case ScannerState::JsonQuotedValue:
+            if (endOfStream)
+                resetScanner();
+            break;
+        case ScannerState::Normal:
+            break;
+        }
+    }
+
     void completeLine(QStringList &completed, bool delimited)
     {
-        closeScannerAtBoundary();
+        prepareScannerForBoundary(!delimited);
         ansiState = AnsiState::Normal;
 
         if (delimited || lineTouched || !line.isEmpty()) {

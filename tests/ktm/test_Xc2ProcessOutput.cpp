@@ -139,6 +139,85 @@ private slots:
         QVERIFY(output.feed(kStderr, QByteArrayView(incomplete)).isEmpty());
         QCOMPARE(output.finish(kStderr),
                  QStringList{QStringLiteral("tail") + replacementCharacter()});
+
+        const QList<QByteArray> boundaryNames = {
+            QByteArrayLiteral("LF"),
+            QByteArrayLiteral("CR"),
+            QByteArrayLiteral("split-CRLF"),
+        };
+        for (int boundary = 0; boundary < boundaryNames.size(); ++boundary) {
+            const QByteArray jsonSecretA = QByteArrayLiteral("JSON-LINE-A-")
+                + boundaryNames.at(boundary);
+            const QByteArray jsonSecretB = QByteArrayLiteral("JSON-LINE-B-")
+                + boundaryNames.at(boundary);
+            const QByteArray keySecretA = QByteArrayLiteral("KEY-LINE-A-")
+                + boundaryNames.at(boundary);
+            const QByteArray keySecretB = QByteArrayLiteral("KEY-LINE-B-")
+                + boundaryNames.at(boundary);
+            const QList<QByteArray> secrets = {
+                jsonSecretA,
+                jsonSecretB,
+                keySecretA,
+                keySecretB,
+            };
+
+            output.reset();
+            const auto verifyState = [&](const QStringList &lines) {
+                for (const QString &line : lines) {
+                    for (const QByteArray &secret : secrets)
+                        verifyAbsent(line.toUtf8(), {secret});
+                }
+                for (const QByteArray &secret : secrets) {
+                    verifyAbsent(output.pendingLineUtf8(kStdout), {secret});
+                    for (const QString &line : output.recentOutput(kStdout))
+                        verifyAbsent(line.toUtf8(), {secret});
+                }
+            };
+            const auto feedBoundary = [&](QByteArray prefix) {
+                prefix += boundary == 0 ? '\n' : '\r';
+                QStringList lines = output.feed(kStdout, QByteArrayView(prefix));
+                if (boundary == 2) {
+                    const QStringList splitLf =
+                        output.feed(kStdout, QByteArrayView("\n"));
+                    QTest::qVerify(splitLf.isEmpty(),
+                                   "split CRLF emits no second line", "",
+                                   __FILE__, __LINE__);
+                    lines.append(splitLf);
+                }
+                return lines;
+            };
+
+            QStringList lines = feedBoundary(QByteArrayLiteral("{\"token\":"));
+            QCOMPARE(lines.size(), 1);
+            verifyState(lines);
+            lines = feedBoundary(QByteArrayLiteral("\"") + jsonSecretA);
+            QCOMPARE(lines.size(), 1);
+            verifyState(lines);
+            verifyState(output.feed(kStdout,
+                                    QByteArrayView(jsonSecretB + "\"}")));
+            verifyState(output.finish(kStdout));
+            const QString jsonOutput =
+                output.recentOutput(kStdout).join(QLatin1Char('\n'));
+            QVERIFY(jsonOutput.contains(QStringLiteral("\"token\":")));
+            QVERIFY(jsonOutput.contains(QStringLiteral("[redacted]")));
+            QVERIFY(jsonOutput.contains(QLatin1Char('}')));
+
+            output.reset();
+            lines = feedBoundary(QByteArrayLiteral("password="));
+            QCOMPARE(lines.size(), 1);
+            verifyState(lines);
+            lines = feedBoundary(QByteArrayLiteral("\"") + keySecretA);
+            QCOMPARE(lines.size(), 1);
+            verifyState(lines);
+            verifyState(output.feed(
+                kStdout, QByteArrayView(keySecretB + "\";visible=ok")));
+            verifyState(output.finish(kStdout));
+            const QString keyOutput =
+                output.recentOutput(kStdout).join(QLatin1Char('\n'));
+            QVERIFY(keyOutput.contains(QStringLiteral("password=")));
+            QVERIFY(keyOutput.contains(QStringLiteral("[redacted]")));
+            QVERIFY(keyOutput.contains(QStringLiteral("visible=ok")));
+        }
     }
 
     void outputLinesAndRingsAreBounded()
@@ -331,6 +410,67 @@ private slots:
                     .isEmpty());
         QCOMPARE(output.feed(kStdout, QByteArrayView("\\right\n")),
                  QStringList{QStringLiteral("leftright")});
+
+        const QByteArray longOws(
+            Xc2ProcessOutput::MaximumLookBehindBytes + 32, ' ');
+        struct OwsCase {
+            QByteArray wire;
+            QByteArray secret;
+            QByteArray expected;
+        };
+        const QList<OwsCase> owsCases = {
+            {QByteArrayLiteral("\"token\"") + longOws
+                 + QByteArrayLiteral(":\"JSON-OWS-SECRET\""),
+             QByteArrayLiteral("JSON-OWS-SECRET"),
+             QByteArrayLiteral("\"token\"") + longOws
+                 + QByteArrayLiteral(":\"[redacted]\"")},
+            {QByteArrayLiteral("Authorization") + longOws
+                 + QByteArrayLiteral(": HEADER-OWS-SECRET"),
+             QByteArrayLiteral("HEADER-OWS-SECRET"),
+             QByteArrayLiteral("Authorization") + longOws
+                 + QByteArrayLiteral(": [redacted]")},
+            {QByteArrayLiteral("password") + longOws
+                 + QByteArrayLiteral("=KEY-OWS-SECRET&visible=ok"),
+             QByteArrayLiteral("KEY-OWS-SECRET"),
+             QByteArrayLiteral("password") + longOws
+                 + QByteArrayLiteral("=[redacted]&visible=ok")},
+        };
+        for (const OwsCase &testCase : owsCases) {
+            output.reset();
+            QVERIFY(feedOneByteAtATime(output, kStdout, testCase.wire,
+                                      {testCase.secret})
+                        .isEmpty());
+            const QStringList eofLine = output.finish(kStdout);
+            QCOMPARE(eofLine.size(), 1);
+            QCOMPARE(eofLine.front().toUtf8(), testCase.expected);
+            verifyAbsent(eofLine.front().toUtf8(), {testCase.secret});
+            verifyAbsent(output.recentOutput(kStdout).front().toUtf8(),
+                         {testCase.secret});
+        }
+
+        output.reset();
+        const QByteArray truncatedSecret =
+            QByteArrayLiteral("TRUNCATED-OWS-SECRET");
+        const QByteArray hugeOws(Xc2ProcessOutput::MaximumLineBytes + 128, ' ');
+        const QByteArray truncatedKey = QByteArrayLiteral("\"token\"")
+            + hugeOws + QByteArrayLiteral(":\n");
+        const QStringList truncatedKeyLine =
+            output.feed(kStdout, QByteArrayView(truncatedKey));
+        QCOMPARE(truncatedKeyLine.size(), 1);
+        QVERIFY(truncatedKeyLine.front().endsWith(
+            QStringLiteral("[truncated]")));
+        verifyAbsent(truncatedKeyLine.front().toUtf8(), {truncatedSecret});
+        QVERIFY(output.feed(kStdout,
+                            QByteArrayView('"' + truncatedSecret + '"'))
+                    .isEmpty());
+        verifyAbsent(output.pendingLineUtf8(kStdout), {truncatedSecret});
+        const QStringList truncatedEof = output.finish(kStdout);
+        for (const QString &line : truncatedEof)
+            verifyAbsent(line.toUtf8(), {truncatedSecret});
+        for (const QString &line : output.recentOutput(kStdout))
+            verifyAbsent(line.toUtf8(), {truncatedSecret});
+        QVERIFY(output.recentOutput(kStdout).join(QLatin1Char('\n')).contains(
+            QStringLiteral("[redacted]")));
     }
 };
 
