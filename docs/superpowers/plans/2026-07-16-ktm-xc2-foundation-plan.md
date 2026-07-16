@@ -113,6 +113,23 @@ private slots:
         QCOMPARE(apply.semantics, OperationSemantics::StateChanging);
         QCOMPARE(apply.maxAutomaticRetries, 0);
     }
+
+    void manualVehicleSelectionAndVehicleFlowRoutesAreFrozen()
+    {
+        const auto &p = Xc2ContractProfile::approved();
+        QCOMPARE(p.endpoint(Endpoint::VehicleManufacturers).path,
+                 QStringLiteral("vehicle/manufacturer"));
+        QCOMPARE(p.endpoint(Endpoint::VehicleSeries).path,
+                 QStringLiteral("vehicle/series"));
+        QCOMPARE(p.endpoint(Endpoint::VehicleModels).path,
+                 QStringLiteral("vehicle/vehicle"));
+        QCOMPARE(p.endpoint(Endpoint::VehicleSelect).path,
+                 QStringLiteral("vehicle/select"));
+        QCOMPARE(p.endpoint(Endpoint::VehicleExecuteFlow).path,
+                 QStringLiteral("vehicle/executeFlow"));
+        QCOMPARE(p.endpoint(Endpoint::VehicleExecuteFlow).method,
+                 HttpMethod::PostForm);
+    }
 };
 
 QTEST_APPLESS_MAIN(Xc2ContractProfileTest)
@@ -180,10 +197,11 @@ enum class Endpoint {
     ServiceStatus, Shutdown, CurrentUser, Login, Logout,
     DeviceLookup, DeviceGet, DeviceGetSelected, DeviceApply, DeviceClose,
     SettingsGet, SettingsSet,
-    VehicleDetect, VehicleSelect, VehicleInfo, AutoScan,
+    VehicleDetect, VehicleManufacturers, VehicleSeries, VehicleModels,
+    VehicleSelect, VehicleInfo, AutoScan,
     EcuDomains, EcuOpen, EcuClose, EcuScan, EcuClearDtc,
     EcuFunctions, EcuMeasurementsGet, EcuMeasurementsStart,
-    EcuMeasurementsStop, EcuExecuteFlow, FlowUpdateGui,
+    EcuMeasurementsStop, EcuExecuteFlow, VehicleExecuteFlow, FlowUpdateGui,
     DownloadMapping, FlashAutomatic, FlashFile
 };
 
@@ -222,6 +240,12 @@ private:
 ```
 
 Implement every enum value with the observed XC2 path/topic. Dynamic paths use named templates such as `ecu/open/{ecuId}`; later clients replace only declared placeholders after percent-encoding. Classify discovery/jobs, selection, clear, flow, and flash endpoints as `StateChanging` with zero retries. `ServiceStatus`, `CurrentUser`, settings reads, vehicle info, ECU-domain/function reads, and measurement-definition reads are `ReadOnly`; keep their profile retry value zero because retry policy belongs to the caller.
+
+Manual selection consumes the observed JSON POST routes
+`vehicle/manufacturer`, `vehicle/series`, and `vehicle/vehicle`, followed by
+state-changing `vehicle/select`. Classify the first three list queries as
+`ReadOnly` even though XC2 exposes them as POST. Preserve both form POST flow
+routes: `ecu/executeFlow` and `vehicle/executeFlow`.
 
 Use the observed device routes exactly: `device/lookup` (GET), `device/get`
 (GET), `device/getSelected` (GET), `device/apply` (JSON POST), and
