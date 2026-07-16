@@ -54,6 +54,7 @@ private:
     Xc2RequestId startRequest(Endpoint endpoint);
     QUrl endpointUrl(Endpoint endpoint) const;
     void readAvailable(Xc2RequestId id);
+    void drainAvailable(PendingRequest *pending);
     void parseAvailable(PendingRequest *pending);
     void failProtocol(PendingRequest *pending, const QString &message);
     void forceStop(Xc2RequestId id, Xc2TransportReason reason);

@@ -4,6 +4,7 @@
 #include <QNetworkProxy>
 #include <QPointer>
 #include <QSignalSpy>
+#include <QTcpSocket>
 
 #include "FakeHttpServer.h"
 #include "ktm/xc2/Xc2RestClient.h"
@@ -345,6 +346,33 @@ private slots:
         QCOMPARE(proxyTrap.requestCount(), 0);
     }
 
+    void socketReadBufferHasFixedHardLimit()
+    {
+        FakeHttpServer server(QHostAddress::LocalHost);
+        QVERIFY(server.isListening());
+        server.enqueueResponse(FakeHttpServer::neverRespond());
+
+        Xc2RestClient client({500, 250});
+        QVERIFY(client.setBaseUrl(encodedBase(server)));
+        QSignalSpy captured(&server, &FakeHttpServer::requestCaptured);
+        QSignalSpy finished(&client, &Xc2RestClient::serviceStatusFinished);
+        const Xc2RequestId id = client.requestServiceStatus();
+        if (captured.isEmpty())
+            QVERIFY(captured.wait(kSignalWaitMs));
+        const QList<QTcpSocket *> sockets = client.findChildren<QTcpSocket *>();
+        QCOMPARE(sockets.size(), 1);
+        QVERIFY(sockets.front()->readBufferSize() > 0);
+        QVERIFY(sockets.front()->readBufferSize() <= 64 * 1024);
+
+        client.abort(id);
+        if (finished.isEmpty())
+            QVERIFY(finished.wait(kSignalWaitMs));
+        QCOMPARE(finished.count(), 1);
+        const auto result = qvariant_cast<Xc2Result<Xc2ServiceStatus>>(
+            finished.takeFirst().at(1));
+        QCOMPARE(result.error.transportReason, Xc2TransportReason::Canceled);
+    }
+
     void get302DoesNotFollowRedirect()
     {
         FakeHttpServer origin(QHostAddress::LocalHost);
@@ -616,6 +644,130 @@ private slots:
         QCOMPARE(server.requestCount(), 1);
     }
 
+    void acceptsStrictFragmentedChunkExtensions()
+    {
+        FakeHttpServer server(QHostAddress::LocalHost);
+        QVERIFY(server.isListening());
+        server.enqueueResponse(FakeHttpServer::fragmentedRawResponse({
+            QByteArrayLiteral(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+                "Set-Cookie: strict=accepted; Path=/\r\n\r\n"
+                "5 \t; \tflag;token \t= \tvalue;quoted \t= \t\"a"),
+            QByteArrayLiteral("\tb"),
+            QByteArray(1, '\\'),
+            QByteArrayLiteral("\"c"),
+            QByteArray(1, '\\'),
+            QByteArrayLiteral("\\d\";empty \t= \t\"\"\r"),
+            QByteArrayLiteral("\nalive\r\n0;end=\""),
+            QByteArrayLiteral("ok\"\r\n"),
+            QByteArrayLiteral(
+                "Set-Cookie: trailer=ignored; Path=/\r\n"
+                "X-Trailer:\taccepted\r\n\r\n"),
+        }));
+
+        Xc2RestClient client({500, 100});
+        QVERIFY(client.setBaseUrl(encodedBase(server)));
+        QSignalSpy finished(&client, &Xc2RestClient::serviceStatusFinished);
+        client.requestServiceStatus();
+        QVERIFY(finished.wait(kSignalWaitMs));
+        const auto result = qvariant_cast<Xc2Result<Xc2ServiceStatus>>(
+            finished.takeFirst().at(1));
+        QVERIFY2(result.ok(), qPrintable(result.error.message));
+        const auto cookies = client.cookieHeaderFor(
+            client.webSocketUrl().toEncoded(QUrl::FullyEncoded));
+        QVERIFY(cookies.ok());
+        QCOMPARE(*cookies.value, QByteArrayLiteral("strict=accepted"));
+        QCOMPARE(server.requestCount(), 1);
+    }
+
+    void rejectsMalformedChunkExtensions_data()
+    {
+        QTest::addColumn<QByteArray>("chunkLine");
+
+        QTest::newRow("empty extension name") << QByteArrayLiteral("5;");
+        QTest::newRow("empty second extension name")
+            << QByteArrayLiteral("5;first;;second");
+        QTest::newRow("space in extension name")
+            << QByteArrayLiteral("5;bad name");
+        QTest::newRow("empty token value") << QByteArrayLiteral("5;name=");
+        QTest::newRow("unterminated quoted value")
+            << QByteArrayLiteral("5;name=\"unterminated");
+        QTest::newRow("junk after quoted value")
+            << QByteArrayLiteral("5;name=\"ok\"junk");
+        QTest::newRow("NUL in quoted value")
+            << QByteArrayLiteral("5;name=\"bad") + QByteArray(1, '\0')
+                + QByteArrayLiteral("value\"");
+        QTest::newRow("DEL in quoted value")
+            << QByteArrayLiteral("5;name=\"bad") + QByteArray(1, '\x7f')
+                + QByteArrayLiteral("value\"");
+        QTest::newRow("bare CR in quoted value")
+            << QByteArrayLiteral("5;name=\"bad\rvalue\"");
+        QTest::newRow("illegal quoted pair")
+            << QByteArrayLiteral("5;name=\"bad") + QByteArray(1, '\\')
+                + QByteArray(1, '\x01') + QByteArrayLiteral("\"");
+        QTest::newRow("trailing whitespace after size")
+            << QByteArrayLiteral("5 ");
+        QTest::newRow("trailing whitespace after name")
+            << QByteArrayLiteral("5;name\t");
+        QTest::newRow("trailing whitespace after value")
+            << QByteArrayLiteral("5;name=value ");
+    }
+
+    void rejectsMalformedChunkExtensions()
+    {
+        QFETCH(QByteArray, chunkLine);
+
+        const qsizetype split = qMax<qsizetype>(1, chunkLine.size() / 2);
+        FakeHttpServer server(QHostAddress::LocalHost);
+        QVERIFY(server.isListening());
+        server.enqueueResponse(FakeHttpServer::fragmentedRawResponse({
+            QByteArrayLiteral(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+                "Set-Cookie: invalid=must-not-stick; Path=/\r\n\r\n")
+                + chunkLine.left(split),
+            chunkLine.mid(split),
+            QByteArrayLiteral("\r\nalive\r\n0\r\n\r\n"),
+        }));
+
+        Xc2RestClient client({500, 100});
+        QVERIFY(client.setBaseUrl(encodedBase(server)));
+        QSignalSpy finished(&client, &Xc2RestClient::serviceStatusFinished);
+        client.requestServiceStatus();
+        QVERIFY(finished.wait(kSignalWaitMs));
+        const auto result = qvariant_cast<Xc2Result<Xc2ServiceStatus>>(
+            finished.takeFirst().at(1));
+        QVERIFY(!result.ok());
+        QCOMPARE(result.error.category, Xc2ErrorCategory::Transport);
+        QCOMPARE(result.error.transportReason, Xc2TransportReason::Network);
+        QCOMPARE(result.error.httpStatus, 200);
+        const auto cookies = client.cookieHeaderFor(
+            client.webSocketUrl().toEncoded(QUrl::FullyEncoded));
+        QVERIFY(cookies.ok());
+        QVERIFY(cookies.value->isEmpty());
+        QCOMPARE(server.requestCount(), 1);
+    }
+
+    void acceptsHtabInReasonHeaderAndTrailer()
+    {
+        FakeHttpServer server(QHostAddress::LocalHost);
+        QVERIFY(server.isListening());
+        server.enqueueResponse(FakeHttpServer::rawResponse(QByteArrayLiteral(
+            "HTTP/1.1 200 OK\tSynthetic\r\n"
+            "X-Synthetic:\tvalue\tpart\r\n"
+            "Transfer-Encoding: chunked\r\n\r\n"
+            "5\r\nalive\r\n0\r\nX-Trailer:\tvalue\tpart\r\n\r\n")));
+
+        Xc2RestClient client({500, 250});
+        QVERIFY(client.setBaseUrl(encodedBase(server)));
+        QSignalSpy finished(&client, &Xc2RestClient::serviceStatusFinished);
+        client.requestServiceStatus();
+        QVERIFY(finished.wait(kSignalWaitMs));
+        const auto result = qvariant_cast<Xc2Result<Xc2ServiceStatus>>(
+            finished.takeFirst().at(1));
+        QVERIFY2(result.ok(), qPrintable(result.error.message));
+        QCOMPARE(server.requestCount(), 1);
+    }
+
     void malformedOrTruncatedChunkedIsTransportFailure_data()
     {
         QTest::addColumn<QByteArray>("wire");
@@ -713,6 +865,77 @@ private slots:
         QCOMPARE(server.requestCount(), 1);
     }
 
+    void burstLimitFailuresDoNotInstallCookies_data()
+    {
+        QTest::addColumn<QByteArray>("wire");
+        QTest::addColumn<int>("expectedHttpStatus");
+
+        const QByteArray cookie = QByteArrayLiteral(
+            "Set-Cookie: burst=must-not-stick; Path=/\r\n");
+        const QByteArray oversizedBody(8 * 1024 * 1024 + 1, 'x');
+        QTest::newRow("oversized header burst")
+            << QByteArrayLiteral("HTTP/1.1 200 OK\r\n") + cookie
+                + QByteArrayLiteral("X-Burst: ")
+                + QByteArray(64 * 1024, 'h')
+                + QByteArrayLiteral("\r\nContent-Length: 5\r\n\r\nalive")
+            << 0;
+        QTest::newRow("oversized Content-Length body burst")
+            << QByteArrayLiteral(
+                   "HTTP/1.1 200 OK\r\nContent-Length: 8388609\r\n")
+                + cookie + QByteArrayLiteral("\r\n") + oversizedBody
+            << 200;
+        QTest::newRow("oversized chunked body burst")
+            << QByteArrayLiteral(
+                   "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n")
+                + cookie + QByteArrayLiteral("\r\n800001\r\n")
+                + oversizedBody + QByteArrayLiteral("\r\n0\r\n\r\n")
+            << 200;
+        QTest::newRow("oversized close-delimited body burst")
+            << QByteArrayLiteral("HTTP/1.1 200 OK\r\n") + cookie
+                + QByteArrayLiteral("Connection: close\r\n\r\n")
+                + oversizedBody
+            << 200;
+        QTest::newRow("oversized chunk-line burst")
+            << QByteArrayLiteral(
+                   "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n")
+                + cookie + QByteArrayLiteral("\r\n1;name=")
+                + QByteArray(64 * 1024, 'c')
+                + QByteArrayLiteral("\r\na\r\n0\r\n\r\n")
+            << 200;
+        QTest::newRow("oversized trailer burst")
+            << QByteArrayLiteral(
+                   "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n")
+                + cookie + QByteArrayLiteral("\r\n1\r\na\r\n0\r\nX-Burst: ")
+                + QByteArray(64 * 1024, 't') + QByteArrayLiteral("\r\n\r\n")
+            << 200;
+    }
+
+    void burstLimitFailuresDoNotInstallCookies()
+    {
+        QFETCH(QByteArray, wire);
+        QFETCH(int, expectedHttpStatus);
+
+        FakeHttpServer server(QHostAddress::LocalHost);
+        QVERIFY(server.isListening());
+        server.enqueueResponse(FakeHttpServer::rawResponse(wire));
+        Xc2RestClient client({5000, 2000});
+        QVERIFY(client.setBaseUrl(encodedBase(server)));
+        QSignalSpy finished(&client, &Xc2RestClient::serviceStatusFinished);
+        client.requestServiceStatus();
+        QVERIFY(finished.wait(10000));
+        const auto result = qvariant_cast<Xc2Result<Xc2ServiceStatus>>(
+            finished.takeFirst().at(1));
+        QVERIFY(!result.ok());
+        QCOMPARE(result.error.category, Xc2ErrorCategory::Transport);
+        QCOMPARE(result.error.transportReason, Xc2TransportReason::Network);
+        QCOMPARE(result.error.httpStatus, expectedHttpStatus);
+        const auto cookies = client.cookieHeaderFor(
+            client.webSocketUrl().toEncoded(QUrl::FullyEncoded));
+        QVERIFY(cookies.ok());
+        QVERIFY(cookies.value->isEmpty());
+        QCOMPARE(server.requestCount(), 1);
+    }
+
     void acceptsCloseDelimitedResponse()
     {
         FakeHttpServer server(QHostAddress::LocalHost);
@@ -729,6 +952,35 @@ private slots:
             finished.takeFirst().at(1));
         QVERIFY2(result.ok(), qPrintable(result.error.message));
         QCOMPARE(server.requestCount(), 1);
+    }
+
+    void largeCloseDelimitedResponseDrainsBeforeEofCompletion()
+    {
+        QByteArray body = backendError(500, 1500);
+        body.chop(1);
+        body += QByteArrayLiteral(",\"padding\":\"")
+            + QByteArray(256 * 1024, 'x') + QByteArrayLiteral("\"}");
+        FakeHttpServer server(QHostAddress::LocalHost);
+        QVERIFY(server.isListening());
+        server.enqueueResponse(FakeHttpServer::rawResponse(
+            QByteArrayLiteral(
+                "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n")
+            + body));
+
+        Xc2RestClient client({1500, 500});
+        QVERIFY(client.setBaseUrl(encodedBase(server)));
+        QSignalSpy finished(&client, &Xc2RestClient::serviceStatusFinished);
+        client.requestServiceStatus();
+        QVERIFY(finished.wait(kSignalWaitMs));
+        const auto result = qvariant_cast<Xc2Result<Xc2ServiceStatus>>(
+            finished.takeFirst().at(1));
+        QVERIFY(!result.ok());
+        QCOMPARE(result.error.category, Xc2ErrorCategory::Backend);
+        QCOMPARE(result.error.httpStatus, 500);
+        QCOMPARE(result.error.rawPayload, body);
+        QCOMPARE(server.requestCount(), 1);
+        QSignalSpy extra(&client, &Xc2RestClient::serviceStatusFinished);
+        QVERIFY(!extra.wait(80));
     }
 
     void rejectsResponseBodyOverEightMiB()
@@ -823,6 +1075,74 @@ private slots:
             finished.takeFirst().at(1));
         QVERIFY2(result.ok(), qPrintable(result.error.message));
         QVERIFY2(completionMs < 250, qPrintable(QString::number(completionMs)));
+        QCOMPARE(server.requestCount(), 1);
+    }
+
+    void largeFramedResponseCrossesReadWindowsWhilePeerStaysOpen()
+    {
+        const QByteArray body(256 * 1024, 'x');
+        FakeHttpServer server(QHostAddress::LocalHost);
+        QVERIFY(server.isListening());
+        server.enqueueResponse(FakeHttpServer::rawResponseKeepOpen(
+            QByteArrayLiteral("HTTP/1.1 200 OK\r\nContent-Length: ")
+            + QByteArray::number(body.size()) + QByteArrayLiteral("\r\n\r\n")
+            + body));
+
+        Xc2RestClient client({1500, 500});
+        QVERIFY(client.setBaseUrl(encodedBase(server)));
+        QSignalSpy finished(&client, &Xc2RestClient::shutdownFinished);
+        QElapsedTimer elapsed;
+        elapsed.start();
+        client.requestShutdown();
+        QVERIFY(finished.wait(kSignalWaitMs));
+        const qint64 completionMs = elapsed.elapsed();
+        const Xc2Error error = qvariant_cast<Xc2Error>(
+            finished.takeFirst().at(1));
+        QCOMPARE(error.category, Xc2ErrorCategory::None);
+        QVERIFY2(completionMs < 1000, qPrintable(QString::number(completionMs)));
+        QCOMPARE(server.requestCount(), 1);
+        QSignalSpy extra(&client, &Xc2RestClient::shutdownFinished);
+        QVERIFY(!extra.wait(80));
+    }
+
+    void rejectsForbidden204Framing_data()
+    {
+        QTest::addColumn<QByteArray>("wire");
+
+        const QByteArray head = QByteArrayLiteral(
+            "HTTP/1.1 204 No Content\r\n"
+            "Set-Cookie: forbidden=must-not-stick; Path=/\r\n");
+        QTest::newRow("Content-Length zero")
+            << head + QByteArrayLiteral("Content-Length: 0\r\n\r\n");
+        QTest::newRow("Transfer-Encoding")
+            << head + QByteArrayLiteral(
+                   "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
+        QTest::newRow("body bytes without framing")
+            << head + QByteArrayLiteral("\r\nalive");
+    }
+
+    void rejectsForbidden204Framing()
+    {
+        QFETCH(QByteArray, wire);
+
+        FakeHttpServer server(QHostAddress::LocalHost);
+        QVERIFY(server.isListening());
+        server.enqueueResponse(FakeHttpServer::rawResponse(wire));
+        Xc2RestClient client({500, 250});
+        QVERIFY(client.setBaseUrl(encodedBase(server)));
+        QSignalSpy finished(&client, &Xc2RestClient::serviceStatusFinished);
+        client.requestServiceStatus();
+        QVERIFY(finished.wait(kSignalWaitMs));
+        const auto result = qvariant_cast<Xc2Result<Xc2ServiceStatus>>(
+            finished.takeFirst().at(1));
+        QVERIFY(!result.ok());
+        QCOMPARE(result.error.category, Xc2ErrorCategory::Transport);
+        QCOMPARE(result.error.transportReason, Xc2TransportReason::Network);
+        QCOMPARE(result.error.httpStatus, 204);
+        const auto cookies = client.cookieHeaderFor(
+            client.webSocketUrl().toEncoded(QUrl::FullyEncoded));
+        QVERIFY(cookies.ok());
+        QVERIFY(cookies.value->isEmpty());
         QCOMPARE(server.requestCount(), 1);
     }
 
@@ -1031,6 +1351,140 @@ private slots:
         QVERIFY(!extraRequest.wait(80));
     }
 
+    void rejectsUnapprovedEndpointSuccessStatuses_data()
+    {
+        QTest::addColumn<int>("endpointKind");
+        QTest::addColumn<int>("status");
+        QTest::addColumn<QByteArray>("body");
+        QTest::addColumn<QString>("endpoint");
+
+        QTest::newRow("health 201")
+            << 0 << 201 << QByteArrayLiteral("alive")
+            << QStringLiteral("serviceStatus/status");
+        QTest::newRow("current-user 202")
+            << 1 << 202
+            << QByteArrayLiteral(
+                   R"({"loginName":"xcd","name":"Synthetic","permissions":[]})")
+            << QStringLiteral("auth/currentUser");
+        QTest::newRow("shutdown 206")
+            << 2 << 206 << QByteArrayLiteral("partial")
+            << QStringLiteral("serviceStatus/shutdown");
+    }
+
+    void rejectsUnapprovedEndpointSuccessStatuses()
+    {
+        QFETCH(int, endpointKind);
+        QFETCH(int, status);
+        QFETCH(QByteArray, body);
+        QFETCH(QString, endpoint);
+
+        FakeHttpServer server(QHostAddress::LocalHost);
+        QVERIFY(server.isListening());
+        server.enqueueResponse(FakeHttpServer::complete(
+            status, body,
+            {{QByteArrayLiteral("Set-Cookie"),
+              QByteArrayLiteral("complete=installed; Path=/")}}));
+        Xc2RestClient client({500, 250});
+        QVERIFY(client.setBaseUrl(encodedBase(server)));
+        QSignalSpy statusFinished(
+            &client, &Xc2RestClient::serviceStatusFinished);
+        QSignalSpy userFinished(&client, &Xc2RestClient::currentUserFinished);
+        QSignalSpy shutdownFinished(&client, &Xc2RestClient::shutdownFinished);
+
+        if (endpointKind == 0)
+            client.requestServiceStatus();
+        else if (endpointKind == 1)
+            client.requestCurrentUser();
+        else
+            client.requestShutdown();
+        QSignalSpy *finished = endpointKind == 0 ? &statusFinished
+            : endpointKind == 1 ? &userFinished : &shutdownFinished;
+        QVERIFY(finished->wait(kSignalWaitMs));
+        QCOMPARE(finished->count(), 1);
+
+        Xc2Error error;
+        const QList<QVariant> arguments = finished->takeFirst();
+        if (endpointKind == 0) {
+            const auto result =
+                qvariant_cast<Xc2Result<Xc2ServiceStatus>>(arguments.at(1));
+            QVERIFY(!result.ok());
+            error = result.error;
+        } else if (endpointKind == 1) {
+            const auto result =
+                qvariant_cast<Xc2Result<Xc2CurrentUser>>(arguments.at(1));
+            QVERIFY(!result.ok());
+            error = result.error;
+        } else {
+            error = qvariant_cast<Xc2Error>(arguments.at(1));
+        }
+        QCOMPARE(error.category, Xc2ErrorCategory::Contract);
+        QCOMPARE(error.transportReason, Xc2TransportReason::None);
+        QCOMPARE(error.httpStatus, status);
+        QCOMPARE(error.rawPayload, body);
+        QCOMPARE(error.endpoint, endpoint);
+        const auto cookies = client.cookieHeaderFor(
+            client.webSocketUrl().toEncoded(QUrl::FullyEncoded));
+        QVERIFY(cookies.ok());
+        QCOMPARE(*cookies.value, QByteArrayLiteral("complete=installed"));
+        QCOMPARE(server.requestCount(), 1);
+    }
+
+    void syntacticallyCompleteResponsesInstallCookies_data()
+    {
+        QTest::addColumn<int>("endpointKind");
+        QTest::addColumn<int>("status");
+        QTest::addColumn<QByteArray>("body");
+        QTest::addColumn<int>("expectedCategory");
+        QTest::addColumn<QByteArray>("expectedCookie");
+
+        QTest::newRow("approved shutdown 204")
+            << 2 << 204 << QByteArray() << int(Xc2ErrorCategory::None)
+            << QByteArrayLiteral("shutdown=installed");
+        QTest::newRow("complete backend 403")
+            << 0 << 403 << backendError(403, 1007)
+            << int(Xc2ErrorCategory::Backend)
+            << QByteArrayLiteral("backend=installed");
+    }
+
+    void syntacticallyCompleteResponsesInstallCookies()
+    {
+        QFETCH(int, endpointKind);
+        QFETCH(int, status);
+        QFETCH(QByteArray, body);
+        QFETCH(int, expectedCategory);
+        QFETCH(QByteArray, expectedCookie);
+
+        FakeHttpServer server(QHostAddress::LocalHost);
+        QVERIFY(server.isListening());
+        server.enqueueResponse(FakeHttpServer::complete(
+            status, body,
+            {{QByteArrayLiteral("Set-Cookie"),
+              expectedCookie + QByteArrayLiteral("; Path=/")}}));
+        Xc2RestClient client({500, 250});
+        QVERIFY(client.setBaseUrl(encodedBase(server)));
+        QSignalSpy statusFinished(
+            &client, &Xc2RestClient::serviceStatusFinished);
+        QSignalSpy shutdownFinished(&client, &Xc2RestClient::shutdownFinished);
+        if (endpointKind == 0)
+            client.requestServiceStatus();
+        else
+            client.requestShutdown();
+        QSignalSpy *finished = endpointKind == 0
+            ? &statusFinished : &shutdownFinished;
+        QVERIFY(finished->wait(kSignalWaitMs));
+        const QList<QVariant> arguments = finished->takeFirst();
+        const Xc2Error error = endpointKind == 0
+            ? qvariant_cast<Xc2Result<Xc2ServiceStatus>>(
+                  arguments.at(1)).error
+            : qvariant_cast<Xc2Error>(arguments.at(1));
+        QCOMPARE(int(error.category), expectedCategory);
+        const auto cookies = client.cookieHeaderFor(
+            client.webSocketUrl().toEncoded(QUrl::FullyEncoded));
+        QVERIFY(cookies.ok());
+        QCOMPARE(*cookies.value, expectedCookie);
+        QCOMPARE(server.requestCount(), 1);
+    }
+
     void classifiesCompleteResponseMatrix_data()
     {
         QTest::addColumn<int>("endpointKind");
@@ -1177,7 +1631,15 @@ private slots:
             observed.ok = observed.error.category == Xc2ErrorCategory::None;
         }
 
-        QCOMPARE(observed.ok, expectedOk);
+        QVERIFY2(observed.ok == expectedOk,
+                 qPrintable(QStringLiteral(
+                     "ok=%1 category=%2 reason=%3 http=%4 raw=%5 message=%6")
+                     .arg(observed.ok)
+                     .arg(int(observed.error.category))
+                     .arg(int(observed.error.transportReason))
+                     .arg(observed.error.httpStatus)
+                     .arg(QString::fromLatin1(observed.error.rawPayload.toHex()))
+                     .arg(observed.error.message)));
         QVERIFY2(int(observed.error.category) == expectedCategory,
                  qPrintable(QStringLiteral(
                      "category=%1 reason=%2 http=%3 raw=%4 message=%5")

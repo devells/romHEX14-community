@@ -54,9 +54,11 @@ QByteArray responseHead(const FakeHttpResponse &response,
         wire += header.first + QByteArrayLiteral(": ") + header.second
             + QByteArrayLiteral("\r\n");
     }
-    wire += QByteArrayLiteral("Content-Length: ")
-        + QByteArray::number(contentLength)
-        + QByteArrayLiteral("\r\nConnection: close\r\n\r\n");
+    if (response.status != 204) {
+        wire += QByteArrayLiteral("Content-Length: ")
+            + QByteArray::number(contentLength) + QByteArrayLiteral("\r\n");
+    }
+    wire += QByteArrayLiteral("Connection: close\r\n\r\n");
     return wire;
 }
 

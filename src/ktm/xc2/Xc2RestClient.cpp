@@ -20,6 +20,8 @@ namespace {
 
 constexpr qsizetype kMaximumHeaderBytes = 64 * 1024;
 constexpr qsizetype kMaximumBodyBytes = 8 * 1024 * 1024;
+constexpr qint64 kSocketReadBufferBytes = 16 * 1024;
+constexpr qint64 kSocketReadChunkBytes = 4 * 1024;
 
 Xc2Error contractError(QString message)
 {
@@ -50,14 +52,19 @@ bool headerNameEquals(const QByteArray &left, const QByteArray &right)
     return left.compare(right, Qt::CaseInsensitive) == 0;
 }
 
+bool isTokenCharacter(char byte)
+{
+    const uchar value = static_cast<uchar>(byte);
+    static const QByteArray separators("()<>@,;:\\\"/[]?={} \t");
+    return value > 0x20 && value < 0x7f && !separators.contains(byte);
+}
+
 bool isHeaderName(const QByteArray &name)
 {
     if (name.isEmpty())
         return false;
-    static const QByteArray separators("()<>@,;:\\\"/[]?={} \t");
     for (const char byte : name) {
-        const uchar value = static_cast<uchar>(byte);
-        if (value <= 0x20 || value >= 0x7f || separators.contains(byte))
+        if (!isTokenCharacter(byte))
             return false;
     }
     return true;
@@ -67,10 +74,137 @@ bool isHeaderValue(const QByteArray &value)
 {
     for (const char byte : value) {
         const uchar character = static_cast<uchar>(byte);
-        if (character <= 0x1f || character == 0x7f)
+        if ((character <= 0x1f && character != '\t')
+            || character == 0x7f) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void skipOptionalWhitespace(const QByteArray &line, qsizetype *position)
+{
+    while (*position < line.size()
+           && (line.at(*position) == ' ' || line.at(*position) == '\t')) {
+        ++*position;
+    }
+}
+
+bool consumeToken(const QByteArray &line, qsizetype *position)
+{
+    const qsizetype start = *position;
+    while (*position < line.size()
+           && isTokenCharacter(line.at(*position))) {
+        ++*position;
+    }
+    return *position > start;
+}
+
+bool isQuotedTextCharacter(char byte)
+{
+    const uchar value = static_cast<uchar>(byte);
+    return value == '\t' || value == ' ' || value == 0x21
+        || (value >= 0x23 && value <= 0x5b)
+        || (value >= 0x5d && value <= 0x7e) || value >= 0x80;
+}
+
+bool isQuotedPairCharacter(char byte)
+{
+    const uchar value = static_cast<uchar>(byte);
+    return value == '\t' || value == ' '
+        || (value >= 0x21 && value <= 0x7e) || value >= 0x80;
+}
+
+bool consumeQuotedString(const QByteArray &line, qsizetype *position)
+{
+    if (*position >= line.size() || line.at(*position) != '"')
+        return false;
+    ++*position;
+    while (*position < line.size()) {
+        const char byte = line.at(*position);
+        if (byte == '"') {
+            ++*position;
+            return true;
+        }
+        if (byte == '\\') {
+            ++*position;
+            if (*position >= line.size()
+                || !isQuotedPairCharacter(line.at(*position))) {
+                return false;
+            }
+            ++*position;
+            continue;
+        }
+        if (!isQuotedTextCharacter(byte))
+            return false;
+        ++*position;
+    }
+    return false;
+}
+
+bool parseChunkSizeLine(const QByteArray &line, QByteArray *sizeText)
+{
+    qsizetype position = 0;
+    while (position < line.size()) {
+        const char byte = line.at(position);
+        if (!((byte >= '0' && byte <= '9')
+              || (byte >= 'a' && byte <= 'f')
+              || (byte >= 'A' && byte <= 'F'))) {
+            break;
+        }
+        ++position;
+    }
+    if (position == 0)
+        return false;
+    *sizeText = line.left(position);
+
+    while (position < line.size()) {
+        skipOptionalWhitespace(line, &position);
+        if (position == line.size())
+            return false;
+        if (line.at(position) != ';')
+            return false;
+        ++position;
+        skipOptionalWhitespace(line, &position);
+        if (!consumeToken(line, &position))
+            return false;
+        const qsizetype afterName = position;
+        skipOptionalWhitespace(line, &position);
+        if (position == line.size())
+            return position == afterName;
+        if (position < line.size() && line.at(position) == '=') {
+            ++position;
+            skipOptionalWhitespace(line, &position);
+            if (position >= line.size())
+                return false;
+            if (line.at(position) == '"') {
+                if (!consumeQuotedString(line, &position))
+                    return false;
+            } else if (!consumeToken(line, &position)) {
+                return false;
+            }
+            const qsizetype afterValue = position;
+            skipOptionalWhitespace(line, &position);
+            if (position == line.size())
+                return position == afterValue;
+        }
+        if (position < line.size() && line.at(position) != ';')
             return false;
     }
     return true;
+}
+
+bool isApprovedSuccessStatus(Endpoint endpoint, int httpStatus)
+{
+    switch (endpoint) {
+    case Endpoint::ServiceStatus:
+    case Endpoint::CurrentUser:
+        return httpStatus == 200;
+    case Endpoint::Shutdown:
+        return httpStatus == 200 || httpStatus == 204;
+    default:
+        return false;
+    }
 }
 
 bool isDecimal(const QByteArray &value)
@@ -80,20 +214,6 @@ bool isDecimal(const QByteArray &value)
     for (const char byte : value) {
         if (byte < '0' || byte > '9')
             return false;
-    }
-    return true;
-}
-
-bool isHexadecimal(const QByteArray &value)
-{
-    if (value.isEmpty())
-        return false;
-    for (const char byte : value) {
-        if (!((byte >= '0' && byte <= '9')
-              || (byte >= 'a' && byte <= 'f')
-              || (byte >= 'A' && byte <= 'F'))) {
-            return false;
-        }
     }
     return true;
 }
@@ -375,6 +495,7 @@ Xc2RequestId Xc2RestClient::startRequest(Endpoint endpoint)
     pending->endpoint = endpoint;
     pending->socket = new QTcpSocket(this);
     pending->socket->setProxy(QNetworkProxy(QNetworkProxy::NoProxy));
+    pending->socket->setReadBufferSize(kSocketReadBufferBytes);
     pending->totalDeadline = new QTimer(this);
     pending->totalDeadline->setSingleShot(true);
     pending->totalDeadline->setTimerType(Qt::PreciseTimer);
@@ -428,6 +549,7 @@ Xc2RequestId Xc2RestClient::startRequest(Endpoint endpoint)
             return;
         iterator.value()->hasObservedError = true;
         iterator.value()->observedError = socketError;
+        scheduleCompletion(id);
     });
     connect(pending->socket, &QAbstractSocket::disconnected, this,
             [this, id] { scheduleCompletion(id); });
@@ -467,16 +589,30 @@ void Xc2RestClient::readAvailable(Xc2RequestId id)
     const auto iterator = m_pending.find(id);
     if (iterator == m_pending.end() || !iterator.value()->socket)
         return;
-    PendingRequest *pending = iterator.value();
-    const QByteArray bytes = pending->socket->readAll();
-    if (bytes.isEmpty())
-        return;
-    pending->receiveBuffer += bytes;
-    if (m_options.transferTimeoutMs > 0) {
-        pending->inactivityDeadline->start(
-            qMax(1, m_options.transferTimeoutMs));
+    drainAvailable(iterator.value());
+}
+
+void Xc2RestClient::drainAvailable(PendingRequest *pending)
+{
+    while (!pending->protocolFailure && pending->socket
+           && pending->socket->bytesAvailable() > 0) {
+        if (pending->responseComplete) {
+            failProtocol(pending,
+                         QStringLiteral("Bytes follow framed HTTP response"));
+            return;
+        }
+        const QByteArray bytes = pending->socket->read(
+            qMin(kSocketReadChunkBytes,
+                 pending->socket->bytesAvailable()));
+        if (bytes.isEmpty())
+            return;
+        pending->receiveBuffer += bytes;
+        if (m_options.transferTimeoutMs > 0) {
+            pending->inactivityDeadline->start(
+                qMax(1, m_options.transferTimeoutMs));
+        }
+        parseAvailable(pending);
     }
-    parseAvailable(pending);
 }
 
 void Xc2RestClient::parseAvailable(PendingRequest *pending)
@@ -501,10 +637,7 @@ void Xc2RestClient::parseAvailable(PendingRequest *pending)
             if (iterator == m_pending.end())
                 return;
             PendingRequest *record = iterator.value();
-            if (record->socket && record->socket->bytesAvailable() > 0) {
-                record->receiveBuffer += record->socket->readAll();
-                parseAvailable(record);
-            }
+            drainAvailable(record);
             if (record->socket
                 && record->socket->state()
                        != QAbstractSocket::UnconnectedState) {
@@ -642,7 +775,18 @@ void Xc2RestClient::parseAvailable(PendingRequest *pending)
         }
 
         pending->headersParsed = true;
-        if (pending->httpStatus == 204 || pending->httpStatus == 304) {
+        if (pending->httpStatus == 204) {
+            if (!contentLengths.isEmpty() || !transferEncodings.isEmpty()
+                || !pending->receiveBuffer.isEmpty()) {
+                failProtocol(pending,
+                             QStringLiteral("HTTP 204 carried forbidden framing"));
+                return;
+            }
+            pending->bodyMode = PendingRequest::BodyMode::NoBody;
+            finishResponse();
+            return;
+        }
+        if (pending->httpStatus == 304) {
             if (chunked || contentLength > 0
                 || !pending->receiveBuffer.isEmpty()) {
                 failProtocol(pending,
@@ -774,13 +918,13 @@ void Xc2RestClient::parseAvailable(PendingRequest *pending)
                              QStringLiteral("HTTP chunk line exceeds limit"));
                 return;
             }
-            QByteArray sizeText = pending->receiveBuffer.left(lineEnd);
+            const QByteArray chunkLine = pending->receiveBuffer.left(lineEnd);
             pending->receiveBuffer.remove(0, lineEnd + 2);
-            const qsizetype extension = sizeText.indexOf(';');
-            if (extension >= 0)
-                sizeText.truncate(extension);
-            if (!isHexadecimal(sizeText)) {
-                failProtocol(pending, QStringLiteral("Invalid HTTP chunk size"));
+            QByteArray sizeText;
+            if (!parseChunkSizeLine(chunkLine, &sizeText)) {
+                failProtocol(
+                    pending,
+                    QStringLiteral("Invalid HTTP chunk size or extension"));
                 return;
             }
             bool sizeOk = false;
@@ -863,9 +1007,13 @@ void Xc2RestClient::completeOnce(Xc2RequestId id)
     if (pending->completed)
         return;
 
-    if (pending->socket && pending->socket->bytesAvailable() > 0) {
-        pending->receiveBuffer += pending->socket->readAll();
-        parseAvailable(pending);
+    drainAvailable(pending);
+    if (pending->forcedReason == Xc2TransportReason::None
+        && !pending->protocolFailure && !pending->responseComplete
+        && pending->socket
+        && pending->socket->state() != QAbstractSocket::UnconnectedState) {
+        pending->completionScheduled = false;
+        return;
     }
     if (!pending->protocolFailure && pending->headersParsed
         && pending->bodyMode == PendingRequest::BodyMode::CloseDelimited) {
@@ -902,6 +1050,8 @@ void Xc2RestClient::completeOnce(Xc2RequestId id)
     const Xc2TransportReason forcedReason = pending->forcedReason;
     const bool protocolFailure = pending->protocolFailure;
     const bool responseComplete = pending->responseComplete;
+    const bool unapprovedSuccessStatus = httpStatus >= 200 && httpStatus < 300
+        && !isApprovedSuccessStatus(endpoint, httpStatus);
     QString networkMessage = pending->protocolMessage;
     if (networkMessage.isEmpty() && pending->socket)
         networkMessage = pending->socket->errorString();
@@ -969,6 +1119,28 @@ void Xc2RestClient::completeOnce(Xc2RequestId id)
             cleanup();
             emit currentUserFinished(
                 id, result);
+            return;
+        } else {
+            cleanup();
+            emit shutdownFinished(id, error);
+            return;
+        }
+    } else if (unapprovedSuccessStatus) {
+        Xc2Error error = contractError(QStringLiteral(
+            "HTTP success status is not approved for this endpoint"));
+        error.httpStatus = httpStatus;
+        error.rawPayload = rawPayload;
+        error.endpoint = spec.path;
+        if (endpoint == Endpoint::ServiceStatus) {
+            const auto result =
+                Xc2Result<Xc2ServiceStatus>::failure(error);
+            cleanup();
+            emit serviceStatusFinished(id, result);
+            return;
+        } else if (endpoint == Endpoint::CurrentUser) {
+            const auto result = Xc2Result<Xc2CurrentUser>::failure(error);
+            cleanup();
+            emit currentUserFinished(id, result);
             return;
         } else {
             cleanup();
