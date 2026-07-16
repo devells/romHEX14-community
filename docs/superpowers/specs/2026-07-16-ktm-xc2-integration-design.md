@@ -136,8 +136,10 @@ Responsibilities:
 - Hold a stable Windows process HANDLE and exact IPv4 listener PID proof. Before
   a shutdown POST, connect a dedicated no-proxy socket and, before writing any
   byte, prove the server side of that same established four-tuple is owned by the
-  still-live captured process. Otherwise write zero bytes and terminate/kill only
-  the owned process.
+  still-live captured process. Obtain Cookie bytes only through the REST
+  client's exact shutdown-target export; its WebSocket-only export never
+  authorizes shutdown. Otherwise write zero bytes and terminate/kill only the
+  owned process.
 
 The manager will not reuse or select port 8082. That service may be the mock
 backend or an incompatible XC2 instance. A port reservation cannot be handed to
@@ -160,15 +162,36 @@ invalidates the callbacks required to drain output, observe `finished`, reap the
 child, and release the lock. Stop mutates those gates and removes pending request
 IDs before aborting an asynchronous REST reply, so synchronous abort completion
 cannot revive a stale run. Failed cleanup always closes through `Stopped`; a new
-start is rejected until then.
+start is rejected until then. Every accepted start clears the previous run's
+sanitized output rings and pending partials. `recentOutput()` then exposes only
+the active run and retains that just-finished run while `Stopped`, until the next
+accepted start. An accepted run that never starts a child reports its sole
+terminal result as `stopped(-1, QProcess::CrashExit)` after cleanup and lock
+release.
 
 Manager destruction transfers the complete process/HANDLE/job/lock context to an
-application-lifetime asynchronous reaper and never waits on the UI thread. Every
-owned child also belongs to a Windows Job Object with
-`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so application exit kills the child tree
-even when no further Qt events can run. The lock is not deliberately released
-before normal child completion; crash leftovers are recovered as dead-owner
-stale locks on the next application start.
+application-lifetime asynchronous reaper and never waits, calls `processEvents`,
+or enters a nested event loop on the UI thread. For coordinated normal Quit, one
+application event filter consumes the first and repeated `QEvent::Quit` events
+idempotently and starts the bounded asynchronous terminate-then-kill sequence.
+The helper process and `QLockFile` stay live until `QProcess` is NotRunning, the
+stable child HANDLE is signaled, and output is finalized; only then does the
+reaper release the lock and repost exactly one Quit event.
+
+The same fully qualified `Xc2BackendManagerTestAccess` friend may be defined
+independently in `test_Xc2BackendManager.cpp` and
+`xc2_manager_exit_helper.cpp`, which are separate test executables. The helper
+uses that private seam to launch the real manager with the fake sidecar,
+publishes its PID and lock path, destroys the manager to transfer the live
+context into the real reaper, and then requests quit. It does not copy launch,
+Job, lock, or reaping logic.
+
+Every owned child also belongs to a Windows Job Object with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. A forced `QCoreApplication::exit`, owner
+crash, or OS termination promises only Job Object child-tree containment when
+no further Qt events can run. There is no strict lock-release ordering after the
+owner is dead; crash leftovers are recoverable dead-owner stale locks. Preserving
+such ordering would require an external guardian process and is outside scope.
 
 ### 6.2 `Xc2RestClient`
 
@@ -186,15 +209,22 @@ canonicalizes `127.1` and integer/octal IPv4 aliases to `127.0.0.1` and decodes
 unreserved escapes such as `%78` and `%2e`. The client strictly parses the raw
 scheme, authority, canonical explicit port, and exact `/xc2/1.0[/]` path before
 constructing internal canonical REST and WebSocket URLs. A rebase is rejected
-while any socket is pending; a successful cross-authority rebase clears the
-dedicated cookie jar. Cookie export accepts encoded bytes only when they equal
-the derived WebSocket URL's fully encoded bytes exactly.
+while any socket is pending and preserves the current authority and cookie jar;
+a successful cross-authority rebase clears that jar. Two narrow cookie exports
+accept encoded bytes only when they equal their internally derived target's
+fully encoded bytes exactly: `cookieHeaderFor()` is WebSocket-only, while
+`shutdownCookieHeaderFor()` is bound to the shutdown REST endpoint. There is no
+generic URL cookie-export surface.
 
 Requests carry an explicit-port `Host` header with IPv6 brackets when needed,
 `Connection: close`, `Accept-Encoding: identity`, and manually selected REST
 cookies. The client owns a dedicated `QNetworkCookieJar` and manually installs
 every separate `Set-Cookie` only after a syntactically complete response, then
-uses the same jar for later REST Cookie headers and WebSocket export.
+uses the same jar for later REST Cookie headers and the two target-bound exports.
+For shutdown, default-path cookies set by service-status responses, cookies with
+`Path=/xc2/1.0`, and root cookies match; cookies scoped only to
+`/xc2-websocket` do not. A protocol-failed response installs no cookie visible
+through either export.
 
 An incremental bounded HTTP/1.1 parser handles fragmented headers,
 `Content-Length`, chunked bodies plus trailers, 204/no-body, and

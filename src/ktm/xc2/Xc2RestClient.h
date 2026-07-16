@@ -37,6 +37,8 @@ public:
     Xc2RequestId requestShutdown();
     Xc2Result<QByteArray> cookieHeaderFor(
         const QByteArray &encodedUrl) const;
+    Xc2Result<QByteArray> shutdownCookieHeaderFor(
+        const QByteArray &encodedShutdownUrl) const;
     void abort(Xc2RequestId id);
 
 signals:

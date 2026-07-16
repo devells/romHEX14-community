@@ -967,8 +967,9 @@ rtk git commit -m "feat: validate external XC2 installation"
 - Consumes: Task 1 endpoint specs and Task 2 strict codecs/models.
 - Produces: `Xc2TransportReason`, `Xc2RequestId`,
   `Xc2RestClient::requestServiceStatus/requestCurrentUser/requestShutdown`,
-  reply signals, raw-byte `setBaseUrl`, authority-bound
-  `webSocketUrl`/`cookieHeaderFor`, and `abort`.
+  reply signals, raw-byte `setBaseUrl`, exact authority/path-bound
+  `webSocketUrl`/`cookieHeaderFor`, exact shutdown-REST
+  `shutdownCookieHeaderFor`, and `abort`.
 
 **Evidence-locked transport constraints:**
 
@@ -1017,6 +1018,8 @@ void acceptsIpv4Ipv6AndLocalhostBases();
 void rejectsUnsafeOrAliasedBases_data();
 void rejectsUnsafeOrAliasedBases();
 void cookieExportRequiresDerivedWebSocketAuthority();
+void shutdownCookieExportRequiresExactRestTarget();
+void shutdownCookieExportUsesRestPathScope();
 void successfulCrossAuthorityRebaseClearsCookieJar();
 void rebaseWhilePendingFailsAndPreservesAuthorityAndCookies();
 ```
@@ -1062,6 +1065,19 @@ matching. Reject wrong/missing port, host aliases, alternate case or encoding,
 spelling. This exact comparison is mandatory because cookie matching itself is
 not port-scoped. Join only the dedicated jar's returned cookies with
 `QNetworkCookie::NameAndValueOnly`.
+
+The shutdown export is a separate, equally exact API. Before configuration it
+fails with `Contract`; afterwards its supplied `QByteArray` must equal the
+internally derived
+`http://<same validated host>:<same explicit port>/xc2/1.0/serviceStatus/shutdown`
+target's `QUrl::toEncoded(QUrl::FullyEncoded)` bytes. Reject the WebSocket URL,
+REST base, wrong scheme/host/port/path, user info, query, fragment, alternate
+encoding, and every semantically equivalent but non-identical spelling. Match
+cookies against that exact REST shutdown URL so default-path cookies from the
+service-status route plus `Path=/xc2/1.0` and `Path=/` are exported, while
+`Path=/xc2-websocket` is excluded. Conversely the WebSocket export includes
+only cookies matching `/xc2-websocket`. There is no generic URL cookie-export
+API and neither exact export may be retargeted to the other's path.
 
 Once any request is pending, every `setBaseUrl()` call fails with `Contract` and
 leaves `baseUrl()`, `webSocketUrl()`, and all cookies unchanged. A successful
@@ -1140,7 +1156,8 @@ body framing or bytes fails.
 Only a syntactically complete response may mutate the cookie jar. Iterate every
 `Set-Cookie` field separately, parse it with `QNetworkCookie`, and install it
 against the canonical endpoint URL. A timeout, cancel, truncation, malformed
-response, or over-limit response installs no cookies.
+response, or over-limit response installs no cookies visible through either
+the WebSocket or exact shutdown-REST export.
 
 - [ ] **Step 5: Write failing deadline, exactly-once, and response-matrix tests**
 
@@ -1225,6 +1242,8 @@ public:
     Xc2RequestId requestShutdown();
     Xc2Result<QByteArray> cookieHeaderFor(
         const QByteArray &encodedWsUrl) const;
+    Xc2Result<QByteArray> shutdownCookieHeaderFor(
+        const QByteArray &encodedShutdownUrl) const;
     void abort(Xc2RequestId id);
 
 signals:
@@ -1245,8 +1264,10 @@ Implement the raw validation and rebase transaction from Step 2 before creating
 the canonical internal `QUrl` values. The client owns one dedicated
 `QNetworkCookieJar`; there is no constructor or setter for an external jar. It
 uses the jar manually for matching REST request cookies, installing every
-complete-response `Set-Cookie`, and exporting the exact derived WebSocket
-Cookie. It does not own or instantiate a `QNetworkAccessManager`.
+complete-response `Set-Cookie`, exporting the exact derived WebSocket Cookie,
+and separately exporting cookies for only the exact derived shutdown REST
+target. It does not own or instantiate a `QNetworkAccessManager`, and exposes
+no generic cookie-export URL.
 
 - [ ] **Step 8: Implement one-shot sockets, the incremental parser, and one completion path**
 
@@ -1548,16 +1569,17 @@ Connection: close
 
 ```
 
-An optional Cookie header may contain only the current attempt's authority-bound
-Task 5 cookie export. Resolve it once from the current attempt before connecting
-by passing the manager-generated canonical
+An optional Cookie header may contain only the current attempt's exact
+shutdown-REST Task 5 cookie export. Resolve it once from the current attempt
+before connecting by passing the manager-generated canonical
 `http://127.0.0.1:<selected>/xc2/1.0/serviceStatus/shutdown` target's
 `QUrl::toEncoded(QUrl::FullyEncoded)` bytes to
-`cookieHeaderFor(const QByteArray &)`: a failed export writes zero bytes, an
-empty success omits the header, and a non-empty success adds exactly one
-`Cookie:` header. Cookie bytes are never logged. A proof failure, socket error,
-timeout, duplicate row, closed listener, signaled HANDLE, or handoff writes zero
-bytes and falls directly to terminate then kill of the owned HANDLE/QProcess. A
+`shutdownCookieHeaderFor(const QByteArray &)`: a failed export writes zero
+bytes, an empty success omits the header, and a non-empty success adds exactly
+one `Cookie:` header. The WebSocket-only `cookieHeaderFor()` is never used for
+shutdown. Cookie bytes are never logged. A proof failure, socket error, timeout,
+duplicate row, closed listener, signaled HANDLE, or handoff writes zero bytes
+and falls directly to terminate then kill of the owned HANDLE/QProcess. A
 partial or failed write is never retried. The fake event logs prove the normal
 path receives one exact empty-form POST and every decoy/handoff path receives
 zero bytes.
@@ -1576,7 +1598,8 @@ void stopDuringStartNeverEmitsReady();
 void repeatedStartIsRejectedWithoutDisturbingCurrentRun();
 void stopIsIdempotentAndRestartWaitsForStopped();
 void destroyRunningManagerReapsWithoutUiThreadWait();
-void applicationExitJobObjectKillsChildWithoutEarlyUnlock();
+void coordinatedQuitReapsChildBeforeUnlockAndExit();
+void forcedApplicationExitJobObjectContainsChildTree();
 void stdoutAndStderrUseIndependentFragmentBuffers();
 void outputLinesAndRingsAreBounded();
 void outputControlsAndSensitiveFieldsAreRemoved();
@@ -1640,19 +1663,37 @@ spawning, or emitting that run's `failed`. Invalid input, busy lock, inspection
 failure, early crash, collision exhaustion, and shutdown failure enter `Failed`
 only while cleanup is outstanding, emit one run failure, and always transition
 to `Stopped` after NotRunning/HANDLE signal and lock release. `stop()` is
-idempotent in every state and never issues a second shutdown write.
+idempotent in every state and never issues a second shutdown write. Every
+accepted start clears both sanitized output rings and their pending partials;
+while a run is active `recentOutput()` exposes only that run, and after cleanup
+reaches `Stopped` it retains the just-finished run until the next accepted
+start. If an accepted run never starts a child, its single terminal signal is
+`stopped(-1, QProcess::CrashExit)` after cleanup and lock release.
 
 Deleting a running manager transfers the complete process/HANDLE/job/lock
 context to an application-lifetime reaper without waiting or running a nested
-event loop. The reaper performs asynchronous terminate/kill and releases the
-lock only after NotRunning. In addition, every successfully started child is
-assigned, before network authorization, to a Windows Job Object configured with
+event loop. While it owns a live child, that reaper installs one application
+`QEvent::Quit` filter. The first and repeated Quit events are consumed
+idempotently, trigger the same bounded asynchronous terminate-then-kill path,
+and leave the helper process and `QLockFile` alive. Only after `QProcess` is
+NotRunning, the stable HANDLE is signaled, and output is finalized may the
+reaper release the lock and repost exactly one Quit event. The exit helper uses
+its test-binary-local friend to start the real manager with the private fake,
+publishes PID/lock path, destroys the manager to transfer the live ownership
+context to the real reaper, and then requests quit; it never copies manager
+ownership logic. The parent proves helper and lock remain live until the child
+HANDLE signals, then observes unlock and helper exit.
+
+Separately, every successfully started child is assigned before network
+authorization to a Windows Job Object configured with
 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; job creation/configuration/assignment
-failure is fatal. OS handle closure then kills the child even when the Qt event
-loop is already exiting. `xc2_manager_exit_helper` starts a fake, publishes its
-PID/lock path, and exits immediately; the parent test retains the process HANDLE
-and proves the child dies and the lock is not reusable while that child remains
-live.
+failure is fatal. A forced `QCoreApplication::exit`, process crash, or OS
+termination may prevent further Qt cleanup, so only Job Object child-tree
+containment is promised there. No claim is made that a dead owner process's
+`QLockFile` remains unrecoverable until the asynchronously terminated child
+HANDLE signals; crash leftovers are dead-owner stale locks. Strict lock
+retention across forced owner death would require an external guardian process
+and is outside this scope.
 
 - [ ] **Step 5: Run the manager target to verify red behavior**
 
@@ -1715,11 +1756,15 @@ Q_DECLARE_METATYPE(ktm::xc2::Xc2BackendEndpoints)
 ```
 
 `PrivateLaunchPlan` and the pure production argv builder are private. Only the
-friend class defined in `test_Xc2BackendManager.cpp` can construct a fake
-program, bind-address row, lock override, timeout, environment observer, or
-candidate sequence. `startProduction()` validates non-empty absolute input,
-performs fresh production inspection, and immediately copies only that
-inspection's verified paths into the private run; it never accepts Task 4 DTOs.
+test-binary-local fully-qualified friend class defined independently in
+`test_Xc2BackendManager.cpp` and `xc2_manager_exit_helper.cpp` can construct a
+fake program, bind-address row, lock override, timeout, environment observer,
+or candidate sequence. The two definitions live in separate test executables;
+the helper uses that seam to exercise the real manager and never reimplements
+launch, Job, lock, or reaping logic. `startProduction()` validates non-empty
+absolute input, performs fresh production inspection, and immediately copies
+only that inspection's verified paths into the private run; it never accepts
+Task 4 DTOs.
 Validate positive bounded startup/shutdown timeouts, `maxPortAttempts` in
 `1..3`, an absolute existing working directory, direct executable/JAR paths,
 absolute test lock paths, exact IPv4 bind address, non-empty callback, and
@@ -1772,13 +1817,21 @@ releases the lock, emits one `stopped`, and transitions to `Stopped`. Old
 callbacks may finish their own context but cannot observe or mutate a later
 run.
 
-The destructor never calls `waitForStarted`, `waitForFinished`, or a nested
-event loop. It disconnects manager-facing callbacks and transfers the entire
-attempt plus lock to the application-lifetime reaper, which performs the same
-asynchronous terminate/kill/NotRunning sequence. The Job Object is the final OS
-guarantee when the application event loop or reaper is itself exiting: closing
-its last handle kills the associated child tree. No path destroys `QLockFile`
-while its captured child HANDLE remains unsignaled.
+The destructor never calls `waitForStarted`, `waitForFinished`, `processEvents`,
+or a nested event loop. It disconnects manager-facing callbacks and transfers
+the entire attempt plus lock to the application-lifetime reaper, which performs
+the same bounded asynchronous terminate/kill/NotRunning sequence. During
+coordinated normal Quit, the reaper's application event filter consumes first
+and repeated Quit events idempotently, keeps the helper and lock alive until
+NotRunning, stable-HANDLE signal, and output finalization, then releases the
+lock and reposts exactly one Quit. The helper's independently declared
+`Xc2BackendManagerTestAccess` friend starts the real manager through its private
+fake seam, publishes the proof data, destroys the manager to exercise the real
+reaper transfer, and then requests quit; it contains no copied launch, Job,
+lock, or cleanup logic. Forced application exit, owner crash, and OS termination
+rely only on `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` child-tree containment. They
+make no strict post-owner lock-ordering promise; an external guardian would be
+required and is outside scope.
 
 - [ ] **Step 8: Run manager and all KTM tests**
 
@@ -1792,10 +1845,12 @@ IPv4 listener PID, strict health, and non-blank current user; empty permissions
 are retained without authorizing operations. Fresh production provenance,
 unique dynamic-port overrides, sanitized environment, injected candidate
 collisions, long-lived/stale locks, run/attempt stale-callback suppression,
-same-socket shutdown proof, output bounds/redaction, normal destruction, and
-outer application exit all pass with every captured child HANDLE signaled. The
-valid 8082 decoy, handoff decoy, and port-steal traps remain alive until their
-test-owned cleanup and record zero unauthorized shutdown bytes.
+same-socket shutdown proof, output bounds/redaction, and normal destruction all
+pass with every captured child HANDLE signaled. Coordinated Quit proves the
+child signal precedes unlock and helper exit; forced application exit proves
+Job Object containment only. The valid 8082 decoy, handoff decoy, and port-steal
+traps remain alive until their test-owned cleanup and record zero unauthorized
+shutdown bytes.
 
 - [ ] **Step 9: Commit the owned manager**
 

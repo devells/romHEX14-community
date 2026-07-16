@@ -37,6 +37,26 @@ QByteArray encodedBase(const FakeHttpServer &server,
     return numericBase(server, host).toEncoded(QUrl::FullyEncoded);
 }
 
+QByteArray encodedShutdownTarget(
+    const FakeHttpServer &server,
+    const QString &host = QStringLiteral("127.0.0.1"))
+{
+    QUrl result = numericBase(server, host);
+    result.setPath(QStringLiteral(
+        "/xc2/1.0/serviceStatus/shutdown"));
+    return result.toEncoded(QUrl::FullyEncoded);
+}
+
+QList<QByteArray> cookiePairs(const QByteArray &header)
+{
+    QList<QByteArray> result;
+    for (const QByteArray &pair : header.split(';')) {
+        if (!pair.trimmed().isEmpty())
+            result.append(pair.trimmed());
+    }
+    return result;
+}
+
 QUrl trapUrl(const FakeHttpServer &server)
 {
     QUrl result = numericBase(server);
@@ -489,6 +509,112 @@ private slots:
         }
     }
 
+    void shutdownCookieExportRequiresExactRestTarget()
+    {
+        Xc2RestClient unconfigured;
+        const auto beforeBase = unconfigured.shutdownCookieHeaderFor(
+            QByteArrayLiteral(
+                "http://127.0.0.1:49123/xc2/1.0/serviceStatus/shutdown"));
+        QVERIFY(!beforeBase.ok());
+        QCOMPARE(beforeBase.error.category, Xc2ErrorCategory::Contract);
+
+        FakeHttpServer server(QHostAddress::LocalHost);
+        QVERIFY(server.isListening());
+        Xc2RestClient client;
+        QVERIFY(client.setBaseUrl(encodedBase(server)));
+
+        const QByteArray exact = encodedShutdownTarget(server);
+        const auto good = client.shutdownCookieHeaderFor(exact);
+        QVERIFY2(good.ok(), qPrintable(good.error.message));
+        QVERIFY(good.value->isEmpty());
+
+        const quint16 wrongPort = server.port() == 65535
+            ? server.port() - 1 : server.port() + 1;
+        const QByteArray authority = QByteArrayLiteral("127.0.0.1:")
+            + QByteArray::number(server.port());
+        const QList<QByteArray> invalid = {
+            client.webSocketUrl().toEncoded(QUrl::FullyEncoded),
+            client.baseUrl().toEncoded(QUrl::FullyEncoded),
+            QByteArrayLiteral("https://") + authority
+                + QByteArrayLiteral(
+                    "/xc2/1.0/serviceStatus/shutdown"),
+            QByteArrayLiteral("http://localhost:")
+                + QByteArray::number(server.port())
+                + QByteArrayLiteral(
+                    "/xc2/1.0/serviceStatus/shutdown"),
+            QByteArrayLiteral("http://127.0.0.1:")
+                + QByteArray::number(wrongPort)
+                + QByteArrayLiteral(
+                    "/xc2/1.0/serviceStatus/shutdown"),
+            QByteArrayLiteral("http://") + authority
+                + QByteArrayLiteral(
+                    "/xc2/1.0/serviceStatus/status"),
+            exact + QByteArrayLiteral("/"),
+            exact + QByteArrayLiteral("?query=1"),
+            exact + QByteArrayLiteral("#fragment"),
+            QByteArrayLiteral("http://user@") + authority
+                + QByteArrayLiteral(
+                    "/xc2/1.0/serviceStatus/shutdown"),
+            QByteArrayLiteral("http://") + authority
+                + QByteArrayLiteral(
+                    "/xc2/1.0/%73erviceStatus/shutdown"),
+        };
+        for (const QByteArray &candidate : invalid) {
+            const auto bad = client.shutdownCookieHeaderFor(candidate);
+            QVERIFY2(!bad.ok(), candidate.constData());
+            QCOMPARE(bad.error.category, Xc2ErrorCategory::Contract);
+        }
+    }
+
+    void shutdownCookieExportUsesRestPathScope()
+    {
+        FakeHttpServer server(QHostAddress::LocalHost);
+        QVERIFY(server.isListening());
+        server.enqueueResponse(FakeHttpServer::complete(
+            200, QByteArrayLiteral("alive"),
+            {{QByteArrayLiteral("Set-Cookie"),
+              QByteArrayLiteral("defaulted=one")},
+             {QByteArrayLiteral("Set-Cookie"),
+              QByteArrayLiteral("context=two; Path=/xc2/1.0")},
+             {QByteArrayLiteral("Set-Cookie"),
+              QByteArrayLiteral("root=three; Path=/")},
+             {QByteArrayLiteral("Set-Cookie"),
+              QByteArrayLiteral(
+                  "websocket=four; Path=/xc2-websocket")}}));
+
+        Xc2RestClient client({500, 250});
+        QVERIFY(client.setBaseUrl(encodedBase(server)));
+        QSignalSpy finished(&client, &Xc2RestClient::serviceStatusFinished);
+        client.requestServiceStatus();
+        QVERIFY(finished.wait(kSignalWaitMs));
+        const auto status = qvariant_cast<Xc2Result<Xc2ServiceStatus>>(
+            finished.takeFirst().at(1));
+        QVERIFY2(status.ok(), qPrintable(status.error.message));
+
+        const auto shutdown = client.shutdownCookieHeaderFor(
+            encodedShutdownTarget(server));
+        QVERIFY2(shutdown.ok(), qPrintable(shutdown.error.message));
+        const QList<QByteArray> shutdownPairs = cookiePairs(*shutdown.value);
+        QCOMPARE(shutdownPairs.size(), 3);
+        QVERIFY(shutdownPairs.contains(QByteArrayLiteral("defaulted=one")));
+        QVERIFY(shutdownPairs.contains(QByteArrayLiteral("context=two")));
+        QVERIFY(shutdownPairs.contains(QByteArrayLiteral("root=three")));
+        QVERIFY(!shutdownPairs.contains(
+            QByteArrayLiteral("websocket=four")));
+
+        const auto websocket = client.cookieHeaderFor(
+            client.webSocketUrl().toEncoded(QUrl::FullyEncoded));
+        QVERIFY2(websocket.ok(), qPrintable(websocket.error.message));
+        const QList<QByteArray> websocketPairs = cookiePairs(*websocket.value);
+        QCOMPARE(websocketPairs.size(), 2);
+        QVERIFY(websocketPairs.contains(QByteArrayLiteral("root=three")));
+        QVERIFY(websocketPairs.contains(
+            QByteArrayLiteral("websocket=four")));
+        QVERIFY(!websocketPairs.contains(
+            QByteArrayLiteral("defaulted=one")));
+        QVERIFY(!websocketPairs.contains(QByteArrayLiteral("context=two")));
+    }
+
     void successfulCrossAuthorityRebaseClearsCookieJar()
     {
         FakeHttpServer firstAuthority(QHostAddress::LocalHost);
@@ -511,6 +637,13 @@ private slots:
         QVERIFY(before.ok());
         QCOMPARE(*before.value,
                  QByteArrayLiteral("session=authority-one"));
+        const QByteArray firstShutdown =
+            encodedShutdownTarget(firstAuthority);
+        const auto shutdownBefore =
+            client.shutdownCookieHeaderFor(firstShutdown);
+        QVERIFY(shutdownBefore.ok());
+        QCOMPARE(*shutdownBefore.value,
+                 QByteArrayLiteral("session=authority-one"));
 
         QVERIFY(client.setBaseUrl(encodedBase(secondAuthority)));
         const QByteArray secondWebSocket =
@@ -522,6 +655,16 @@ private slots:
         const auto oldAuthority = client.cookieHeaderFor(firstWebSocket);
         QVERIFY(!oldAuthority.ok());
         QCOMPARE(oldAuthority.error.category, Xc2ErrorCategory::Contract);
+        const QByteArray secondShutdown =
+            encodedShutdownTarget(secondAuthority);
+        const auto shutdownAfter =
+            client.shutdownCookieHeaderFor(secondShutdown);
+        QVERIFY(shutdownAfter.ok());
+        QVERIFY(shutdownAfter.value->isEmpty());
+        const auto oldShutdown =
+            client.shutdownCookieHeaderFor(firstShutdown);
+        QVERIFY(!oldShutdown.ok());
+        QCOMPARE(oldShutdown.error.category, Xc2ErrorCategory::Contract);
     }
 
     void rebaseWhilePendingFailsAndPreservesAuthorityAndCookies()
@@ -553,6 +696,11 @@ private slots:
         const auto cookieBefore = client.cookieHeaderFor(websocketBytes);
         QVERIFY(cookieBefore.ok());
         QCOMPARE(*cookieBefore.value, QByteArrayLiteral("session=stable"));
+        const QByteArray shutdownBytes = encodedShutdownTarget(origin);
+        const auto shutdownBefore =
+            client.shutdownCookieHeaderFor(shutdownBytes);
+        QVERIFY(shutdownBefore.ok());
+        QCOMPARE(*shutdownBefore.value, QByteArrayLiteral("session=stable"));
 
         QSignalSpy captured(&origin, &FakeHttpServer::requestCaptured);
         QSignalSpy pendingFinished(
@@ -569,6 +717,10 @@ private slots:
         const auto cookieAfter = client.cookieHeaderFor(websocketBytes);
         QVERIFY(cookieAfter.ok());
         QCOMPARE(*cookieAfter.value, QByteArrayLiteral("session=stable"));
+        const auto shutdownAfter =
+            client.shutdownCookieHeaderFor(shutdownBytes);
+        QVERIFY(shutdownAfter.ok());
+        QCOMPARE(*shutdownAfter.value, QByteArrayLiteral("session=stable"));
         QCOMPARE(otherAuthority.requestCount(), 0);
 
         client.abort(pendingId);
@@ -744,6 +896,10 @@ private slots:
             client.webSocketUrl().toEncoded(QUrl::FullyEncoded));
         QVERIFY(cookies.ok());
         QVERIFY(cookies.value->isEmpty());
+        const auto shutdownCookies = client.shutdownCookieHeaderFor(
+            encodedShutdownTarget(server));
+        QVERIFY(shutdownCookies.ok());
+        QVERIFY(shutdownCookies.value->isEmpty());
         QCOMPARE(server.requestCount(), 1);
     }
 

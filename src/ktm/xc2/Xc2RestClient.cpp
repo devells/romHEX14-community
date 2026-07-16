@@ -469,6 +469,27 @@ Xc2Result<QByteArray> Xc2RestClient::cookieHeaderFor(
         cookieHeader(m_cookieJar, m_webSocketUrl));
 }
 
+Xc2Result<QByteArray> Xc2RestClient::shutdownCookieHeaderFor(
+    const QByteArray &encodedShutdownUrl) const
+{
+    const auto fail = [](const QString &message) {
+        return Xc2Result<QByteArray>::failure(contractError(message));
+    };
+
+    if (m_baseUrl.isEmpty())
+        return fail(QStringLiteral("REST base has not been configured"));
+    const QUrl shutdownUrl = endpointUrl(Endpoint::Shutdown);
+    const QByteArray canonical =
+        shutdownUrl.toEncoded(QUrl::FullyEncoded);
+    if (encodedShutdownUrl != canonical) {
+        return fail(QStringLiteral(
+            "Cookie export URL must equal the derived shutdown URL"));
+    }
+
+    return Xc2Result<QByteArray>::success(
+        cookieHeader(m_cookieJar, shutdownUrl));
+}
+
 void Xc2RestClient::abort(Xc2RequestId id)
 {
     forceStop(id, Xc2TransportReason::Canceled);
