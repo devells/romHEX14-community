@@ -74,6 +74,8 @@ if(RX14_KTM_XC2)
         src/ktm/xc2/Xc2JsonCodec.h
         src/ktm/xc2/Xc2Models.cpp
         src/ktm/xc2/Xc2Models.h
+        src/ktm/xc2/Xc2RestClient.cpp
+        src/ktm/xc2/Xc2RestClient.h
         src/ktm/xc2/Xc2StompCodec.cpp
         src/ktm/xc2/Xc2StompCodec.h
         src/ktm/xc2/Xc2Settings.cpp
@@ -84,7 +86,7 @@ if(RX14_KTM_XC2)
     target_include_directories(rx14_ktm_xc2 PUBLIC
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
     )
-    target_link_libraries(rx14_ktm_xc2 PUBLIC Qt6::Core)
+    target_link_libraries(rx14_ktm_xc2 PUBLIC Qt6::Core Qt6::Network)
 endif()
 
 # ── BLAKE3 (portable C, no SIMD) ────────────────────────────────────────────
@@ -602,6 +604,22 @@ if(BUILD_TESTING AND RX14_KTM_XC2)
     )
     add_test(NAME xc2_installation COMMAND test_Xc2InstallationProbe)
     set_tests_properties(xc2_installation PROPERTIES LABELS "unit;ktm")
+
+    add_executable(test_Xc2RestClient
+        tests/ktm/FakeHttpServer.cpp
+        tests/ktm/FakeHttpServer.h
+        tests/ktm/test_Xc2RestClient.cpp
+    )
+    target_link_libraries(test_Xc2RestClient PRIVATE
+        rx14_ktm_xc2
+        Qt6::Network
+        Qt6::Test
+    )
+    add_test(NAME xc2_rest_client COMMAND test_Xc2RestClient)
+    set_tests_properties(xc2_rest_client PROPERTIES
+        LABELS "loopback;unit;ktm"
+        TIMEOUT 60
+    )
 endif()
 
 # ── Map auto-detect corpus harness (issue #25) ─────────────────────────────

@@ -25,8 +25,11 @@ enum class Xc2ErrorCategory {
     Transport
 };
 
+enum class Xc2TransportReason { None, Canceled, Timeout, Network };
+
 struct Xc2Error {
     Xc2ErrorCategory category = Xc2ErrorCategory::None;
+    Xc2TransportReason transportReason = Xc2TransportReason::None;
     QString message;
     int httpStatus = 0;
     int xc2Status = 0;
@@ -102,6 +105,7 @@ struct Xc2JobProgress {
 } // namespace ktm::xc2
 
 Q_DECLARE_METATYPE(ktm::xc2::Xc2Error)
+Q_DECLARE_METATYPE(ktm::xc2::Xc2TransportReason)
 Q_DECLARE_METATYPE(ktm::xc2::Xc2ServiceStatus)
 Q_DECLARE_METATYPE(ktm::xc2::Xc2CurrentUser)
 Q_DECLARE_METATYPE(ktm::xc2::Xc2JobAccepted)
