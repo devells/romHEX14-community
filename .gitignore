@@ -4,6 +4,7 @@ resources/*.dll
 # Build output
 build/
 build-*/
+.worktrees/
 dist/
 *.obj
 *.o
