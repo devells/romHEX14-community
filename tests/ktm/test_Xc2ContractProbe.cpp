@@ -20,6 +20,7 @@
 namespace {
 
 constexpr int kDefaultProbeTimeoutMs = 2000;
+constexpr int kWrapperProbeTimeoutMs = 7000;
 constexpr int kProcessWallBoundMs = 8000;
 constexpr int kCleanupBoundMs = 1500;
 const QByteArray kCookie =
@@ -386,6 +387,221 @@ QList<QByteArray> expectedServerCommands(
     }
 }
 
+bool isOverallDeadlineScript(
+    FakeXc2TransportServer::ProbeScript script)
+{
+    using Script = FakeXc2TransportServer::ProbeScript;
+    switch (script) {
+    case Script::HealthNoResponse:
+    case Script::CurrentUserNoResponse:
+    case Script::UpgradeNoResponse:
+    case Script::MissingConnected:
+    case Script::MissingDisconnectReceipt:
+    case Script::LateDisconnectReceipt:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool waitForExpectedClientMilestones(
+    FakeXc2TransportServer &server,
+    FakeXc2TransportServer::ProbeScript script)
+{
+    const ProbeMilestones expected = expectedMilestones(script);
+    const auto observed = [&server, &expected] {
+        return server.capturedRestRequests().size()
+                >= expected.restRequests
+            && server.upgradeRequests().size() >= expected.upgrades
+            && server.webSocketConnectionCount()
+                >= expected.webSocketConnections
+            && server.stompFrames().size() >= expected.clientStompFrames;
+    };
+    if (observed())
+        return true;
+
+    QEventLoop loop;
+    QTimer deadline;
+    deadline.setSingleShot(true);
+    deadline.setTimerType(Qt::PreciseTimer);
+    const auto checkObserved = [&observed, &loop] {
+        if (observed())
+            loop.quit();
+    };
+    QObject::connect(&server,
+                     &FakeXc2TransportServer::restRequestCaptured,
+                     &loop, checkObserved);
+    QObject::connect(&server,
+                     &FakeXc2TransportServer::upgradeRequestCaptured,
+                     &loop, checkObserved);
+    QObject::connect(&server,
+                     &FakeXc2TransportServer::webSocketConnected,
+                     &loop, checkObserved);
+    QObject::connect(&server,
+                     &FakeXc2TransportServer::stompFrameReceived,
+                     &loop, checkObserved);
+    QObject::connect(&deadline, &QTimer::timeout,
+                     &loop, &QEventLoop::quit);
+    if (observed())
+        return true;
+    deadline.start(kCleanupBoundMs);
+    loop.exec();
+    return observed();
+}
+
+QByteArray expectedDiagnostic(
+    FakeXc2TransportServer::ProbeScript script)
+{
+    using Script = FakeXc2TransportServer::ProbeScript;
+    switch (script) {
+    case Script::HealthNoResponse:
+        return QByteArrayLiteral(
+            "xc2-contract-probe stage=health category=transport http=0 "
+            "xc2=0 summary=overall-deadline");
+    case Script::HealthTruncated:
+        return QByteArrayLiteral(
+            "xc2-contract-probe stage=health category=transport http=200 "
+            "xc2=0 summary=backend-unavailable");
+    case Script::Health204:
+        return QByteArrayLiteral(
+            "xc2-contract-probe stage=health category=contract http=204 "
+            "xc2=0 summary=contract-failure");
+    case Script::HealthMalformedSuccess:
+        return QByteArrayLiteral(
+            "xc2-contract-probe stage=health category=contract http=200 "
+            "xc2=0 summary=contract-failure");
+    case Script::HealthBackendUnavailable:
+        return QByteArrayLiteral(
+            "xc2-contract-probe stage=health category=backend http=503 "
+            "xc2=7319 summary=backend-unavailable");
+    case Script::HealthAuth401:
+        return QByteArrayLiteral(
+            "xc2-contract-probe stage=health category=backend http=401 "
+            "xc2=7319 summary=backend-unavailable");
+    case Script::HealthMalformedError:
+        return QByteArrayLiteral(
+            "xc2-contract-probe stage=health category=contract http=503 "
+            "xc2=0 summary=contract-failure");
+    case Script::CurrentUserNoResponse:
+        return QByteArrayLiteral(
+            "xc2-contract-probe stage=current-user category=transport http=0 "
+            "xc2=0 summary=overall-deadline");
+    case Script::CurrentUserTruncated:
+        return QByteArrayLiteral(
+            "xc2-contract-probe stage=current-user category=transport "
+            "http=200 xc2=0 summary=backend-unavailable");
+    case Script::CurrentUser204:
+        return QByteArrayLiteral(
+            "xc2-contract-probe stage=current-user category=contract http=204 "
+            "xc2=0 summary=not-authenticated");
+    case Script::CurrentUserMalformedSuccess:
+        return QByteArrayLiteral(
+            "xc2-contract-probe stage=current-user category=contract http=200 "
+            "xc2=0 summary=contract-failure");
+    case Script::CurrentUserBackendUnavailable:
+        return QByteArrayLiteral(
+            "xc2-contract-probe stage=current-user category=backend http=503 "
+            "xc2=7319 summary=backend-unavailable");
+    case Script::CurrentUserAuth401:
+        return QByteArrayLiteral(
+            "xc2-contract-probe stage=current-user category=backend http=401 "
+            "xc2=7319 summary=not-authenticated");
+    case Script::CurrentUserAuth403:
+        return QByteArrayLiteral(
+            "xc2-contract-probe stage=current-user category=backend http=403 "
+            "xc2=7319 summary=not-authenticated");
+    case Script::CurrentUserMalformedAuthError:
+        return QByteArrayLiteral(
+            "xc2-contract-probe stage=current-user category=contract http=401 "
+            "xc2=0 summary=contract-failure");
+    case Script::CurrentUserMissingPermission:
+    case Script::CurrentUserCaseMismatchedPermission:
+        return QByteArrayLiteral(
+            "xc2-contract-probe stage=permission category=session http=200 "
+            "xc2=0 summary=permission-missing");
+    case Script::CurrentUserBlankLogin:
+    case Script::CurrentUserBlankName:
+        return QByteArrayLiteral(
+            "xc2-contract-probe stage=current-user category=contract http=200 "
+            "xc2=0 summary=blank-identity");
+    case Script::UpgradeNoResponse:
+    case Script::MissingConnected:
+    case Script::MissingDisconnectReceipt:
+    case Script::LateDisconnectReceipt:
+        return QByteArrayLiteral(
+            "xc2-contract-probe stage=stomp category=transport http=0 "
+            "xc2=0 summary=overall-deadline");
+    case Script::UpgradeRejected:
+    case Script::UpgradeWrongSubprotocol:
+    case Script::CloseBeforeDisconnectReceipt:
+    case Script::ReceiptThenAbnormalClose:
+        return QByteArrayLiteral(
+            "xc2-contract-probe stage=stomp category=transport http=0 "
+            "xc2=0 summary=transport-or-contract-failure");
+    case Script::StompError:
+        return QByteArrayLiteral(
+            "xc2-contract-probe stage=stomp category=backend http=0 "
+            "xc2=0 summary=transport-or-contract-failure");
+    case Script::MalformedConnected:
+    case Script::WrongDisconnectReceipt:
+        return QByteArrayLiteral(
+            "xc2-contract-probe stage=stomp category=contract http=0 "
+            "xc2=0 summary=transport-or-contract-failure");
+    case Script::Happy:
+    case Script::ApprovedTopicMessagesBeforeReceipt:
+    case Script::DeadlineBoundaryTerminalBurst:
+    case Script::Disabled:
+        return {};
+    }
+    Q_UNREACHABLE();
+    return {};
+}
+
+bool isExactSingleLine(const QByteArray &actual,
+                       const QByteArray &expected)
+{
+    const QByteArray lfTerminated = expected + '\n';
+    const QByteArray crlfTerminated = expected + "\r\n";
+    return actual == lfTerminated || actual == crlfTerminated;
+}
+
+void verifyExactSingleLine(const QByteArray &actual,
+                           const QByteArray &expected)
+{
+    QVERIFY2(isExactSingleLine(actual, expected),
+             "output was not the exact expected single line");
+}
+
+void verifyProbeOutcome(
+    const ProcessResult &result,
+    FakeXc2TransportServer::ProbeScript script,
+    int timeoutMs,
+    bool wrapperProcess = false)
+{
+    using Script = FakeXc2TransportServer::ProbeScript;
+    const bool successScript = script == Script::Happy
+        || script == Script::ApprovedTopicMessagesBeforeReceipt;
+    if (successScript) {
+        verifyExactSingleLine(
+            result.standardOutput,
+            QByteArrayLiteral(
+                "xc2-contract-probe compatible-read-only-surface"));
+        QVERIFY(result.standardError.isEmpty());
+    } else {
+        const QByteArray diagnostic = expectedDiagnostic(script);
+        QVERIFY2(!diagnostic.isEmpty(), "script has no fixed diagnostic");
+        QVERIFY(result.standardOutput.isEmpty());
+        verifyExactSingleLine(result.standardError, diagnostic);
+    }
+
+    if (!successScript && !isOverallDeadlineScript(script)) {
+        const qint64 earlyBoundMs = timeoutMs
+            - (wrapperProcess ? 1000 : 250);
+        QVERIFY2(result.runningElapsedMs <= earlyBoundMs,
+                 "immediate scripted result waited for the outer deadline");
+    }
+}
+
 void verifyProbeMilestones(FakeXc2TransportServer &server,
                            FakeXc2TransportServer::ProbeScript script)
 {
@@ -469,6 +685,9 @@ void verifyExactSuccessCapture(FakeXc2TransportServer &server,
                                const ProcessResult &result)
 {
     verifyCommonResult(server, result, 0);
+    verifyProbeOutcome(
+        result, FakeXc2TransportServer::ProbeScript::Happy,
+        kDefaultProbeTimeoutMs);
     verifyProbeMilestones(server,
                           FakeXc2TransportServer::ProbeScript::Happy);
     QCOMPARE(server.capturedRestRequests().size(), 2);
@@ -541,6 +760,11 @@ private slots:
         server.setRestCookie(kCookie);
         const ProcessResult result = runProbe(server, 2000);
         verifyCommonResult(server, result, 0);
+        verifyProbeOutcome(
+            result,
+            FakeXc2TransportServer::ProbeScript::
+                ApprovedTopicMessagesBeforeReceipt,
+            2000);
         verifyProbeMilestones(
             server,
             FakeXc2TransportServer::ProbeScript::
@@ -699,7 +923,12 @@ private slots:
         server.setProbeScript(script);
         server.setRestCookie(kCookie);
         const ProcessResult result = runProbe(server, timeoutMs);
+        if (isOverallDeadlineScript(script)) {
+            QVERIFY2(waitForExpectedClientMilestones(server, script),
+                     "deadline client milestones were not observed");
+        }
         verifyCommonResult(server, result, 2);
+        verifyProbeOutcome(result, script, timeoutMs);
         verifyProbeMilestones(server, script);
         if (script == FakeXc2TransportServer::ProbeScript::HealthNoResponse
             || script
@@ -736,6 +965,7 @@ private slots:
         server.setRestCookie(kCookie);
         const ProcessResult result = runProbe(server);
         verifyCommonResult(server, result, 3);
+        verifyProbeOutcome(result, script, kDefaultProbeTimeoutMs);
         verifyProbeMilestones(server, script);
     }
 
@@ -776,7 +1006,12 @@ private slots:
         server.setProbeScript(script);
         server.setRestCookie(kCookie);
         const ProcessResult result = runProbe(server, timeoutMs);
+        if (isOverallDeadlineScript(script)) {
+            QVERIFY2(waitForExpectedClientMilestones(server, script),
+                     "deadline client milestones were not observed");
+        }
         verifyCommonResult(server, result, 4);
+        verifyProbeOutcome(result, script, timeoutMs);
         verifyProbeMilestones(server, script);
         if (script == FakeXc2TransportServer::ProbeScript::UpgradeNoResponse
             || script
@@ -809,6 +1044,7 @@ private slots:
         server.setRestCookie(kCookie);
         const ProcessResult result = runProbe(server);
         verifyCommonResult(server, result, 5);
+        verifyProbeOutcome(result, script, kDefaultProbeTimeoutMs);
         verifyProbeMilestones(server, script);
     }
 
@@ -840,9 +1076,12 @@ private slots:
                 "xc2-contract-probe stage=stomp category=transport http=0 "
                 "xc2=0 summary=overall-deadline"),
         };
-        QVERIFY(allowedDiagnostics.contains(
-            result.standardError.trimmed()));
-        QCOMPARE(result.standardError.count('\n'), 1);
+        bool exactDiagnostic = false;
+        for (const QByteArray &diagnostic : allowedDiagnostics)
+            exactDiagnostic |= isExactSingleLine(
+                result.standardError, diagnostic);
+        QVERIFY2(exactDiagnostic,
+                 "race output was not an allowed exact single line");
         QCOMPARE(server.attemptedTerminalFrames().size(), 2);
         QCOMPARE(server.attemptedTerminalFrames().at(0).command,
                  QByteArrayLiteral("ERROR"));
@@ -868,7 +1107,16 @@ private slots:
         server.setProbeDelayMs(3000);
         server.setRestCookie(kCookie);
         const ProcessResult result = runProbe(server, 2000);
+        QVERIFY2(waitForExpectedClientMilestones(
+                     server,
+                     FakeXc2TransportServer::ProbeScript::
+                         LateDisconnectReceipt),
+                 "deadline client milestones were not observed");
         verifyCommonResult(server, result, 4);
+        verifyProbeOutcome(
+            result,
+            FakeXc2TransportServer::ProbeScript::LateDisconnectReceipt,
+            2000);
         verifyProbeMilestones(
             server,
             FakeXc2TransportServer::ProbeScript::LateDisconnectReceipt);
@@ -907,6 +1155,10 @@ private slots:
             server.setRestCookie(kCookie);
             const ProcessResult result = runProbe(server);
             verifyCommonResult(server, result, 5);
+            verifyProbeOutcome(
+                result,
+                FakeXc2TransportServer::ProbeScript::CurrentUserAuth401,
+                kDefaultProbeTimeoutMs);
             verifyProbeMilestones(
                 server,
                 FakeXc2TransportServer::ProbeScript::CurrentUserAuth401);
@@ -925,6 +1177,10 @@ private slots:
             server.setRestCookie(kCookie);
             const ProcessResult result = runProbe(server);
             verifyCommonResult(server, result, 4);
+            verifyProbeOutcome(
+                result,
+                FakeXc2TransportServer::ProbeScript::StompError,
+                kDefaultProbeTimeoutMs);
             verifyProbeMilestones(
                 server,
                 FakeXc2TransportServer::ProbeScript::StompError);
@@ -1005,15 +1261,18 @@ private slots:
             QStringLiteral("-ProbePath"),
             copiedProbe,
             QStringLiteral("-TimeoutMs"),
-            QString::number(kDefaultProbeTimeoutMs),
+            QString::number(kWrapperProbeTimeoutMs),
         };
         const ProcessResult result = runProcess(
             QStringLiteral("powershell.exe"), arguments);
         verifyCommonResult(server, result, expectedExitCode);
         if (probePathMode != 0 || emptyBase)
             verifyNoNetworkMilestones(server);
-        else
+        else {
+            verifyProbeOutcome(result, script, kWrapperProbeTimeoutMs,
+                               true);
             verifyProbeMilestones(server, script);
+        }
     }
 };
 

@@ -579,8 +579,10 @@ void FakeXc2TransportServer::inspect(QTcpSocket *socket)
             "HTTP/1.1 302 Found\r\nLocation: ") + location
             + QByteArrayLiteral(
                 "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-        m_upgradeResponses.append(response);
-        socket->write(response);
+        if (socket->write(response) == response.size())
+            m_upgradeResponses.append(response);
+        else
+            ++m_unexpectedOperationCount;
         socket->disconnectFromHost();
         return;
     }
@@ -589,8 +591,10 @@ void FakeXc2TransportServer::inspect(QTcpSocket *socket)
         const QByteArray response = QByteArrayLiteral(
             "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n"
             "Connection: close\r\n\r\n");
-        m_upgradeResponses.append(response);
-        socket->write(response);
+        if (socket->write(response) == response.size())
+            m_upgradeResponses.append(response);
+        else
+            ++m_unexpectedOperationCount;
         socket->disconnectFromHost();
         return;
     }
@@ -607,8 +611,10 @@ void FakeXc2TransportServer::inspect(QTcpSocket *socket)
             "Sec-WebSocket-Accept: ") + accept
             + QByteArrayLiteral(
                 "\r\nSec-WebSocket-Protocol: v11.stomp\r\n\r\n");
-        m_upgradeResponses.append(response);
-        socket->write(response);
+        if (socket->write(response) == response.size())
+            m_upgradeResponses.append(response);
+        else
+            ++m_unexpectedOperationCount;
         return;
     }
 
@@ -621,9 +627,11 @@ void FakeXc2TransportServer::inspect(QTcpSocket *socket)
 void FakeXc2TransportServer::respondToRest(
     QTcpSocket *socket, const FakeXc2HttpRequest &request)
 {
-    const auto writeResponse = [this, socket](QByteArray response) {
-        m_restResponses.append(response);
-        socket->write(response);
+    const auto writeResponse = [this, socket](const QByteArray &response) {
+        if (socket->write(response) == response.size())
+            m_restResponses.append(response);
+        else
+            ++m_unexpectedOperationCount;
     };
     const bool health = request.target
         == QByteArrayLiteral("/xc2/1.0/serviceStatus/status");
