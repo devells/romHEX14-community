@@ -78,6 +78,8 @@ if(RX14_KTM_XC2)
         src/ktm/xc2/Xc2BackendManager.h
         src/ktm/xc2/Xc2RestClient.cpp
         src/ktm/xc2/Xc2RestClient.h
+        src/ktm/xc2/Xc2StompClient.cpp
+        src/ktm/xc2/Xc2StompClient.h
         src/ktm/xc2/Xc2StompCodec.cpp
         src/ktm/xc2/Xc2StompCodec.h
         src/ktm/xc2/internal/Xc2ProcessOutput.cpp
@@ -93,6 +95,7 @@ if(RX14_KTM_XC2)
     target_link_libraries(rx14_ktm_xc2 PUBLIC
         Qt6::Core
         Qt6::Network
+        Qt6::WebSockets
         Iphlpapi
         Ws2_32
     )
@@ -599,6 +602,26 @@ if(BUILD_TESTING AND RX14_KTM_XC2)
     )
     add_test(NAME xc2_stomp_codec COMMAND test_Xc2StompCodec)
     set_tests_properties(xc2_stomp_codec PROPERTIES LABELS "unit;contract;ktm")
+
+    add_executable(test_Xc2StompClient
+        tests/ktm/FakeXc2TransportServer.cpp
+        tests/ktm/FakeXc2TransportServer.h
+        tests/ktm/test_Xc2StompClient.cpp
+    )
+    target_compile_definitions(test_Xc2StompClient PRIVATE
+        KTM_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/ktm/fixtures"
+    )
+    target_link_libraries(test_Xc2StompClient PRIVATE
+        rx14_ktm_xc2
+        Qt6::Network
+        Qt6::Test
+        Qt6::WebSockets
+    )
+    add_test(NAME xc2_stomp_client COMMAND test_Xc2StompClient)
+    set_tests_properties(xc2_stomp_client PROPERTIES
+        LABELS "loopback;unit;contract;ktm"
+        TIMEOUT 60
+    )
 
     add_executable(test_Xc2InstallationProbe
         tests/ktm/test_Xc2InstallationProbe.cpp
