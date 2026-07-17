@@ -373,13 +373,9 @@ public:
     {
         if (context == nullptr)
             return;
-        if (m_items.isEmpty()) {
-            m_quitPending = false;
-            m_repostedQuitEvent = nullptr;
-            if (!m_filterInstalled && qApp != nullptr) {
-                qApp->installEventFilter(this);
-                m_filterInstalled = true;
-            }
+        if (!m_filterInstalled && qApp != nullptr) {
+            qApp->installEventFilter(this);
+            m_filterInstalled = true;
         }
         context->setParent(this);
         m_items.append({context, std::move(beginStop)});
@@ -403,27 +399,45 @@ public:
             return;
 
         if (m_quitPending && m_repostedQuitEvent == nullptr
-            && qApp != nullptr) {
+            && m_queueBarrierEvent == nullptr && qApp != nullptr) {
             m_repostedQuitEvent = new QEvent(QEvent::Quit);
             QCoreApplication::postEvent(qApp, m_repostedQuitEvent);
             if (reaperRepostTestHook())
                 reaperRepostTestHook()();
             return;
         }
+        if (m_repostedQuitEvent != nullptr || m_queueBarrierEvent != nullptr)
+            return;
         removeFilter();
     }
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override
     {
-        if (watched != qApp || event->type() != QEvent::Quit)
+        if (watched != qApp)
+            return QObject::eventFilter(watched, event);
+        if (event == m_queueBarrierEvent) {
+            m_queueBarrierEvent = nullptr;
+            if (m_items.isEmpty() && !m_quitPending
+                && m_repostedQuitEvent == nullptr) {
+                removeFilter();
+            }
+            return true;
+        }
+        if (event->type() != QEvent::Quit)
             return QObject::eventFilter(watched, event);
         if (event == m_repostedQuitEvent) {
             m_repostedQuitEvent = nullptr;
             m_quitPending = false;
-            removeFilter();
+            m_queueBarrierEvent = new QEvent(
+                static_cast<QEvent::Type>(QEvent::User + 42));
+            QCoreApplication::postEvent(
+                qApp, m_queueBarrierEvent,
+                std::numeric_limits<int>::min());
             return false;
         }
+        if (m_queueBarrierEvent != nullptr)
+            return true;
         if (!m_items.isEmpty() || m_quitPending) {
             m_quitPending = true;
             const QList<Item> snapshot = m_items;
@@ -448,6 +462,7 @@ private:
     bool m_filterInstalled = false;
     bool m_quitPending = false;
     QEvent *m_repostedQuitEvent = nullptr;
+    QEvent *m_queueBarrierEvent = nullptr;
 };
 
 ApplicationReaper *applicationReaper()
@@ -615,16 +630,20 @@ struct Xc2BackendManager::RunContext final : QObject {
         startupDeadline.setRemainingTime(remaining, Qt::PreciseTimer);
 
         const QFileInfo lockInfo(plan.lockPath);
+        observe(QStringLiteral("lock-directory:%1")
+                    .arg(lockInfo.absolutePath()));
         if (!QDir().mkpath(lockInfo.absolutePath())) {
             fail(backendError(QStringLiteral("Cannot create the XC2 lock directory")));
             return;
         }
         lock = std::make_unique<QLockFile>(plan.lockPath);
         lock->setStaleLockTime(0);
+        observe(QStringLiteral("lock-attempt:%1").arg(plan.lockPath));
         if (!lock->tryLock(0)) {
             fail(backendError(QStringLiteral("The XC2 backend is already owned")));
             return;
         }
+        observe(QStringLiteral("lock-acquired:%1").arg(plan.lockPath));
         startAttempt();
     }
 
@@ -778,10 +797,19 @@ struct Xc2BackendManager::RunContext final : QObject {
                     onProcessStarted(attemptId);
                 });
         connect(attempt->process, &QProcess::errorOccurred, this,
-                [this, attemptId](QProcess::ProcessError error) {
-                    CallbackScope callback(this);
-                    onProcessError(attemptId, error);
-                });
+                 [this, attemptId](QProcess::ProcessError error) {
+                     const auto deliver = [this, attemptId, error] {
+                         CallbackScope callback(this);
+                         onProcessError(attemptId, error);
+                     };
+                     if (plan.errorNotificationDelayMsForTest > 0) {
+                         QTimer::singleShot(
+                             plan.errorNotificationDelayMsForTest,
+                             this, deliver);
+                     } else {
+                         deliver();
+                     }
+                 });
         connect(attempt->process,
                 qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
                 this, [this, attemptId](int exitCode,
@@ -1152,6 +1180,7 @@ struct Xc2BackendManager::RunContext final : QObject {
         const bool standardError =
             stream == Xc2ProcessOutput::Stream::StandardError;
         for (const QString &line : lines) {
+            revokeUnexpectedSignaledExitBeforeOutput();
             bool published = false;
             const bool stillOwned = invokeManager(
                 [this, standardError, &line, &published](
@@ -1162,6 +1191,19 @@ struct Xc2BackendManager::RunContext final : QObject {
             if (!published || !stillOwned)
                 return;
         }
+    }
+
+    void revokeUnexpectedSignaledExitBeforeOutput()
+    {
+        if (!attempt || attempt->collisionCleanup || stopRequested
+            || failureEmitted
+            || !processHandleIsSignaled(attempt->processHandle)) {
+            return;
+        }
+        totalDeadline.stop();
+        revokeReadinessAndRequests();
+        markFailure(backendError(QStringLiteral(
+            "The XC2 backend exited before stop")));
     }
 
     void revokeReadinessAndRequests()
@@ -1241,16 +1283,54 @@ struct Xc2BackendManager::RunContext final : QObject {
         current.shutdownSocket->connectToHost(
             QHostAddress(QStringLiteral("127.0.0.1")), current.port,
             QIODevice::ReadWrite);
-        QTimer::singleShot(plan.shutdownDeadlineMs, this,
+        scheduleShutdownDeadlineWakeup(attemptId);
+        if (plan.shutdownDeadlineEarlyWakeupHookForTest) {
+            const QPointer<RunContext> guarded(this);
+            plan.shutdownDeadlineEarlyWakeupHookForTest(
+                [guarded, attemptId] {
+                    if (guarded)
+                        guarded->onShutdownDeadlineWakeup(attemptId);
+                });
+        }
+    }
+
+    bool shutdownDeadlineWakeupIsRelevant(quint64 attemptId) const
+    {
+        return isCurrentAttempt(attemptId) && !completed
+            && attempt->shutdownAttempted
+            && cleanupPhase != CleanupPhase::Terminating
+            && cleanupPhase != CleanupPhase::Killing
+            && cleanupPhase != CleanupPhase::Finalizing;
+    }
+
+    void scheduleShutdownDeadlineWakeup(quint64 attemptId)
+    {
+        if (!shutdownDeadlineWakeupIsRelevant(attemptId))
+            return;
+        const qint64 remaining = shutdownDeadline.remainingTime();
+        const int delayMs = static_cast<int>(qBound<qint64>(
+            qint64{1}, remaining,
+            static_cast<qint64>(std::numeric_limits<int>::max())));
+        QTimer::singleShot(delayMs, Qt::PreciseTimer, this,
                            [this, attemptId] {
-            if (!isCurrentAttempt(attemptId) || completed
-                || cleanupPhase == CleanupPhase::Terminating
-                || cleanupPhase == CleanupPhase::Killing
-                || cleanupPhase == CleanupPhase::Finalizing)
-                return;
-            if (shutdownDeadline.hasExpired())
-                shutdownFailed(QStringLiteral("The XC2 shutdown deadline expired"));
+            onShutdownDeadlineWakeup(attemptId);
         });
+    }
+
+    void onShutdownDeadlineWakeup(quint64 attemptId)
+    {
+        if (!shutdownDeadlineWakeupIsRelevant(attemptId))
+            return;
+        if (shutdownDeadline.hasExpired()) {
+            observe(QStringLiteral("shutdown-deadline-expired:wakeup"));
+            shutdownFailed(QStringLiteral(
+                "The XC2 shutdown deadline expired"));
+            return;
+        }
+        observe(QStringLiteral("shutdown-deadline-rescheduled:%1:%2")
+                    .arg(attemptId)
+                    .arg(shutdownDeadline.remainingTime()));
+        scheduleShutdownDeadlineWakeup(attemptId);
     }
 
     bool shutdownExpired(const QString &phase)
@@ -1710,7 +1790,12 @@ struct Xc2BackendManager::RunContext final : QObject {
         completed = true;
         totalDeadline.stop();
         if (lock) {
-            lock->unlock();
+            const bool wasLocked = lock->isLocked();
+            if (wasLocked)
+                lock->unlock();
+            if (wasLocked)
+                observe(QStringLiteral("lock-released:%1")
+                            .arg(plan.lockPath));
             lock.reset();
         }
         if (owner) {

@@ -86,6 +86,9 @@ private:
         bool failJobSetupForTest = false;
         bool failNativeTerminationForTest = false;
         int finishedNotificationDelayMsForTest = 0;
+        int errorNotificationDelayMsForTest = 0;
+        std::function<void(std::function<void()>)>
+            shutdownDeadlineEarlyWakeupHookForTest;
         ShutdownProofMutation shutdownProofMutationForTest =
             ShutdownProofMutation::None;
     };

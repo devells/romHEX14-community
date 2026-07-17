@@ -16,6 +16,7 @@
 #include <QTimer>
 
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 
 namespace {
@@ -38,6 +39,7 @@ struct Options {
     QString userMode = QStringLiteral("valid");
     QString releaseTriggerPath;
     QString exitTriggerPath;
+    QString newlineExitTriggerPath;
     QString eventLogPath;
 };
 
@@ -119,6 +121,9 @@ bool parseOptions(const QStringList &arguments, Options &options)
         } else if (argument == QStringLiteral("--exit-trigger")) {
             if (!takeValue(arguments, i, options.exitTriggerPath))
                 return false;
+        } else if (argument == QStringLiteral("--newline-exit-trigger")) {
+            if (!takeValue(arguments, i, options.newlineExitTriggerPath))
+                return false;
         } else if (argument == QStringLiteral("--event-log")) {
             if (!takeValue(arguments, i, options.eventLogPath))
                 return false;
@@ -141,6 +146,7 @@ bool parseOptions(const QStringList &arguments, Options &options)
              options.holdLockPath,
              options.releaseTriggerPath,
              options.exitTriggerPath,
+             options.newlineExitTriggerPath,
              options.eventLogPath,
          }) {
         if (!path.isEmpty() && !QDir::isAbsolutePath(path))
@@ -355,6 +361,23 @@ public:
 
     void start()
     {
+        if (!m_options.newlineExitTriggerPath.isEmpty()) {
+            auto *timer = new QTimer(this);
+            timer->setInterval(5);
+            connect(timer, &QTimer::timeout, this, [this, timer] {
+                if (!QFileInfo::exists(m_options.newlineExitTriggerPath))
+                    return;
+                timer->stop();
+                QFile output;
+                output.open(stdout, QIODevice::WriteOnly,
+                            QFileDevice::DontCloseHandle);
+                output.write("unexpected-final-line\n");
+                output.flush();
+                m_log->write(QStringLiteral("NEWLINE_EXIT_TRIGGERED"));
+                std::_Exit(9);
+            });
+            timer->start();
+        }
         if (!m_options.exitTriggerPath.isEmpty()) {
             auto *timer = new QTimer(this);
             timer->setInterval(5);
