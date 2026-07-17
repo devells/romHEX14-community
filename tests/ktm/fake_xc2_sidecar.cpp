@@ -41,6 +41,7 @@ struct Options {
     QString exitTriggerPath;
     QString newlineExitTriggerPath;
     QString newlineExitReleasePath;
+    QString stagedOutputDirectory;
     QString eventLogPath;
 };
 
@@ -129,6 +130,9 @@ bool parseOptions(const QStringList &arguments, Options &options)
                    == QStringLiteral("--newline-exit-release-trigger")) {
             if (!takeValue(arguments, i, options.newlineExitReleasePath))
                 return false;
+        } else if (argument == QStringLiteral("--staged-output-dir")) {
+            if (!takeValue(arguments, i, options.stagedOutputDirectory))
+                return false;
         } else if (argument == QStringLiteral("--event-log")) {
             if (!takeValue(arguments, i, options.eventLogPath))
                 return false;
@@ -153,6 +157,7 @@ bool parseOptions(const QStringList &arguments, Options &options)
              options.exitTriggerPath,
              options.newlineExitTriggerPath,
              options.newlineExitReleasePath,
+             options.stagedOutputDirectory,
              options.eventLogPath,
          }) {
         if (!path.isEmpty() && !QDir::isAbsolutePath(path))
@@ -367,6 +372,57 @@ public:
 
     void start()
     {
+        if (!m_options.stagedOutputDirectory.isEmpty()) {
+            auto *timer = new QTimer(this);
+            timer->setInterval(5);
+            connect(timer, &QTimer::timeout, this, [this] {
+                const QString prefix = QStringLiteral("stage-%1.")
+                                           .arg(m_nextOutputStage);
+                struct Candidate {
+                    QString suffix;
+                    bool standardError;
+                    bool exitAfter;
+                };
+                static const QList<Candidate> candidates{
+                    {QStringLiteral("stdout"), false, false},
+                    {QStringLiteral("stderr"), true, false},
+                    {QStringLiteral("stdout.exit"), false, true},
+                    {QStringLiteral("stderr.exit"), true, true},
+                };
+                for (const Candidate &candidate : candidates) {
+                    const QString path = QDir(m_options.stagedOutputDirectory)
+                                             .filePath(prefix
+                                                       + candidate.suffix);
+                    QFile staged(path);
+                    if (!staged.exists())
+                        continue;
+                    if (!staged.open(QIODevice::ReadOnly))
+                        return;
+                    const QByteArray bytes = staged.readAll();
+                    QFile output;
+                    output.open(candidate.standardError ? stderr : stdout,
+                                QIODevice::WriteOnly,
+                                QFileDevice::DontCloseHandle);
+                    output.write(bytes);
+                    output.flush();
+                    m_log->write(
+                        QStringLiteral("STAGED_OUTPUT"),
+                        {{QStringLiteral("stage"), m_nextOutputStage},
+                         {QStringLiteral("stream"),
+                          candidate.standardError
+                              ? QStringLiteral("stderr")
+                              : QStringLiteral("stdout")},
+                         {QStringLiteral("bytesBase64"),
+                          QString::fromLatin1(bytes.toBase64())},
+                         {QStringLiteral("exitAfter"), candidate.exitAfter}});
+                    ++m_nextOutputStage;
+                    if (candidate.exitAfter)
+                        std::_Exit(9);
+                    return;
+                }
+            });
+            timer->start();
+        }
         if (!m_options.newlineExitTriggerPath.isEmpty()) {
             auto *timer = new QTimer(this);
             timer->setInterval(5);
@@ -698,6 +754,7 @@ private:
     int m_maxConcurrentHealth = 0;
     bool m_descendantStarted = false;
     quint64 m_nextConnectionId = 0;
+    int m_nextOutputStage = 1;
 };
 
 } // namespace

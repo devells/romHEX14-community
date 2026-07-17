@@ -27,6 +27,7 @@
 #include <QTemporaryDir>
 #include <QTest>
 #include <QThread>
+#include <QTimer>
 
 #include <memory>
 #include <optional>
@@ -118,7 +119,9 @@ public:
                               ShutdownProofMutation::None,
                           int errorNotificationDelayMs = 0,
                           std::function<void(std::function<void()>)>
-                              shutdownDeadlineEarlyWakeupHook = {})
+                              shutdownDeadlineEarlyWakeupHook = {},
+                          std::function<void(const QString &)>
+                              lifecycleObserver = {})
     {
         Xc2BackendManager::PrivateLaunchPlan plan;
         plan.program = QString::fromUtf8(FAKE_XC2_SIDECAR_PATH);
@@ -144,9 +147,15 @@ public:
         plan.errorNotificationDelayMsForTest = errorNotificationDelayMs;
         plan.shutdownDeadlineEarlyWakeupHookForTest =
             std::move(shutdownDeadlineEarlyWakeupHook);
-        if (lifecycleTrace) {
-            plan.lifecycleObserver = [lifecycleTrace](const QString &event) {
-                lifecycleTrace->append(event);
+        if (lifecycleTrace || lifecycleObserver) {
+            plan.lifecycleObserver = [lifecycleTrace,
+                                      lifecycleObserver =
+                                          std::move(lifecycleObserver)](
+                                         const QString &event) {
+                if (lifecycleTrace)
+                    lifecycleTrace->append(event);
+                if (lifecycleObserver)
+                    lifecycleObserver(event);
             };
         }
         auto index = std::make_shared<int>(0);
@@ -169,6 +178,23 @@ public:
             return arguments;
         };
         return manager.startPrivateForTest(std::move(plan), error);
+    }
+
+    static bool startStagedOutputFake(
+        Xc2BackendManager &manager, const QString &lockPath,
+        quint16 candidate, const QString &stagedOutputDirectory,
+        const QString &eventLog,
+        std::shared_ptr<QStringList> lifecycleTrace,
+        std::function<void(const QString &)> lifecycleObserver)
+    {
+        return startFake(
+            manager, lockPath, {candidate},
+            {QStringLiteral("--staged-output-dir"),
+             stagedOutputDirectory},
+            eventLog, 5000, 500, 100, 1, {}, {}, nullptr,
+            std::move(lifecycleTrace), false, false, {}, {}, false, 0,
+            ShutdownProofMutation::None, 0, {},
+            std::move(lifecycleObserver));
     }
 
     static bool startInvalid(Xc2BackendManager &manager,
@@ -565,6 +591,27 @@ bool lockIsAvailable(const QString &path)
         return false;
     probe.unlock();
     return true;
+}
+
+bool writeStagedOutput(const QString &directory, int stage,
+                       bool standardError, const QByteArray &bytes,
+                       bool exitAfter = false)
+{
+    const QString suffix = standardError ? QStringLiteral("stderr")
+                                         : QStringLiteral("stdout");
+    const QString path = QDir(directory).filePath(
+        QStringLiteral("stage-%1.%2%3")
+            .arg(stage)
+            .arg(suffix, exitAfter ? QStringLiteral(".exit") : QString()));
+    const QString temporaryPath = path + QStringLiteral(".tmp");
+    QFile::remove(temporaryPath);
+    QFile staged(temporaryPath);
+    if (!staged.open(QIODevice::WriteOnly) || staged.write(bytes) != bytes.size()
+        || !staged.flush()) {
+        return false;
+    }
+    staged.close();
+    return QFile::rename(temporaryPath, path);
 }
 
 std::optional<DWORD> exactListenerOwner(quint16 port)
@@ -2741,6 +2788,227 @@ private slots:
                                          Xc2BackendState::Stopping}));
         QCOMPARE(manager.recentOutput(false), standardOutputLines);
         QCOMPARE(manager.recentOutput(true), standardErrorLines);
+        QVERIFY(handleIsSignaled(child));
+        QVERIFY(lockIsAvailable(lockPath));
+        CloseHandle(child);
+    }
+
+    void nestedSameStreamCompleteOutputPreservesWireOrder_data()
+    {
+        QTest::addColumn<bool>("standardError");
+        QTest::newRow("stdout") << false;
+        QTest::newRow("stderr") << true;
+    }
+
+    void nestedSameStreamCompleteOutputPreservesWireOrder()
+    {
+        QFETCH(bool, standardError);
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString lockPath = privateLockPath(directory);
+        const QString streamName = standardError ? QStringLiteral("stderr")
+                                                 : QStringLiteral("stdout");
+        const QString heldSuffix = QLatin1Char(':') + streamName;
+        const auto lifecycleTrace = std::make_shared<QStringList>();
+        Xc2BackendManager manager;
+        QSignalSpy ready(&manager, &Xc2BackendManager::ready);
+        QSignalSpy failed(&manager, &Xc2BackendManager::failed);
+        QSignalSpy stopped(&manager, &Xc2BackendManager::stopped);
+        QStringList lines;
+        QList<Xc2BackendState> states;
+        QList<bool> handleLive;
+        HANDLE child = nullptr;
+        qsizetype heldCount = 0;
+        qsizetype nestedHeldTarget = 0;
+        QEventLoop *nestedLoop = nullptr;
+        bool nestedTriggered = false;
+        bool nestedCompleted = false;
+        bool nestedTimedOut = false;
+        bool nestedStageWritten = false;
+        const auto lifecycleObserver = [&](const QString &event) {
+            if (!event.startsWith(QStringLiteral("output-tail-held:"))
+                || !event.endsWith(heldSuffix)) {
+                return;
+            }
+            ++heldCount;
+            if (nestedLoop != nullptr && heldCount >= nestedHeldTarget)
+                nestedLoop->quit();
+        };
+        QObject::connect(&manager, &Xc2BackendManager::outputLine,
+                         &manager, [&](bool emittedStandardError,
+                                       const QString &line) {
+            if (emittedStandardError != standardError)
+                return;
+            lines.append(line);
+            states.append(manager.state());
+            handleLive.append(child != nullptr && handleIsLive(child));
+            if (line != QStringLiteral("P") || nestedTriggered)
+                return;
+            nestedTriggered = true;
+            nestedHeldTarget = heldCount + 1;
+            QEventLoop nested;
+            nestedLoop = &nested;
+            nestedStageWritten = writeStagedOutput(
+                directory.path(), 3, standardError, QByteArrayLiteral("B\n"));
+            if (nestedStageWritten) {
+                QTimer::singleShot(5000, &nested, [&] {
+                    nestedTimedOut = true;
+                    nested.quit();
+                });
+                nested.exec();
+            }
+            nestedLoop = nullptr;
+            nestedCompleted = nestedStageWritten && !nestedTimedOut;
+        });
+        QVERIFY(Xc2BackendManagerTestAccess::startStagedOutputFake(
+            manager, lockPath,
+            Xc2BackendManagerTestAccess::allocateCandidate(), directory.path(),
+            directory.filePath("nested-complete.jsonl"), lifecycleTrace,
+            lifecycleObserver));
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 7000);
+        child = openStableHandle(manager.ownedProcessId());
+        QVERIFY(child != nullptr && handleIsLive(child));
+        QVERIFY(writeStagedOutput(directory.path(), 1, standardError,
+                                  QByteArrayLiteral("P\n")));
+        QTRY_COMPARE_WITH_TIMEOUT(heldCount, qsizetype(1), 5000);
+        QCOMPARE(lines.size(), 0);
+        QVERIFY(writeStagedOutput(directory.path(), 2, standardError,
+                                  QByteArrayLiteral("A\n")));
+        QTRY_VERIFY_WITH_TIMEOUT(nestedTriggered && nestedCompleted, 7000);
+        const QStringList linesBeforeStop = lines;
+
+        manager.stop();
+        QTRY_COMPARE_WITH_TIMEOUT(stopped.count(), 1, 5000);
+        QCOMPARE(failed.count(), 0);
+        QVERIFY(nestedStageWritten);
+        QVERIFY(!nestedTimedOut);
+        QCOMPARE(lines,
+                 QStringList({QStringLiteral("P"), QStringLiteral("A"),
+                              QStringLiteral("B")}));
+        QCOMPARE(linesBeforeStop,
+                 QStringList({QStringLiteral("P"), QStringLiteral("A")}));
+        QCOMPARE(states,
+                 QList<Xc2BackendState>({Xc2BackendState::Ready,
+                                         Xc2BackendState::Ready,
+                                         Xc2BackendState::Stopping}));
+        QCOMPARE(manager.recentOutput(standardError), lines);
+        QCOMPARE(handleLive.size(), 3);
+        QVERIFY(handleLive.at(0));
+        QVERIFY(handleLive.at(1));
+        QVERIFY(handleIsSignaled(child));
+        QVERIFY(lockIsAvailable(lockPath));
+        CloseHandle(child);
+    }
+
+    void nestedTerminalPreservesHeldCompleteBeforeEofPartial_data()
+    {
+        QTest::addColumn<bool>("standardError");
+        QTest::newRow("stdout") << false;
+        QTest::newRow("stderr") << true;
+    }
+
+    void nestedTerminalPreservesHeldCompleteBeforeEofPartial()
+    {
+        QFETCH(bool, standardError);
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString lockPath = privateLockPath(directory);
+        const QString streamName = standardError ? QStringLiteral("stderr")
+                                                 : QStringLiteral("stdout");
+        const QString heldSuffix = QLatin1Char(':') + streamName;
+        const auto lifecycleTrace = std::make_shared<QStringList>();
+        Xc2BackendManager manager;
+        QSignalSpy ready(&manager, &Xc2BackendManager::ready);
+        QSignalSpy failed(&manager, &Xc2BackendManager::failed);
+        QSignalSpy stopped(&manager, &Xc2BackendManager::stopped);
+        QStringList lines;
+        QStringList order;
+        QList<Xc2BackendState> states;
+        HANDLE child = nullptr;
+        qsizetype heldCount = 0;
+        QEventLoop *nestedLoop = nullptr;
+        bool nestedTriggered = false;
+        bool nestedCompleted = false;
+        bool nestedTimedOut = false;
+        bool nestedStageWritten = false;
+        bool outputFinalized = false;
+        const auto lifecycleObserver = [&](const QString &event) {
+            if (event.startsWith(QStringLiteral("output-tail-held:"))
+                && event.endsWith(heldSuffix)) {
+                ++heldCount;
+            }
+            if (!event.startsWith(QStringLiteral("output-finalized:")))
+                return;
+            outputFinalized = true;
+            if (nestedLoop != nullptr)
+                nestedLoop->quit();
+        };
+        QObject::connect(&manager, &Xc2BackendManager::failed,
+                         &manager, [&] { order.append("failed"); });
+        QObject::connect(&manager, &Xc2BackendManager::stopped,
+                         &manager, [&] { order.append("stopped"); });
+        QObject::connect(&manager, &Xc2BackendManager::outputLine,
+                         &manager, [&](bool emittedStandardError,
+                                       const QString &line) {
+            if (emittedStandardError != standardError)
+                return;
+            lines.append(line);
+            states.append(manager.state());
+            order.append(QStringLiteral("output:") + line);
+            if (line != QStringLiteral("P") || nestedTriggered)
+                return;
+            nestedTriggered = true;
+            QEventLoop nested;
+            nestedLoop = &nested;
+            nestedStageWritten = writeStagedOutput(
+                directory.path(), 3, standardError,
+                QByteArrayLiteral("EOF-partial"), true);
+            if (nestedStageWritten) {
+                QTimer::singleShot(5000, &nested, [&] {
+                    nestedTimedOut = true;
+                    nested.quit();
+                });
+                nested.exec();
+            }
+            nestedLoop = nullptr;
+            nestedCompleted = nestedStageWritten && outputFinalized
+                && !nestedTimedOut;
+        });
+        QVERIFY(Xc2BackendManagerTestAccess::startStagedOutputFake(
+            manager, lockPath,
+            Xc2BackendManagerTestAccess::allocateCandidate(), directory.path(),
+            directory.filePath("nested-terminal.jsonl"), lifecycleTrace,
+            lifecycleObserver));
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 7000);
+        child = openStableHandle(manager.ownedProcessId());
+        QVERIFY(child != nullptr && handleIsLive(child));
+        QVERIFY(writeStagedOutput(directory.path(), 1, standardError,
+                                  QByteArrayLiteral("P\n")));
+        QTRY_COMPARE_WITH_TIMEOUT(heldCount, qsizetype(1), 5000);
+        QCOMPARE(lines.size(), 0);
+        QVERIFY(writeStagedOutput(directory.path(), 2, standardError,
+                                  QByteArrayLiteral("A\n")));
+        QTRY_VERIFY_WITH_TIMEOUT(nestedTriggered && nestedCompleted, 7000);
+        QTRY_COMPARE_WITH_TIMEOUT(stopped.count(), 1, 5000);
+
+        QCOMPARE(failed.count(), 1);
+        QVERIFY(nestedStageWritten);
+        QVERIFY(outputFinalized);
+        QVERIFY(!nestedTimedOut);
+        QCOMPARE(lines,
+                 QStringList({QStringLiteral("P"), QStringLiteral("A"),
+                              QStringLiteral("EOF-partial")}));
+        QCOMPARE(states,
+                 QList<Xc2BackendState>({Xc2BackendState::Ready,
+                                         Xc2BackendState::Failed,
+                                         Xc2BackendState::Failed}));
+        QCOMPARE(manager.recentOutput(standardError), lines);
+        QCOMPARE(order,
+                 QStringList({QStringLiteral("output:P"),
+                              QStringLiteral("failed"),
+                              QStringLiteral("output:A"),
+                              QStringLiteral("output:EOF-partial"),
+                              QStringLiteral("stopped")}));
         QVERIFY(handleIsSignaled(child));
         QVERIFY(lockIsAvailable(lockPath));
         CloseHandle(child);

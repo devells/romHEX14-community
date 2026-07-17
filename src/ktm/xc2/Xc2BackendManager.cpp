@@ -40,6 +40,9 @@ constexpr int kMaximumTimeoutMs = 120000;
 constexpr int kMaximumKillAttempts = 3;
 constexpr int kMaximumQtReconcileAttempts = 2;
 constexpr qsizetype kProcessReadBlockBytes = 4096;
+constexpr qsizetype kTerminalOutputReserve = 2;
+constexpr qsizetype kMaximumPendingOutputLines =
+    Xc2ProcessOutput::MaximumRecentLines + kTerminalOutputReserve;
 
 struct ProductionInspectionTestHooks {
     std::function<void(const QString &)> observer;
@@ -481,6 +484,12 @@ ApplicationReaper *applicationReaper()
 
 struct Xc2BackendManager::RunContext final : QObject {
     struct Attempt {
+        struct OutputPublication {
+            std::optional<QString> held;
+            QStringList pending;
+            bool draining = false;
+        };
+
         explicit Attempt(RunContext *runContext)
             : run(runContext)
         {
@@ -515,6 +524,8 @@ struct Xc2BackendManager::RunContext final : QObject {
         bool networkAuthorized = false;
         bool ownsChildForCleanup = false;
         bool outputFinalized = false;
+        bool outputFinalizationRequested = false;
+        bool outputFinalizationInProgress = false;
         bool cleanupCompleted = false;
         bool shutdownAttempted = false;
         bool shutdownWritten = false;
@@ -529,8 +540,8 @@ struct Xc2BackendManager::RunContext final : QObject {
         bool finishedObserved = false;
         int exitCode = -1;
         QProcess::ExitStatus exitStatus = QProcess::CrashExit;
-        std::optional<QString> heldStandardOutput;
-        std::optional<QString> heldStandardError;
+        OutputPublication standardOutputPublication;
+        OutputPublication standardErrorPublication;
     };
 
     enum class CleanupPhase {
@@ -1147,72 +1158,158 @@ struct Xc2BackendManager::RunContext final : QObject {
         });
     }
 
-    void drainProcessOutput(quint64 attemptId,
+    bool drainProcessOutput(quint64 attemptId,
                             Xc2ProcessOutput::Stream stream)
     {
         if (!isCurrentAttempt(attemptId) || !attempt->process
             || attempt->outputFinalized)
-            return;
+            return false;
         QProcess *process = attempt->process;
-        process->setReadChannel(stream == Xc2ProcessOutput::Stream::StandardOutput
-                                    ? QProcess::StandardOutput
-                                    : QProcess::StandardError);
+        const QProcess::ProcessChannel channel =
+            stream == Xc2ProcessOutput::Stream::StandardOutput
+            ? QProcess::StandardOutput : QProcess::StandardError;
         std::array<char, kProcessReadBlockBytes> buffer{};
-        while (process->bytesAvailable() > 0) {
-            const qint64 count = process->read(buffer.data(), buffer.size());
+        bool readAny = false;
+        while (isCurrentAttempt(attemptId) && !attempt->outputFinalized) {
+            Attempt::OutputPublication &publication =
+                outputPublication(stream);
+            // A byte can complete at most one line. Keep room for the held
+            // tail and an EOF partial while a public callback is reentered.
+            const qsizetype availableLines = kMaximumPendingOutputLines
+                - publication.pending.size() - kTerminalOutputReserve;
+            if (availableLines <= 0)
+                break;
+            process->setReadChannel(channel);
+            const qint64 availableBytes = process->bytesAvailable();
+            if (availableBytes <= 0)
+                break;
+            const qint64 maximumRead = std::min<qint64>(
+                {availableBytes, static_cast<qint64>(buffer.size()),
+                 static_cast<qint64>(availableLines)});
+            const qint64 count = process->read(buffer.data(), maximumRead);
             if (count <= 0)
                 break;
+            readAny = true;
             const QStringList lines = attempt->output.feed(
                 stream, QByteArrayView(buffer.data(), count));
             emitOutputLines(stream, lines);
         }
+        return readAny;
+    }
+
+    bool hasBufferedProcessOutput(Xc2ProcessOutput::Stream stream)
+    {
+        if (!attempt || !attempt->process)
+            return false;
+        attempt->process->setReadChannel(
+            stream == Xc2ProcessOutput::Stream::StandardOutput
+                ? QProcess::StandardOutput : QProcess::StandardError);
+        return attempt->process->bytesAvailable() > 0;
+    }
+
+    bool tryFinalizeOutput(Attempt &current)
+    {
+        if (current.outputFinalized || current.outputFinalizationInProgress)
+            return false;
+        current.outputFinalizationRequested = true;
+        current.outputFinalizationInProgress = true;
+        const quint64 attemptId = current.attemptId;
+        const bool readStandardOutput = drainProcessOutput(
+            attemptId, Xc2ProcessOutput::Stream::StandardOutput);
+        const bool readStandardError = drainProcessOutput(
+            attemptId, Xc2ProcessOutput::Stream::StandardError);
+        if (!isCurrentAttempt(attemptId))
+            return readStandardOutput || readStandardError;
+        if (hasBufferedProcessOutput(
+                Xc2ProcessOutput::Stream::StandardOutput)
+            || hasBufferedProcessOutput(
+                Xc2ProcessOutput::Stream::StandardError)) {
+            current.outputFinalizationInProgress = false;
+            return readStandardOutput || readStandardError;
+        }
+
+        Xc2ProcessOutput::FinishedLines lines = current.output.finish();
+        current.outputFinalized = true;
+        queueOutputLines(Xc2ProcessOutput::Stream::StandardOutput,
+                         lines.standardOutput);
+        queueOutputLines(Xc2ProcessOutput::Stream::StandardError,
+                         lines.standardError);
+        observe(QStringLiteral("output-finalized:%1").arg(attemptId));
+        current.outputFinalizationInProgress = false;
+        drainPendingPublications(Xc2ProcessOutput::Stream::StandardOutput);
+        drainPendingPublications(Xc2ProcessOutput::Stream::StandardError);
+        return true;
     }
 
     void finalizeOutput(Attempt &current)
     {
         if (current.outputFinalized)
             return;
-        Xc2ProcessOutput::FinishedLines lines = current.output.finish();
-        if (current.heldStandardOutput.has_value()) {
-            lines.standardOutput.prepend(
-                std::move(current.heldStandardOutput.value()));
-            current.heldStandardOutput.reset();
+        current.outputFinalizationRequested = true;
+        tryFinalizeOutput(current);
+    }
+
+    void appendPendingOutputLine(Attempt::OutputPublication &publication,
+                                 QString line)
+    {
+        Q_ASSERT(publication.pending.size() < kMaximumPendingOutputLines);
+        publication.pending.append(std::move(line));
+    }
+
+    void publishHeldWhenRequired(Xc2ProcessOutput::Stream stream)
+    {
+        if (!attempt || shouldHoldOutputTail())
+            return;
+        Attempt::OutputPublication &publication = outputPublication(stream);
+        if (!publication.held.has_value())
+            return;
+        appendPendingOutputLine(publication,
+                                std::move(publication.held.value()));
+        publication.held.reset();
+    }
+
+    void queueOutputLines(Xc2ProcessOutput::Stream stream,
+                          const QStringList &lines)
+    {
+        if (!attempt)
+            return;
+        Attempt::OutputPublication &publication = outputPublication(stream);
+        const quint64 attemptId = attempt->attemptId;
+        const bool holdTail = shouldHoldOutputTail();
+        if (holdTail) {
+            for (const QString &line : lines) {
+                if (publication.held.has_value()) {
+                    appendPendingOutputLine(
+                        publication, std::move(publication.held.value()));
+                    publication.held.reset();
+                }
+                publication.held = line;
+            }
+        } else {
+            publishHeldWhenRequired(stream);
+            for (const QString &line : lines)
+                appendPendingOutputLine(publication, line);
         }
-        if (current.heldStandardError.has_value()) {
-            lines.standardError.prepend(
-                std::move(current.heldStandardError.value()));
-            current.heldStandardError.reset();
+
+        if (!holdTail)
+            return;
+        const QString streamName =
+            stream == Xc2ProcessOutput::Stream::StandardError
+            ? QStringLiteral("stderr") : QStringLiteral("stdout");
+        for (qsizetype index = 0; index < lines.size(); ++index) {
+            if (!isCurrentAttempt(attemptId))
+                return;
+            observe(QStringLiteral("output-tail-held:%1:%2")
+                        .arg(attemptId)
+                        .arg(streamName));
         }
-        current.outputFinalized = true;
-        emitOutputLines(Xc2ProcessOutput::Stream::StandardOutput,
-                        lines.standardOutput);
-        emitOutputLines(Xc2ProcessOutput::Stream::StandardError,
-                        lines.standardError);
     }
 
     void emitOutputLines(Xc2ProcessOutput::Stream stream,
                          const QStringList &lines)
     {
-        for (const QString &line : lines) {
-            if (shouldHoldOutputTail()) {
-                if (!publishHeldOutput(stream))
-                    return;
-                if (shouldHoldOutputTail()) {
-                    heldOutput(stream) = line;
-                    observe(QStringLiteral("output-tail-held:%1:%2")
-                                .arg(attempt->attemptId)
-                                .arg(stream
-                                     == Xc2ProcessOutput::Stream::StandardError
-                                         ? QStringLiteral("stderr")
-                                         : QStringLiteral("stdout")));
-                    continue;
-                }
-            } else if (!publishHeldOutput(stream)) {
-                return;
-            }
-            if (!publishOutputLineNow(stream, line))
-                return;
-        }
+        queueOutputLines(stream, lines);
+        drainPendingPublications(stream);
     }
 
     bool shouldHoldOutputTail() const
@@ -1222,22 +1319,46 @@ struct Xc2BackendManager::RunContext final : QObject {
             && !stopRequested && !failureEmitted;
     }
 
-    std::optional<QString> &heldOutput(Xc2ProcessOutput::Stream stream)
+    Attempt::OutputPublication &outputPublication(
+        Xc2ProcessOutput::Stream stream)
     {
         return stream == Xc2ProcessOutput::Stream::StandardError
-            ? attempt->heldStandardError : attempt->heldStandardOutput;
+            ? attempt->standardErrorPublication
+            : attempt->standardOutputPublication;
     }
 
-    bool publishHeldOutput(Xc2ProcessOutput::Stream stream)
+    void drainPendingPublications(Xc2ProcessOutput::Stream stream)
     {
         if (!attempt)
-            return false;
-        std::optional<QString> &held = heldOutput(stream);
-        if (!held.has_value())
-            return true;
-        QString line = std::move(held.value());
-        held.reset();
-        return publishOutputLineNow(stream, line);
+            return;
+        const quint64 attemptId = attempt->attemptId;
+        Attempt::OutputPublication &initial = outputPublication(stream);
+        if (initial.draining)
+            return;
+        initial.draining = true;
+        while (isCurrentAttempt(attemptId)) {
+            publishHeldWhenRequired(stream);
+            Attempt::OutputPublication &publication =
+                outputPublication(stream);
+            if (publication.pending.isEmpty()) {
+                if (attempt->outputFinalizationRequested
+                    && !attempt->outputFinalized
+                    && !attempt->outputFinalizationInProgress
+                    && tryFinalizeOutput(*attempt)) {
+                    continue;
+                }
+                break;
+            }
+            const QString line = publication.pending.constFirst();
+            const bool stillOwned = publishOutputLineNow(stream, line);
+            if (!isCurrentAttempt(attemptId))
+                break;
+            outputPublication(stream).pending.removeFirst();
+            if (!stillOwned)
+                break;
+        }
+        if (isCurrentAttempt(attemptId))
+            outputPublication(stream).draining = false;
     }
 
     bool publishOutputLineNow(Xc2ProcessOutput::Stream stream,
