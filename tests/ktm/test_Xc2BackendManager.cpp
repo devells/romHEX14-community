@@ -473,12 +473,15 @@ QString queriedImagePath(HANDLE handle)
 class QuitSink final : public QObject {
 public:
     int count = 0;
+    std::function<void()> onQuit;
 
 protected:
     bool eventFilter(QObject *watched, QEvent *event) override
     {
         if (watched == qApp && event->type() == QEvent::Quit) {
             ++count;
+            if (onQuit)
+                onQuit();
             return true;
         }
         return false;
@@ -3083,6 +3086,74 @@ private slots:
                 CloseHandle(child);
         }
         qApp->removeEventFilter(&sink);
+    }
+
+    void taggedQuitWaitsForContextAdoptedByRepostHook()
+    {
+        ReaperRepostHookReset reset;
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString firstLock = directory.filePath("first.lock");
+        const QString secondLock = directory.filePath("second.lock");
+        auto *first = new Xc2BackendManager;
+        auto *second = new Xc2BackendManager;
+        QSignalSpy firstReady(first, &Xc2BackendManager::ready);
+        QSignalSpy secondReady(second, &Xc2BackendManager::ready);
+        QVERIFY(Xc2BackendManagerTestAccess::startFake(
+            *first, firstLock,
+            {Xc2BackendManagerTestAccess::allocateCandidate()},
+            {QStringLiteral("--ignore-shutdown")},
+            directory.filePath("first.jsonl"), 5000, 200, 80, 1));
+        QVERIFY(Xc2BackendManagerTestAccess::startFake(
+            *second, secondLock,
+            {Xc2BackendManagerTestAccess::allocateCandidate()},
+            {QStringLiteral("--ignore-shutdown")},
+            directory.filePath("second.jsonl"), 5000, 200, 80, 1,
+            {}, {}, nullptr, {}, false, false, {}, {}, false, 1000));
+        QTRY_COMPARE_WITH_TIMEOUT(firstReady.count(), 1, 7000);
+        QTRY_COMPARE_WITH_TIMEOUT(secondReady.count(), 1, 7000);
+        HANDLE firstChild = openStableHandle(first->ownedProcessId());
+        HANDLE secondChild = openStableHandle(second->ownedProcessId());
+        QVERIFY(firstChild != nullptr && handleIsLive(firstChild));
+        QVERIFY(secondChild != nullptr && handleIsLive(secondChild));
+
+        QuitSink sink;
+        bool secondReapedBeforeQuit = false;
+        sink.onQuit = [&] {
+            secondReapedBeforeQuit = handleIsSignaled(secondChild)
+                && lockIsAvailable(secondLock);
+        };
+        qApp->installEventFilter(&sink);
+        int repostCount = 0;
+        bool secondAdopted = false;
+        Xc2BackendManagerTestAccess::setReaperRepostHook([&] {
+            ++repostCount;
+            if (secondAdopted)
+                return;
+            secondAdopted = true;
+            delete second;
+            second = nullptr;
+        });
+
+        delete first;
+        first = nullptr;
+        QCoreApplication::postEvent(qApp, new QEvent(QEvent::Quit));
+        QTRY_VERIFY_WITH_TIMEOUT(secondAdopted, 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(handleIsSignaled(firstChild), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(handleIsSignaled(secondChild), 5000);
+        QTRY_VERIFY_WITH_TIMEOUT(lockIsAvailable(firstLock), 3000);
+        QTRY_VERIFY_WITH_TIMEOUT(lockIsAvailable(secondLock), 3000);
+        QTRY_COMPARE_WITH_TIMEOUT(sink.count, 1, 3000);
+        QCoreApplication::sendPostedEvents();
+        const int finalQuitCount = sink.count;
+        const int finalRepostCount = repostCount;
+        qApp->removeEventFilter(&sink);
+        CloseHandle(firstChild);
+        CloseHandle(secondChild);
+
+        QCOMPARE(finalQuitCount, 1);
+        QVERIFY(secondReapedBeforeQuit);
+        QCOMPARE(finalRepostCount, 2);
     }
 
     void forcedApplicationExitJobObjectContainsChildTree()

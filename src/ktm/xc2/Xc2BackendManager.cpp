@@ -428,6 +428,10 @@ protected:
             return QObject::eventFilter(watched, event);
         if (event == m_repostedQuitEvent) {
             m_repostedQuitEvent = nullptr;
+            if (!m_items.isEmpty()) {
+                m_quitPending = true;
+                return true;
+            }
             m_quitPending = false;
             m_queueBarrierEvent = new QEvent(
                 static_cast<QEvent::Type>(QEvent::User + 42));
