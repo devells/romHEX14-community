@@ -529,6 +529,8 @@ struct Xc2BackendManager::RunContext final : QObject {
         bool finishedObserved = false;
         int exitCode = -1;
         QProcess::ExitStatus exitStatus = QProcess::CrashExit;
+        std::optional<QString> heldStandardOutput;
+        std::optional<QString> heldStandardError;
     };
 
     enum class CleanupPhase {
@@ -1170,7 +1172,17 @@ struct Xc2BackendManager::RunContext final : QObject {
     {
         if (current.outputFinalized)
             return;
-        const Xc2ProcessOutput::FinishedLines lines = current.output.finish();
+        Xc2ProcessOutput::FinishedLines lines = current.output.finish();
+        if (current.heldStandardOutput.has_value()) {
+            lines.standardOutput.prepend(
+                std::move(current.heldStandardOutput.value()));
+            current.heldStandardOutput.reset();
+        }
+        if (current.heldStandardError.has_value()) {
+            lines.standardError.prepend(
+                std::move(current.heldStandardError.value()));
+            current.heldStandardError.reset();
+        }
         current.outputFinalized = true;
         emitOutputLines(Xc2ProcessOutput::Stream::StandardOutput,
                         lines.standardOutput);
@@ -1181,20 +1193,67 @@ struct Xc2BackendManager::RunContext final : QObject {
     void emitOutputLines(Xc2ProcessOutput::Stream stream,
                          const QStringList &lines)
     {
-        const bool standardError =
-            stream == Xc2ProcessOutput::Stream::StandardError;
         for (const QString &line : lines) {
-            revokeUnexpectedSignaledExitBeforeOutput();
-            bool published = false;
-            const bool stillOwned = invokeManager(
-                [this, standardError, &line, &published](
-                    Xc2BackendManager *manager) {
-                    published = manager->publishOutputLine(
-                        this, standardError, line);
-                });
-            if (!published || !stillOwned)
+            if (shouldHoldOutputTail()) {
+                if (!publishHeldOutput(stream))
+                    return;
+                if (shouldHoldOutputTail()) {
+                    heldOutput(stream) = line;
+                    observe(QStringLiteral("output-tail-held:%1:%2")
+                                .arg(attempt->attemptId)
+                                .arg(stream
+                                     == Xc2ProcessOutput::Stream::StandardError
+                                         ? QStringLiteral("stderr")
+                                         : QStringLiteral("stdout")));
+                    continue;
+                }
+            } else if (!publishHeldOutput(stream)) {
+                return;
+            }
+            if (!publishOutputLineNow(stream, line))
                 return;
         }
+    }
+
+    bool shouldHoldOutputTail() const
+    {
+        return attempt && attempt->networkAuthorized
+            && !attempt->outputFinalized && !attempt->collisionCleanup
+            && !stopRequested && !failureEmitted;
+    }
+
+    std::optional<QString> &heldOutput(Xc2ProcessOutput::Stream stream)
+    {
+        return stream == Xc2ProcessOutput::Stream::StandardError
+            ? attempt->heldStandardError : attempt->heldStandardOutput;
+    }
+
+    bool publishHeldOutput(Xc2ProcessOutput::Stream stream)
+    {
+        if (!attempt)
+            return false;
+        std::optional<QString> &held = heldOutput(stream);
+        if (!held.has_value())
+            return true;
+        QString line = std::move(held.value());
+        held.reset();
+        return publishOutputLineNow(stream, line);
+    }
+
+    bool publishOutputLineNow(Xc2ProcessOutput::Stream stream,
+                              const QString &line)
+    {
+        revokeUnexpectedSignaledExitBeforeOutput();
+        const bool standardError =
+            stream == Xc2ProcessOutput::Stream::StandardError;
+        bool published = false;
+        const bool stillOwned = invokeManager(
+            [this, standardError, &line, &published](
+                Xc2BackendManager *manager) {
+                published = manager->publishOutputLine(
+                    this, standardError, line);
+            });
+        return published && stillOwned;
     }
 
     void revokeUnexpectedSignaledExitBeforeOutput()

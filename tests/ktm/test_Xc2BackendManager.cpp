@@ -2533,54 +2533,216 @@ private slots:
         QVERIFY(directory.isValid());
         const QString lockPath = privateLockPath(directory);
         const QString trigger = directory.filePath("newline-exit.trigger");
+        const QString release = directory.filePath("newline-exit.release");
+        const auto lifecycleTrace = std::make_shared<QStringList>();
         auto *manager = new Xc2BackendManager;
         QPointer<Xc2BackendManager> guardedManager(manager);
         int readyCount = 0;
         int failedCount = 0;
+        bool releaseIssued = false;
+        bool sawRunningLine = false;
+        bool runningLinePublishedWhileLive = false;
         bool sawFinalLine = false;
         bool publicationCleared = false;
         bool failedBeforeOutput = false;
+        bool deletedFromOutput = false;
+        HANDLE child = nullptr;
+        QStringList order;
         QObject::connect(manager, &Xc2BackendManager::ready,
                          manager, [&] { ++readyCount; });
         QObject::connect(manager, &Xc2BackendManager::failed,
-                         manager, [&] { ++failedCount; });
+                         manager, [&] {
+            ++failedCount;
+            order.append(QStringLiteral("failed"));
+        });
         QObject::connect(manager, &Xc2BackendManager::outputLine,
                          manager, [&](bool standardError,
                                       const QString &line) {
-            if (standardError
-                || line != QStringLiteral("unexpected-final-line")) {
+            if (standardError)
+                return;
+            if (line == QStringLiteral("running-before-final")) {
+                sawRunningLine = true;
+                runningLinePublishedWhileLive =
+                    manager->state() == Xc2BackendState::Ready
+                    && child != nullptr && handleIsLive(child)
+                    && !manager->endpoints().restBaseUrl.isEmpty();
+                order.append(QStringLiteral("running"));
                 return;
             }
+            if (line != QStringLiteral("unexpected-final-line"))
+                return;
             sawFinalLine = true;
+            order.append(QStringLiteral("final"));
             publicationCleared =
                 manager->endpoints().restBaseUrl.isEmpty()
                 && manager->endpoints().webSocketUrl.isEmpty()
                 && !manager->currentUser().has_value();
             failedBeforeOutput = manager->state() == Xc2BackendState::Failed
                 && failedCount == 1;
-            manager->stop();
-            manager->deleteLater();
+            if (releaseIssued) {
+                deletedFromOutput = true;
+                manager->stop();
+                manager->deleteLater();
+            }
         });
         QVERIFY(Xc2BackendManagerTestAccess::startFake(
             *manager, lockPath,
             {Xc2BackendManagerTestAccess::allocateCandidate()},
-            {QStringLiteral("--newline-exit-trigger"), trigger},
+            {QStringLiteral("--newline-exit-trigger"), trigger,
+             QStringLiteral("--newline-exit-release-trigger"), release},
             directory.filePath("newline-exit.jsonl"),
-            5000, 500, 100, 1));
+            5000, 500, 100, 1, {}, {}, nullptr, lifecycleTrace));
         QTRY_COMPARE_WITH_TIMEOUT(readyCount, 1, 7000);
-        HANDLE child = openStableHandle(manager->ownedProcessId());
+        child = openStableHandle(manager->ownedProcessId());
         QVERIFY(child != nullptr && handleIsLive(child));
         QFile triggerFile(trigger);
         QVERIFY(triggerFile.open(QIODevice::WriteOnly));
         triggerFile.write("exit");
         triggerFile.close();
+        const auto tailHeldCount = [&](const QString &stream) {
+            qsizetype count = 0;
+            for (const QString &event : std::as_const(*lifecycleTrace)) {
+                if (event.startsWith(QStringLiteral("output-tail-held:"))
+                    && event.endsWith(QLatin1Char(':') + stream))
+                    ++count;
+            }
+            return count;
+        };
+        QTRY_VERIFY_WITH_TIMEOUT(
+            (sawRunningLine
+             && tailHeldCount(QStringLiteral("stdout")) >= 2)
+                || sawFinalLine,
+            5000);
+        const bool finalHeldBeforeRelease =
+            tailHeldCount(QStringLiteral("stdout")) >= 2
+            && sawRunningLine && !sawFinalLine
+            && handleIsLive(child)
+            && manager->state() == Xc2BackendState::Ready
+            && !manager->endpoints().restBaseUrl.isEmpty()
+            && manager->currentUser().has_value();
+        releaseIssued = true;
+        QFile releaseFile(release);
+        QVERIFY(releaseFile.open(QIODevice::WriteOnly));
+        releaseFile.write("exit");
+        releaseFile.close();
         QTRY_VERIFY_WITH_TIMEOUT(sawFinalLine, 5000);
-        QVERIFY(publicationCleared);
-        QVERIFY(failedBeforeOutput);
-        QCOMPARE(failedCount, 1);
-        QTRY_VERIFY_WITH_TIMEOUT(guardedManager.isNull(), 5000);
         QTRY_VERIFY_WITH_TIMEOUT(handleIsSignaled(child), 5000);
         QTRY_VERIFY_WITH_TIMEOUT(lockIsAvailable(lockPath), 3000);
+        if (guardedManager)
+            guardedManager->deleteLater();
+        QTRY_VERIFY_WITH_TIMEOUT(guardedManager.isNull(), 5000);
+        QVERIFY(finalHeldBeforeRelease);
+        QVERIFY(sawRunningLine);
+        QVERIFY(runningLinePublishedWhileLive);
+        QVERIFY(publicationCleared);
+        QVERIFY(failedBeforeOutput);
+        QVERIFY(deletedFromOutput);
+        QCOMPARE(failedCount, 1);
+        QCOMPARE(order.count(QStringLiteral("running")), 1);
+        QCOMPARE(order.count(QStringLiteral("failed")), 1);
+        QCOMPARE(order.count(QStringLiteral("final")), 1);
+        QVERIFY(order.indexOf(QStringLiteral("running"))
+                < order.indexOf(QStringLiteral("failed")));
+        QVERIFY(order.indexOf(QStringLiteral("failed"))
+                < order.indexOf(QStringLiteral("final")));
+        CloseHandle(child);
+    }
+
+    void deliberateStopFlushesHeldCompleteLineWithoutLoss()
+    {
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString lockPath = privateLockPath(directory);
+        const QString trigger = directory.filePath("running-output.trigger");
+        const QString release = directory.filePath("unused-exit.release");
+        const auto lifecycleTrace = std::make_shared<QStringList>();
+        Xc2BackendManager manager;
+        QSignalSpy ready(&manager, &Xc2BackendManager::ready);
+        QSignalSpy failed(&manager, &Xc2BackendManager::failed);
+        QSignalSpy stopped(&manager, &Xc2BackendManager::stopped);
+        HANDLE child = nullptr;
+        QStringList standardOutputLines;
+        QStringList standardErrorLines;
+        QList<Xc2BackendState> standardOutputStates;
+        QList<Xc2BackendState> standardErrorStates;
+        QList<bool> standardOutputHandleLive;
+        QList<bool> standardErrorHandleLive;
+        QObject::connect(&manager, &Xc2BackendManager::outputLine,
+                         &manager, [&](bool standardError,
+                                       const QString &line) {
+            QStringList &lines = standardError
+                ? standardErrorLines : standardOutputLines;
+            QList<Xc2BackendState> &states = standardError
+                ? standardErrorStates : standardOutputStates;
+            QList<bool> &handleLive = standardError
+                ? standardErrorHandleLive : standardOutputHandleLive;
+            lines.append(line);
+            states.append(manager.state());
+            handleLive.append(child != nullptr && handleIsLive(child));
+        });
+        QVERIFY(Xc2BackendManagerTestAccess::startFake(
+            manager, lockPath,
+            {Xc2BackendManagerTestAccess::allocateCandidate()},
+            {QStringLiteral("--newline-exit-trigger"), trigger,
+             QStringLiteral("--newline-exit-release-trigger"), release},
+            directory.filePath("deliberate-stop-output.jsonl"),
+            5000, 500, 100, 1, {}, {}, nullptr, lifecycleTrace));
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 7000);
+        child = openStableHandle(manager.ownedProcessId());
+        QVERIFY(child != nullptr && handleIsLive(child));
+        QFile triggerFile(trigger);
+        QVERIFY(triggerFile.open(QIODevice::WriteOnly));
+        triggerFile.write("output");
+        triggerFile.close();
+        QTRY_COMPARE_WITH_TIMEOUT(standardOutputLines.size(), 1, 5000);
+        QTRY_COMPARE_WITH_TIMEOUT(standardErrorLines.size(), 1, 5000);
+        QCOMPARE(standardOutputLines.constFirst(),
+                 QStringLiteral("running-before-final"));
+        QCOMPARE(standardErrorLines.constFirst(),
+                 QStringLiteral("running-stderr-before-final"));
+        QCOMPARE(standardOutputStates.constFirst(), Xc2BackendState::Ready);
+        QCOMPARE(standardErrorStates.constFirst(), Xc2BackendState::Ready);
+        QVERIFY(standardOutputHandleLive.constFirst());
+        QVERIFY(standardErrorHandleLive.constFirst());
+        QVERIFY(handleIsLive(child));
+        QCOMPARE(manager.state(), Xc2BackendState::Ready);
+        QVERIFY(!manager.recentOutput(false).contains(
+            QStringLiteral("unexpected-final-line")));
+        QVERIFY(!manager.recentOutput(true).contains(
+            QStringLiteral("unexpected-stderr-final-line")));
+        qsizetype stdoutHeldCount = 0;
+        qsizetype stderrHeldCount = 0;
+        for (const QString &event : std::as_const(*lifecycleTrace)) {
+            if (!event.startsWith(QStringLiteral("output-tail-held:")))
+                continue;
+            if (event.endsWith(QStringLiteral(":stdout")))
+                ++stdoutHeldCount;
+            if (event.endsWith(QStringLiteral(":stderr")))
+                ++stderrHeldCount;
+        }
+        QCOMPARE(stdoutHeldCount, 2);
+        QCOMPARE(stderrHeldCount, 2);
+
+        manager.stop();
+        QTRY_COMPARE_WITH_TIMEOUT(stopped.count(), 1, 5000);
+        QCOMPARE(failed.count(), 0);
+        QCOMPARE(standardOutputLines,
+                 QStringList({QStringLiteral("running-before-final"),
+                              QStringLiteral("unexpected-final-line")}));
+        QCOMPARE(standardErrorLines,
+                 QStringList({
+                     QStringLiteral("running-stderr-before-final"),
+                     QStringLiteral("unexpected-stderr-final-line")}));
+        QCOMPARE(standardOutputStates,
+                 QList<Xc2BackendState>({Xc2BackendState::Ready,
+                                         Xc2BackendState::Stopping}));
+        QCOMPARE(standardErrorStates,
+                 QList<Xc2BackendState>({Xc2BackendState::Ready,
+                                         Xc2BackendState::Stopping}));
+        QCOMPARE(manager.recentOutput(false), standardOutputLines);
+        QCOMPARE(manager.recentOutput(true), standardErrorLines);
+        QVERIFY(handleIsSignaled(child));
+        QVERIFY(lockIsAvailable(lockPath));
         CloseHandle(child);
     }
 

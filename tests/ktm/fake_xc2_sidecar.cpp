@@ -40,6 +40,7 @@ struct Options {
     QString releaseTriggerPath;
     QString exitTriggerPath;
     QString newlineExitTriggerPath;
+    QString newlineExitReleasePath;
     QString eventLogPath;
 };
 
@@ -124,6 +125,10 @@ bool parseOptions(const QStringList &arguments, Options &options)
         } else if (argument == QStringLiteral("--newline-exit-trigger")) {
             if (!takeValue(arguments, i, options.newlineExitTriggerPath))
                 return false;
+        } else if (argument
+                   == QStringLiteral("--newline-exit-release-trigger")) {
+            if (!takeValue(arguments, i, options.newlineExitReleasePath))
+                return false;
         } else if (argument == QStringLiteral("--event-log")) {
             if (!takeValue(arguments, i, options.eventLogPath))
                 return false;
@@ -147,6 +152,7 @@ bool parseOptions(const QStringList &arguments, Options &options)
              options.releaseTriggerPath,
              options.exitTriggerPath,
              options.newlineExitTriggerPath,
+             options.newlineExitReleasePath,
              options.eventLogPath,
          }) {
         if (!path.isEmpty() && !QDir::isAbsolutePath(path))
@@ -371,9 +377,33 @@ public:
                 QFile output;
                 output.open(stdout, QIODevice::WriteOnly,
                             QFileDevice::DontCloseHandle);
-                output.write("unexpected-final-line\n");
+                output.write("running-before-final\nunexpected-final-line\n");
                 output.flush();
+                QFile errorOutput;
+                errorOutput.open(stderr, QIODevice::WriteOnly,
+                                 QFileDevice::DontCloseHandle);
+                errorOutput.write(
+                    "running-stderr-before-final\n"
+                    "unexpected-stderr-final-line\n");
+                errorOutput.flush();
                 m_log->write(QStringLiteral("NEWLINE_EXIT_TRIGGERED"));
+                if (!m_options.newlineExitReleasePath.isEmpty()) {
+                    auto *releaseTimer = new QTimer(this);
+                    releaseTimer->setInterval(1);
+                    connect(releaseTimer, &QTimer::timeout, this,
+                            [this, releaseTimer] {
+                        if (!QFileInfo::exists(
+                                m_options.newlineExitReleasePath)) {
+                            return;
+                        }
+                        releaseTimer->stop();
+                        m_log->write(
+                            QStringLiteral("NEWLINE_EXIT_RELEASED"));
+                        std::_Exit(9);
+                    });
+                    releaseTimer->start();
+                    return;
+                }
                 std::_Exit(9);
             });
             timer->start();
