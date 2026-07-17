@@ -221,6 +221,11 @@ int FakeXc2TransportServer::webSocketConnectionCount() const
     return m_webSocketConnectionCount;
 }
 
+int FakeXc2TransportServer::webSocketDisconnectionCount() const
+{
+    return m_webSocketDisconnectionCount;
+}
+
 int FakeXc2TransportServer::openConnectionCount() const
 {
     int count = 0;
@@ -248,6 +253,16 @@ int FakeXc2TransportServer::unexpectedOperationCount() const
     return m_unexpectedOperationCount;
 }
 
+int FakeXc2TransportServer::terminalBurstExecutionCount() const
+{
+    return m_terminalBurstExecutionCount;
+}
+
+int FakeXc2TransportServer::terminalCloseAttemptCount() const
+{
+    return m_terminalCloseAttemptCount;
+}
+
 const QList<FakeXc2HttpRequest> &FakeXc2TransportServer::restRequests() const
 {
     return m_restRequests;
@@ -259,9 +274,19 @@ FakeXc2TransportServer::capturedRestRequests() const
     return m_capturedRestRequests;
 }
 
+const QList<QByteArray> &FakeXc2TransportServer::restResponses() const
+{
+    return m_restResponses;
+}
+
 const QList<FakeXc2HttpRequest> &FakeXc2TransportServer::upgradeRequests() const
 {
     return m_upgradeRequests;
+}
+
+const QList<QByteArray> &FakeXc2TransportServer::upgradeResponses() const
+{
+    return m_upgradeResponses;
 }
 
 const QList<FakeXc2WebSocketMessage> &FakeXc2TransportServer::messages() const
@@ -279,6 +304,12 @@ const QList<ktm::xc2::Xc2StompFrame> &
 FakeXc2TransportServer::sentStompFrames() const
 {
     return m_sentStompFrames;
+}
+
+const QList<ktm::xc2::Xc2StompFrame> &
+FakeXc2TransportServer::attemptedTerminalFrames() const
+{
+    return m_attemptedTerminalFrames;
 }
 
 const QList<ktm::xc2::Xc2Error> &FakeXc2TransportServer::decodeErrors() const
@@ -413,6 +444,8 @@ void FakeXc2TransportServer::acceptConnections()
 {
     while (m_tcpServer->hasPendingConnections()) {
         QTcpSocket *socket = m_tcpServer->nextPendingConnection();
+        if (!m_connectionElapsed.isValid())
+            m_connectionElapsed.start();
         ++m_connectionCount;
         auto *connection = new RawConnection{socket, false};
         m_rawConnections.append(connection);
@@ -546,15 +579,18 @@ void FakeXc2TransportServer::inspect(QTcpSocket *socket)
             "HTTP/1.1 302 Found\r\nLocation: ") + location
             + QByteArrayLiteral(
                 "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        m_upgradeResponses.append(response);
         socket->write(response);
         socket->disconnectFromHost();
         return;
     }
     if (m_upgradeMode == UpgradeMode::Reject) {
         socket->read(totalRequestBytes);
-        socket->write(QByteArrayLiteral(
+        const QByteArray response = QByteArrayLiteral(
             "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n"
-            "Connection: close\r\n\r\n"));
+            "Connection: close\r\n\r\n");
+        m_upgradeResponses.append(response);
+        socket->write(response);
         socket->disconnectFromHost();
         return;
     }
@@ -571,6 +607,7 @@ void FakeXc2TransportServer::inspect(QTcpSocket *socket)
             "Sec-WebSocket-Accept: ") + accept
             + QByteArrayLiteral(
                 "\r\nSec-WebSocket-Protocol: v11.stomp\r\n\r\n");
+        m_upgradeResponses.append(response);
         socket->write(response);
         return;
     }
@@ -584,6 +621,10 @@ void FakeXc2TransportServer::inspect(QTcpSocket *socket)
 void FakeXc2TransportServer::respondToRest(
     QTcpSocket *socket, const FakeXc2HttpRequest &request)
 {
+    const auto writeResponse = [this, socket](QByteArray response) {
+        m_restResponses.append(response);
+        socket->write(response);
+    };
     const bool health = request.target
         == QByteArrayLiteral("/xc2/1.0/serviceStatus/status");
     if (health) {
@@ -591,38 +632,38 @@ void FakeXc2TransportServer::respondToRest(
         case ProbeScript::HealthNoResponse:
             return;
         case ProbeScript::HealthTruncated:
-            socket->write(QByteArrayLiteral(
+            writeResponse(QByteArrayLiteral(
                 "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
                 "Connection: close\r\n\r\nal"));
             socket->disconnectFromHost();
             return;
         case ProbeScript::Health204:
-            socket->write(QByteArrayLiteral(
+            writeResponse(QByteArrayLiteral(
                 "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"));
             socket->disconnectFromHost();
             return;
         case ProbeScript::HealthMalformedSuccess:
-            socket->write(httpResponse(
+            writeResponse(httpResponse(
                 200, QByteArrayLiteral("OK"), QByteArrayLiteral("dead"),
                 QByteArrayLiteral("Content-Type: text/plain\r\n")));
             socket->disconnectFromHost();
             return;
         case ProbeScript::HealthBackendUnavailable:
-            socket->write(httpResponse(
+            writeResponse(httpResponse(
                 503, QByteArrayLiteral("Service Unavailable"),
                 validErrorPayload(503),
                 QByteArrayLiteral("Content-Type: application/json\r\n")));
             socket->disconnectFromHost();
             return;
         case ProbeScript::HealthAuth401:
-            socket->write(httpResponse(
+            writeResponse(httpResponse(
                 401, QByteArrayLiteral("Unauthorized"),
                 validErrorPayload(401),
                 QByteArrayLiteral("Content-Type: application/json\r\n")));
             socket->disconnectFromHost();
             return;
         case ProbeScript::HealthMalformedError:
-            socket->write(httpResponse(
+            writeResponse(httpResponse(
                 503, QByteArrayLiteral("Service Unavailable"),
                 QByteArrayLiteral("{"),
                 QByteArrayLiteral("Content-Type: application/json\r\n")));
@@ -637,7 +678,7 @@ void FakeXc2TransportServer::respondToRest(
             headers += QByteArrayLiteral("Set-Cookie: ") + m_restCookie
                 + QByteArrayLiteral("; Path=/\r\n");
         }
-        socket->write(httpResponse(200, QByteArrayLiteral("OK"),
+        writeResponse(httpResponse(200, QByteArrayLiteral("OK"),
                                    QByteArrayLiteral("alive"), headers));
         socket->disconnectFromHost();
         return;
@@ -647,44 +688,44 @@ void FakeXc2TransportServer::respondToRest(
     case ProbeScript::CurrentUserNoResponse:
         return;
     case ProbeScript::CurrentUserTruncated:
-        socket->write(QByteArrayLiteral(
+        writeResponse(QByteArrayLiteral(
             "HTTP/1.1 200 OK\r\nContent-Length: 64\r\n"
             "Connection: close\r\n\r\n{\"loginName\":"));
         socket->disconnectFromHost();
         return;
     case ProbeScript::CurrentUser204:
-        socket->write(QByteArrayLiteral(
+        writeResponse(QByteArrayLiteral(
             "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"));
         socket->disconnectFromHost();
         return;
     case ProbeScript::CurrentUserMalformedSuccess:
-        socket->write(httpResponse(
+        writeResponse(httpResponse(
             200, QByteArrayLiteral("OK"),
             QByteArrayLiteral("{\"loginName\":"),
             QByteArrayLiteral("Content-Type: application/json\r\n")));
         socket->disconnectFromHost();
         return;
     case ProbeScript::CurrentUserBackendUnavailable:
-        socket->write(httpResponse(
+        writeResponse(httpResponse(
             503, QByteArrayLiteral("Service Unavailable"),
             validErrorPayload(503),
             QByteArrayLiteral("Content-Type: application/json\r\n")));
         socket->disconnectFromHost();
         return;
     case ProbeScript::CurrentUserAuth401:
-        socket->write(httpResponse(
+        writeResponse(httpResponse(
             401, QByteArrayLiteral("Unauthorized"), validErrorPayload(401),
             QByteArrayLiteral("Content-Type: application/json\r\n")));
         socket->disconnectFromHost();
         return;
     case ProbeScript::CurrentUserAuth403:
-        socket->write(httpResponse(
+        writeResponse(httpResponse(
             403, QByteArrayLiteral("Forbidden"), validErrorPayload(403),
             QByteArrayLiteral("Content-Type: application/json\r\n")));
         socket->disconnectFromHost();
         return;
     case ProbeScript::CurrentUserMalformedAuthError:
-        socket->write(httpResponse(
+        writeResponse(httpResponse(
             401, QByteArrayLiteral("Unauthorized"), QByteArrayLiteral("{"),
             QByteArrayLiteral("Content-Type: application/json\r\n")));
         socket->disconnectFromHost();
@@ -706,7 +747,7 @@ void FakeXc2TransportServer::respondToRest(
     } else if (m_probeScript == ProbeScript::CurrentUserBlankName) {
         name = QByteArrayLiteral("   ");
     }
-    socket->write(httpResponse(
+    writeResponse(httpResponse(
         200, QByteArrayLiteral("OK"),
         currentUserPayload(permissions, login, name),
         QByteArrayLiteral("Content-Type: application/json\r\n")));
@@ -817,6 +858,7 @@ void FakeXc2TransportServer::acceptWebSockets()
         });
         connect(socket, &QWebSocket::disconnected, this, [this, socket] {
             m_lastPeerCloseCode = socket->closeCode();
+            ++m_webSocketDisconnectionCount;
             emit webSocketDisconnected();
             emit connectionClosed();
         });
@@ -856,6 +898,40 @@ void FakeXc2TransportServer::runProbeStompScript(
         return;
     }
 
+    if (m_probeScript == ProbeScript::ApprovedTopicMessagesBeforeReceipt
+        && frame.command == QByteArrayLiteral("SUBSCRIBE")
+        && frame.headers.value(QByteArrayLiteral("destination"))
+            == QByteArrayLiteral("/topic/login")) {
+        ktm::xc2::Xc2StompFrame vciMessage;
+        vciMessage.command = QByteArrayLiteral("MESSAGE");
+        vciMessage.headers.insert(
+            QByteArrayLiteral("destination"),
+            QByteArrayLiteral("/topic/vci/status"));
+        vciMessage.headers.insert(
+            QByteArrayLiteral("subscription"),
+            QByteArrayLiteral("vci-status-subscription"));
+        vciMessage.headers.insert(
+            QByteArrayLiteral("message-id"),
+            QByteArrayLiteral("probe-vci-message"));
+        vciMessage.body = QByteArrayLiteral("{\"status\":\"available\"}");
+        sendFrame(vciMessage);
+
+        ktm::xc2::Xc2StompFrame loginMessage;
+        loginMessage.command = QByteArrayLiteral("MESSAGE");
+        loginMessage.headers.insert(
+            QByteArrayLiteral("destination"),
+            QByteArrayLiteral("/topic/login"));
+        loginMessage.headers.insert(
+            QByteArrayLiteral("subscription"),
+            QByteArrayLiteral("login-subscription"));
+        loginMessage.headers.insert(
+            QByteArrayLiteral("message-id"),
+            QByteArrayLiteral("probe-login-message"));
+        loginMessage.body = QByteArrayLiteral("{\"loggedIn\":true}");
+        sendFrame(loginMessage);
+        return;
+    }
+
     if (frame.command != QByteArrayLiteral("DISCONNECT"))
         return;
     const QByteArray receipt =
@@ -875,7 +951,43 @@ void FakeXc2TransportServer::runProbeStompScript(
         m_probeScript == ProbeScript::WrongDisconnectReceipt
             ? QByteArrayLiteral("disconnect-wrong-generation")
             : receipt);
-    if (m_probeScript == ProbeScript::LateDisconnectReceipt) {
+    if (m_probeScript == ProbeScript::DeadlineBoundaryTerminalBurst) {
+        const QPointer<FakeXc2TransportServer> owner(this);
+        const QPointer<QWebSocket> guarded(socket);
+        const int delayMs = qMax(
+            0, m_probeDelayMs
+                - int(m_connectionElapsed.isValid()
+                          ? m_connectionElapsed.elapsed()
+                          : 0));
+        QTimer::singleShot(delayMs, Qt::PreciseTimer, this,
+                           [owner, guarded, response] {
+            if (!owner)
+                return;
+            ++owner->m_terminalBurstExecutionCount;
+
+            ktm::xc2::Xc2StompFrame error;
+            error.command = QByteArrayLiteral("ERROR");
+            error.headers.insert(
+                QByteArrayLiteral("message"),
+                QByteArrayLiteral("BOUNDARY_ERROR_SENTINEL_4c2a"));
+            error.body = QByteArrayLiteral("BOUNDARY_BODY_SENTINEL_d5e1");
+            owner->m_attemptedTerminalFrames.append(error);
+            owner->m_attemptedTerminalFrames.append(response);
+            owner->sendFrame(error);
+            owner->sendFrame(response);
+            ++owner->m_terminalCloseAttemptCount;
+            if (guarded) {
+                guarded->close(
+                    QWebSocketProtocol::CloseCodeGoingAway,
+                    QStringLiteral("boundary-terminal-burst"));
+            }
+            emit owner->terminalBurstExecuted();
+        });
+        return;
+    }
+    if (m_probeScript == ProbeScript::LateDisconnectReceipt
+        || m_probeScript
+            == ProbeScript::ApprovedTopicMessagesBeforeReceipt) {
         const QPointer<FakeXc2TransportServer> owner(this);
         const QPointer<QWebSocket> guarded(socket);
         QTimer::singleShot(m_probeDelayMs, this,

@@ -19,7 +19,7 @@
 
 namespace {
 
-constexpr int kDefaultProbeTimeoutMs = 500;
+constexpr int kDefaultProbeTimeoutMs = 2000;
 constexpr int kProcessWallBoundMs = 8000;
 constexpr int kCleanupBoundMs = 1500;
 const QByteArray kCookie =
@@ -116,6 +116,23 @@ bool waitForNoOpenConnections(FakeXc2TransportServer &server)
     return server.openConnectionCount() == 0;
 }
 
+bool waitForTerminalBurst(FakeXc2TransportServer &server)
+{
+    if (server.terminalBurstExecutionCount() != 0)
+        return true;
+    QEventLoop loop;
+    QTimer deadline;
+    deadline.setSingleShot(true);
+    deadline.setTimerType(Qt::PreciseTimer);
+    QObject::connect(
+        &server, &FakeXc2TransportServer::terminalBurstExecuted,
+        &loop, &QEventLoop::quit);
+    QObject::connect(&deadline, &QTimer::timeout, &loop, &QEventLoop::quit);
+    deadline.start(750);
+    loop.exec();
+    return server.terminalBurstExecutionCount() == 1;
+}
+
 QStringList probeArguments(const FakeXc2TransportServer &server,
                            int timeoutMs = kDefaultProbeTimeoutMs)
 {
@@ -159,6 +176,8 @@ void verifyNoSensitiveOutput(const ProcessResult &result)
         QByteArrayLiteral("INFO_SENTINEL_502d"),
         QByteArrayLiteral("STOMP_MESSAGE_SENTINEL_95be"),
         QByteArrayLiteral("STOMP_BODY_SENTINEL_d71a"),
+        QByteArrayLiteral("BOUNDARY_ERROR_SENTINEL_4c2a"),
+        QByteArrayLiteral("BOUNDARY_BODY_SENTINEL_d5e1"),
         QByteArrayLiteral("EcuDiagnosticRead"),
     };
     for (const QByteArray &sentinel : sentinels) {
@@ -274,10 +293,184 @@ void verifyCommonResult(FakeXc2TransportServer &server,
     verifyNoSensitiveOutput(result);
 }
 
+struct ProbeMilestones {
+    int restRequests = 0;
+    int restResponses = 0;
+    int upgrades = 0;
+    int webSocketConnections = 0;
+    int clientStompFrames = 0;
+    int serverStompFrames = 0;
+    int webSocketDisconnections = 0;
+};
+
+ProbeMilestones expectedMilestones(
+    FakeXc2TransportServer::ProbeScript script)
+{
+    using Script = FakeXc2TransportServer::ProbeScript;
+    switch (script) {
+    case Script::HealthNoResponse:
+        return {1, 0, 0, 0, 0, 0, 0};
+    case Script::HealthTruncated:
+    case Script::Health204:
+    case Script::HealthMalformedSuccess:
+    case Script::HealthBackendUnavailable:
+    case Script::HealthAuth401:
+    case Script::HealthMalformedError:
+        return {1, 1, 0, 0, 0, 0, 0};
+    case Script::CurrentUserNoResponse:
+        return {2, 1, 0, 0, 0, 0, 0};
+    case Script::CurrentUserTruncated:
+    case Script::CurrentUser204:
+    case Script::CurrentUserMalformedSuccess:
+    case Script::CurrentUserBackendUnavailable:
+    case Script::CurrentUserAuth401:
+    case Script::CurrentUserAuth403:
+    case Script::CurrentUserMalformedAuthError:
+    case Script::CurrentUserMissingPermission:
+    case Script::CurrentUserCaseMismatchedPermission:
+    case Script::CurrentUserBlankLogin:
+    case Script::CurrentUserBlankName:
+        return {2, 2, 0, 0, 0, 0, 0};
+    case Script::UpgradeNoResponse:
+    case Script::UpgradeRejected:
+    case Script::UpgradeWrongSubprotocol:
+        return {2, 2, 1, 0, 0, 0, 0};
+    case Script::MissingConnected:
+        return {2, 2, 1, 1, 1, 0, 1};
+    case Script::StompError:
+    case Script::MalformedConnected:
+        return {2, 2, 1, 1, 1, 1, 1};
+    case Script::MissingDisconnectReceipt:
+    case Script::CloseBeforeDisconnectReceipt:
+    case Script::LateDisconnectReceipt:
+        return {2, 2, 1, 1, 4, 1, 1};
+    case Script::Happy:
+    case Script::WrongDisconnectReceipt:
+    case Script::ReceiptThenAbnormalClose:
+        return {2, 2, 1, 1, 4, 2, 1};
+    case Script::ApprovedTopicMessagesBeforeReceipt:
+        return {2, 2, 1, 1, 4, 4, 1};
+    case Script::DeadlineBoundaryTerminalBurst:
+        return {2, 2, 1, 1, 4, -1, 1};
+    case Script::Disabled:
+        break;
+    }
+    Q_UNREACHABLE();
+    return {};
+}
+
+QList<QByteArray> expectedServerCommands(
+    FakeXc2TransportServer::ProbeScript script)
+{
+    using Script = FakeXc2TransportServer::ProbeScript;
+    switch (script) {
+    case Script::StompError:
+        return {QByteArrayLiteral("ERROR")};
+    case Script::MalformedConnected:
+    case Script::MissingDisconnectReceipt:
+    case Script::CloseBeforeDisconnectReceipt:
+    case Script::LateDisconnectReceipt:
+        return {QByteArrayLiteral("CONNECTED")};
+    case Script::Happy:
+    case Script::WrongDisconnectReceipt:
+    case Script::ReceiptThenAbnormalClose:
+        return {QByteArrayLiteral("CONNECTED"),
+                QByteArrayLiteral("RECEIPT")};
+    case Script::ApprovedTopicMessagesBeforeReceipt:
+        return {QByteArrayLiteral("CONNECTED"),
+                QByteArrayLiteral("MESSAGE"),
+                QByteArrayLiteral("MESSAGE"),
+                QByteArrayLiteral("RECEIPT")};
+    default:
+        return {};
+    }
+}
+
+void verifyProbeMilestones(FakeXc2TransportServer &server,
+                           FakeXc2TransportServer::ProbeScript script)
+{
+    using Script = FakeXc2TransportServer::ProbeScript;
+    const ProbeMilestones expected = expectedMilestones(script);
+    QCOMPARE(server.capturedRestRequests().size(), expected.restRequests);
+    QCOMPARE(server.restResponses().size(), expected.restResponses);
+    QCOMPARE(server.upgradeRequests().size(), expected.upgrades);
+    const int expectedUpgradeResponses =
+        script == Script::UpgradeRejected
+            || script == Script::UpgradeWrongSubprotocol
+        ? 1
+        : 0;
+    QCOMPARE(server.upgradeResponses().size(), expectedUpgradeResponses);
+    if (script == Script::UpgradeRejected) {
+        QVERIFY(server.upgradeResponses().constFirst().startsWith(
+            "HTTP/1.1 403 Forbidden"));
+    } else if (script == Script::UpgradeWrongSubprotocol) {
+        QVERIFY(server.upgradeResponses().constFirst().contains(
+            "Sec-WebSocket-Protocol: v11.stomp"));
+    }
+    QCOMPARE(server.webSocketConnectionCount(),
+             expected.webSocketConnections);
+    QCOMPARE(server.stompFrames().size(), expected.clientStompFrames);
+    if (expected.serverStompFrames >= 0) {
+        QCOMPARE(server.sentStompFrames().size(), expected.serverStompFrames);
+    } else {
+        QVERIFY(server.sentStompFrames().size() >= 1);
+        QVERIFY(server.sentStompFrames().size() <= 3);
+    }
+    QCOMPARE(server.webSocketDisconnectionCount(),
+             expected.webSocketDisconnections);
+
+    if (expected.restRequests >= 2) {
+        QVERIFY(!server.restResponses().isEmpty());
+        QVERIFY(server.restResponses().constFirst().contains("alive"));
+    }
+    if (expected.upgrades == 1) {
+        QCOMPARE(server.restResponses().size(), 2);
+        QVERIFY(server.restResponses().at(1).contains("LOGIN_SENTINEL_15c8"));
+        QVERIFY(server.restResponses().at(1).contains("EcuDiagnosticRead"));
+    }
+
+    if (script
+        == FakeXc2TransportServer::ProbeScript::
+            DeadlineBoundaryTerminalBurst) {
+        const QList<QByteArray> possibleCommands{
+            QByteArrayLiteral("CONNECTED"),
+            QByteArrayLiteral("ERROR"),
+            QByteArrayLiteral("RECEIPT"),
+        };
+        for (qsizetype index = 0;
+             index < server.sentStompFrames().size(); ++index) {
+            QCOMPARE(server.sentStompFrames().at(index).command,
+                     possibleCommands.at(index));
+        }
+    } else {
+        const QList<QByteArray> commands = expectedServerCommands(script);
+        QCOMPARE(commands.size(), server.sentStompFrames().size());
+        for (qsizetype index = 0; index < commands.size(); ++index) {
+            QCOMPARE(server.sentStompFrames().at(index).command,
+                     commands.at(index));
+        }
+    }
+}
+
+void verifyNoNetworkMilestones(const FakeXc2TransportServer &server)
+{
+    QCOMPARE(server.connectionCount(), 0);
+    QCOMPARE(server.capturedRestRequests().size(), 0);
+    QCOMPARE(server.restResponses().size(), 0);
+    QCOMPARE(server.upgradeRequests().size(), 0);
+    QCOMPARE(server.upgradeResponses().size(), 0);
+    QCOMPARE(server.webSocketConnectionCount(), 0);
+    QCOMPARE(server.webSocketDisconnectionCount(), 0);
+    QCOMPARE(server.stompFrames().size(), 0);
+    QCOMPARE(server.sentStompFrames().size(), 0);
+}
+
 void verifyExactSuccessCapture(FakeXc2TransportServer &server,
                                const ProcessResult &result)
 {
     verifyCommonResult(server, result, 0);
+    verifyProbeMilestones(server,
+                          FakeXc2TransportServer::ProbeScript::Happy);
     QCOMPARE(server.capturedRestRequests().size(), 2);
     QCOMPARE(server.upgradeRequests().size(), 1);
     QCOMPARE(server.webSocketConnectionCount(), 1);
@@ -337,6 +530,43 @@ private slots:
         QCOMPARE(server.requestUrl().path(), QStringLiteral("/xc2-websocket"));
     }
 
+    void approvedCurrentGenerationMessagesKeepProbeReadOnly()
+    {
+        FakeXc2TransportServer server;
+        QVERIFY(server.isListening());
+        server.setProbeScript(
+            FakeXc2TransportServer::ProbeScript::
+                ApprovedTopicMessagesBeforeReceipt);
+        server.setProbeDelayMs(40);
+        server.setRestCookie(kCookie);
+        const ProcessResult result = runProbe(server, 2000);
+        verifyCommonResult(server, result, 0);
+        verifyProbeMilestones(
+            server,
+            FakeXc2TransportServer::ProbeScript::
+                ApprovedTopicMessagesBeforeReceipt);
+        QCOMPARE(server.stompFrames().size(), 4);
+        QCOMPARE(server.sentStompFrames().size(), 4);
+        QCOMPARE(server.sentStompFrames().at(1).command,
+                 QByteArrayLiteral("MESSAGE"));
+        QCOMPARE(server.sentStompFrames().at(1).headers.value(
+                     QByteArrayLiteral("destination")),
+                 QByteArrayLiteral("/topic/vci/status"));
+        QCOMPARE(server.sentStompFrames().at(1).headers.value(
+                     QByteArrayLiteral("subscription")),
+                 QByteArrayLiteral("vci-status-subscription"));
+        QCOMPARE(server.sentStompFrames().at(2).command,
+                 QByteArrayLiteral("MESSAGE"));
+        QCOMPARE(server.sentStompFrames().at(2).headers.value(
+                     QByteArrayLiteral("destination")),
+                 QByteArrayLiteral("/topic/login"));
+        QCOMPARE(server.sentStompFrames().at(2).headers.value(
+                     QByteArrayLiteral("subscription")),
+                 QByteArrayLiteral("login-subscription"));
+        QCOMPARE(server.sentStompFrames().at(3).command,
+                 QByteArrayLiteral("RECEIPT"));
+    }
+
     void helpExitsZeroBeforeNetwork()
     {
         FakeXc2TransportServer server;
@@ -346,7 +576,7 @@ private slots:
             QString::fromUtf8(XC2_CONTRACT_PROBE_PATH),
             {QStringLiteral("--help")});
         verifyCommonResult(server, result, 0);
-        QCOMPARE(server.connectionCount(), 0);
+        verifyNoNetworkMilestones(server);
         QVERIFY(result.standardOutput.contains("--base-url"));
     }
 
@@ -432,7 +662,7 @@ private slots:
         const ProcessResult result = runProcess(
             QString::fromUtf8(XC2_CONTRACT_PROBE_PATH), arguments);
         verifyCommonResult(server, result, 2);
-        QCOMPARE(server.connectionCount(), 0);
+        verifyNoNetworkMilestones(server);
     }
 
     void restTransportAndOverallDeadlineExitTwo_data()
@@ -440,20 +670,25 @@ private slots:
         QTest::addColumn<FakeXc2TransportServer::ProbeScript>("script");
         QTest::addColumn<int>("timeoutMs");
         using Script = FakeXc2TransportServer::ProbeScript;
-        QTest::newRow("health-no-response-outer-deadline")
+        QTest::newRow("health-no-response-outer-deadline-120ms")
             << Script::HealthNoResponse << 120;
+        QTest::newRow("health-no-response-outer-deadline-150ms")
+            << Script::HealthNoResponse << 150;
+        QTest::newRow("health-no-response-outer-deadline-500ms")
+            << Script::HealthNoResponse << 500;
         QTest::newRow("health-truncated")
-            << Script::HealthTruncated << 500;
+            << Script::HealthTruncated << kDefaultProbeTimeoutMs;
         QTest::newRow("health-backend-unavailable")
-            << Script::HealthBackendUnavailable << 500;
+            << Script::HealthBackendUnavailable << kDefaultProbeTimeoutMs;
         QTest::newRow("health-401-is-not-current-user-auth")
-            << Script::HealthAuth401 << 500;
+            << Script::HealthAuth401 << kDefaultProbeTimeoutMs;
         QTest::newRow("current-user-no-response-outer-deadline")
-            << Script::CurrentUserNoResponse << 120;
+            << Script::CurrentUserNoResponse << kDefaultProbeTimeoutMs;
         QTest::newRow("current-user-truncated")
-            << Script::CurrentUserTruncated << 500;
+            << Script::CurrentUserTruncated << kDefaultProbeTimeoutMs;
         QTest::newRow("current-user-backend-unavailable")
-            << Script::CurrentUserBackendUnavailable << 500;
+            << Script::CurrentUserBackendUnavailable
+            << kDefaultProbeTimeoutMs;
     }
 
     void restTransportAndOverallDeadlineExitTwo()
@@ -465,6 +700,7 @@ private slots:
         server.setRestCookie(kCookie);
         const ProcessResult result = runProbe(server, timeoutMs);
         verifyCommonResult(server, result, 2);
+        verifyProbeMilestones(server, script);
         if (script == FakeXc2TransportServer::ProbeScript::HealthNoResponse
             || script
                 == FakeXc2TransportServer::ProbeScript::CurrentUserNoResponse) {
@@ -500,6 +736,7 @@ private slots:
         server.setRestCookie(kCookie);
         const ProcessResult result = runProbe(server);
         verifyCommonResult(server, result, 3);
+        verifyProbeMilestones(server, script);
     }
 
     void stompFailuresExitFour_data()
@@ -508,24 +745,27 @@ private slots:
         QTest::addColumn<int>("timeoutMs");
         using Script = FakeXc2TransportServer::ProbeScript;
         QTest::newRow("upgrade-no-response")
-            << Script::UpgradeNoResponse << 120;
+            << Script::UpgradeNoResponse << kDefaultProbeTimeoutMs;
         QTest::newRow("upgrade-rejected")
-            << Script::UpgradeRejected << 500;
+            << Script::UpgradeRejected << kDefaultProbeTimeoutMs;
         QTest::newRow("wrong-subprotocol")
-            << Script::UpgradeWrongSubprotocol << 500;
+            << Script::UpgradeWrongSubprotocol << kDefaultProbeTimeoutMs;
         QTest::newRow("missing-connected")
-            << Script::MissingConnected << 120;
-        QTest::newRow("stomp-error") << Script::StompError << 500;
+            << Script::MissingConnected << kDefaultProbeTimeoutMs;
+        QTest::newRow("stomp-error")
+            << Script::StompError << kDefaultProbeTimeoutMs;
         QTest::newRow("malformed-connected")
-            << Script::MalformedConnected << 500;
+            << Script::MalformedConnected << kDefaultProbeTimeoutMs;
         QTest::newRow("wrong-disconnect-receipt")
-            << Script::WrongDisconnectReceipt << 500;
+            << Script::WrongDisconnectReceipt << kDefaultProbeTimeoutMs;
         QTest::newRow("missing-disconnect-receipt")
-            << Script::MissingDisconnectReceipt << 150;
+            << Script::MissingDisconnectReceipt << kDefaultProbeTimeoutMs;
         QTest::newRow("close-before-disconnect-receipt")
-            << Script::CloseBeforeDisconnectReceipt << 500;
+            << Script::CloseBeforeDisconnectReceipt
+            << kDefaultProbeTimeoutMs;
         QTest::newRow("receipt-then-abnormal-close")
-            << Script::ReceiptThenAbnormalClose << 500;
+            << Script::ReceiptThenAbnormalClose
+            << kDefaultProbeTimeoutMs;
     }
 
     void stompFailuresExitFour()
@@ -537,6 +777,7 @@ private slots:
         server.setRestCookie(kCookie);
         const ProcessResult result = runProbe(server, timeoutMs);
         verifyCommonResult(server, result, 4);
+        verifyProbeMilestones(server, script);
         if (script == FakeXc2TransportServer::ProbeScript::UpgradeNoResponse
             || script
                 == FakeXc2TransportServer::ProbeScript::MissingConnected
@@ -568,35 +809,75 @@ private slots:
         server.setRestCookie(kCookie);
         const ProcessResult result = runProbe(server);
         verifyCommonResult(server, result, 5);
+        verifyProbeMilestones(server, script);
     }
 
     void finishAndDeadlineRaceExitsOnceAndCleansConnections()
     {
-        {
-            FakeXc2TransportServer server;
-            server.setProbeScript(
-                FakeXc2TransportServer::ProbeScript::Happy);
-            server.setRestCookie(kCookie);
-            const ProcessResult result = runProbe(server, 500);
-            verifyExactSuccessCapture(server, result);
-            QCOMPARE(result.finishedSignals, 1);
-            QCOMPARE(server.openConnectionCount(), 0);
-        }
-        {
-            FakeXc2TransportServer server;
-            server.setProbeScript(
-                FakeXc2TransportServer::ProbeScript::LateDisconnectReceipt);
-            server.setProbeDelayMs(1000);
-            server.setRestCookie(kCookie);
-            const ProcessResult result = runProbe(server, 500);
-            verifyCommonResult(server, result, 4);
-            QVERIFY2(result.runningElapsedMs < 1000,
-                     "outer disconnect deadline lost to its backstop");
-            QCOMPARE(result.finishedSignals, 1);
-            QCOMPARE(server.stompFrames().size(), 4);
-            QCOMPARE(server.sentStompFrames().size(), 1);
-            QCOMPARE(server.openConnectionCount(), 0);
-        }
+        FakeXc2TransportServer server;
+        server.setProbeScript(
+            FakeXc2TransportServer::ProbeScript::
+                DeadlineBoundaryTerminalBurst);
+        server.setProbeDelayMs(970);
+        server.setRestCookie(kCookie);
+
+        const ProcessResult result = runProbe(server, 1000);
+        QVERIFY2(waitForTerminalBurst(server),
+                 "deadline-boundary terminal burst never executed");
+        verifyCommonResult(server, result, 4);
+        verifyProbeMilestones(
+            server,
+            FakeXc2TransportServer::ProbeScript::
+                DeadlineBoundaryTerminalBurst);
+        QCOMPARE(result.finishedSignals, 1);
+        QCOMPARE(server.terminalBurstExecutionCount(), 1);
+        QCOMPARE(result.standardOutput, QByteArray());
+        const QList<QByteArray> allowedDiagnostics{
+            QByteArrayLiteral(
+                "xc2-contract-probe stage=stomp category=backend http=0 "
+                "xc2=0 summary=transport-or-contract-failure"),
+            QByteArrayLiteral(
+                "xc2-contract-probe stage=stomp category=transport http=0 "
+                "xc2=0 summary=overall-deadline"),
+        };
+        QVERIFY(allowedDiagnostics.contains(
+            result.standardError.trimmed()));
+        QCOMPARE(result.standardError.count('\n'), 1);
+        QCOMPARE(server.attemptedTerminalFrames().size(), 2);
+        QCOMPARE(server.attemptedTerminalFrames().at(0).command,
+                 QByteArrayLiteral("ERROR"));
+        QVERIFY(server.attemptedTerminalFrames().at(0).headers.value(
+                     QByteArrayLiteral("message"))
+                    .contains("BOUNDARY_ERROR_SENTINEL_4c2a"));
+        QVERIFY(server.attemptedTerminalFrames().at(0).body.contains(
+            "BOUNDARY_BODY_SENTINEL_d5e1"));
+        QCOMPARE(server.attemptedTerminalFrames().at(1).command,
+                 QByteArrayLiteral("RECEIPT"));
+        QCOMPARE(server.attemptedTerminalFrames().at(1).headers.value(
+                     QByteArrayLiteral("receipt-id")),
+                 QByteArrayLiteral("disconnect-1"));
+        QCOMPARE(server.terminalCloseAttemptCount(), 1);
+        QCOMPARE(server.openConnectionCount(), 0);
+    }
+
+    void outerDeadlinePreemptsDisconnectBackstop()
+    {
+        FakeXc2TransportServer server;
+        server.setProbeScript(
+            FakeXc2TransportServer::ProbeScript::LateDisconnectReceipt);
+        server.setProbeDelayMs(3000);
+        server.setRestCookie(kCookie);
+        const ProcessResult result = runProbe(server, 2000);
+        verifyCommonResult(server, result, 4);
+        verifyProbeMilestones(
+            server,
+            FakeXc2TransportServer::ProbeScript::LateDisconnectReceipt);
+        QVERIFY2(result.runningElapsedMs < 2500,
+                 "outer disconnect deadline lost to its backstop");
+        QCOMPARE(result.finishedSignals, 1);
+        QCOMPARE(server.stompFrames().size(), 4);
+        QCOMPARE(server.sentStompFrames().size(), 1);
+        QCOMPARE(server.openConnectionCount(), 0);
     }
 
     void outputNeverContainsCookieOrUserSentinels()
@@ -608,6 +889,16 @@ private slots:
             const ProcessResult result = runProbe(server);
             verifyExactSuccessCapture(server, result);
             verifyNoSensitiveOutput(result);
+            QVERIFY(server.restResponses().at(1).contains(
+                "LOGIN_SENTINEL_15c8"));
+            QVERIFY(server.restResponses().at(1).contains(
+                "NAME_SENTINEL_b97e"));
+            QVERIFY(server.restResponses().at(1).contains(
+                "DEALER_SENTINEL_51aa"));
+            QVERIFY(server.restResponses().at(1).contains(
+                "ADDRESS_SENTINEL_70d4"));
+            QVERIFY(server.restResponses().at(1).contains(
+                "SESSION_SENTINEL_5ed1"));
         }
         {
             FakeXc2TransportServer server;
@@ -616,7 +907,16 @@ private slots:
             server.setRestCookie(kCookie);
             const ProcessResult result = runProbe(server);
             verifyCommonResult(server, result, 5);
+            verifyProbeMilestones(
+                server,
+                FakeXc2TransportServer::ProbeScript::CurrentUserAuth401);
             verifyNoSensitiveOutput(result);
+            QVERIFY(server.restResponses().at(1).contains(
+                "BACKEND_MESSAGE_SENTINEL_6f25"));
+            QVERIFY(server.restResponses().at(1).contains(
+                "DEVELOPER_SENTINEL_844a"));
+            QVERIFY(server.restResponses().at(1).contains(
+                "INFO_SENTINEL_502d"));
         }
         {
             FakeXc2TransportServer server;
@@ -625,7 +925,16 @@ private slots:
             server.setRestCookie(kCookie);
             const ProcessResult result = runProbe(server);
             verifyCommonResult(server, result, 4);
+            verifyProbeMilestones(
+                server,
+                FakeXc2TransportServer::ProbeScript::StompError);
             verifyNoSensitiveOutput(result);
+            QCOMPARE(server.sentStompFrames().size(), 1);
+            QVERIFY(server.sentStompFrames().constFirst().headers.value(
+                         QByteArrayLiteral("message"))
+                        .contains("STOMP_MESSAGE_SENTINEL_95be"));
+            QVERIFY(server.sentStompFrames().constFirst().body.contains(
+                "STOMP_BODY_SENTINEL_d71a"));
         }
     }
 
@@ -701,8 +1010,10 @@ private slots:
         const ProcessResult result = runProcess(
             QStringLiteral("powershell.exe"), arguments);
         verifyCommonResult(server, result, expectedExitCode);
-        if (probePathMode != 0)
-            QCOMPARE(server.connectionCount(), 0);
+        if (probePathMode != 0 || emptyBase)
+            verifyNoNetworkMilestones(server);
+        else
+            verifyProbeMilestones(server, script);
     }
 };
 

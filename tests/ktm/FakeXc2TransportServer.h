@@ -3,6 +3,7 @@
 #include "ktm/xc2/Xc2StompCodec.h"
 
 #include <QByteArray>
+#include <QElapsedTimer>
 #include <QHostAddress>
 #include <QHash>
 #include <QList>
@@ -81,6 +82,8 @@ public:
         MissingDisconnectReceipt,
         CloseBeforeDisconnectReceipt,
         ReceiptThenAbnormalClose,
+        ApprovedTopicMessagesBeforeReceipt,
+        DeadlineBoundaryTerminalBurst,
         LateDisconnectReceipt
     };
 
@@ -97,15 +100,22 @@ public:
     int restRequestCount() const;
     int upgradeRequestCount() const;
     int webSocketConnectionCount() const;
+    int webSocketDisconnectionCount() const;
     int openConnectionCount() const;
     int stateChangingRestRequestCount() const;
     int unexpectedOperationCount() const;
+    int terminalBurstExecutionCount() const;
+    int terminalCloseAttemptCount() const;
     const QList<FakeXc2HttpRequest> &restRequests() const;
     const QList<FakeXc2HttpRequest> &capturedRestRequests() const;
+    const QList<QByteArray> &restResponses() const;
     const QList<FakeXc2HttpRequest> &upgradeRequests() const;
+    const QList<QByteArray> &upgradeResponses() const;
     const QList<FakeXc2WebSocketMessage> &messages() const;
     const QList<ktm::xc2::Xc2StompFrame> &stompFrames() const;
     const QList<ktm::xc2::Xc2StompFrame> &sentStompFrames() const;
+    const QList<ktm::xc2::Xc2StompFrame> &
+    attemptedTerminalFrames() const;
     const QList<ktm::xc2::Xc2Error> &decodeErrors() const;
     QUrl requestUrl() const;
     QString negotiatedSubprotocol() const;
@@ -137,6 +147,7 @@ signals:
     void stompFrameReceived();
     void webSocketDisconnected();
     void connectionClosed();
+    void terminalBurstExecuted();
 
 private:
     struct RawConnection;
@@ -161,10 +172,13 @@ private:
     QList<QWebSocket *> m_webSockets;
     QList<FakeXc2HttpRequest> m_restRequests;
     QList<FakeXc2HttpRequest> m_capturedRestRequests;
+    QList<QByteArray> m_restResponses;
     QList<FakeXc2HttpRequest> m_upgradeRequests;
+    QList<QByteArray> m_upgradeResponses;
     QList<FakeXc2WebSocketMessage> m_messages;
     QList<ktm::xc2::Xc2StompFrame> m_stompFrames;
     QList<ktm::xc2::Xc2StompFrame> m_sentStompFrames;
+    QList<ktm::xc2::Xc2StompFrame> m_attemptedTerminalFrames;
     QList<ktm::xc2::Xc2Error> m_decodeErrors;
     QHash<QWebSocket *, ktm::xc2::Xc2StompCodec> m_codecs;
     QByteArray m_restCookie = QByteArrayLiteral("session=synthetic");
@@ -175,8 +189,12 @@ private:
     int m_probeDelayMs = 250;
     int m_connectionCount = 0;
     int m_webSocketConnectionCount = 0;
+    int m_webSocketDisconnectionCount = 0;
     int m_stateChangingRestRequestCount = 0;
     int m_unexpectedOperationCount = 0;
+    int m_terminalBurstExecutionCount = 0;
+    int m_terminalCloseAttemptCount = 0;
+    QElapsedTimer m_connectionElapsed;
     QWebSocketProtocol::CloseCode m_lastPeerCloseCode =
         QWebSocketProtocol::CloseCodeNormal;
 };

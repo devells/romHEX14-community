@@ -216,9 +216,7 @@ public:
         });
         connect(&m_stomp, &Xc2StompClient::messageReceived,
                 this, [this](const Xc2StompMessage &message) {
-            if (!stompCallbackIsCurrent(message.generation))
-                return;
-            failStomp(QStringLiteral("unexpected-message"));
+            onStompMessage(message);
         });
         connect(&m_stomp, &Xc2StompClient::errorOccurred,
                 this, [this](Xc2StompGeneration generation,
@@ -484,6 +482,40 @@ private:
         m_stompErrorSeen = true;
         finishOnce(4, QStringLiteral("stomp"), error,
                    QStringLiteral("transport-or-contract-failure"));
+    }
+
+    void onStompMessage(const Xc2StompMessage &message)
+    {
+        if (!stompCallbackIsCurrent(message.generation))
+            return;
+
+        const Xc2ContractProfile &profile =
+            Xc2ContractProfile::approved();
+        const QList<Topic> approvedTopics =
+            profile.foundationProbeTopics();
+        const qsizetype topicIndex = approvedTopics.indexOf(message.topic);
+        QString approvedSubscriptionId;
+        switch (message.topic) {
+        case Topic::VciStatus:
+            approvedSubscriptionId =
+                QStringLiteral("vci-status-subscription");
+            break;
+        case Topic::Login:
+            approvedSubscriptionId = QStringLiteral("login-subscription");
+            break;
+        default:
+            break;
+        }
+
+        const bool validStage = m_stage == Stage::Stomp
+            || m_stage == Stage::Disconnecting;
+        if (!validStage || !m_connected || topicIndex < 0
+            || topicIndex >= m_subscriptionCount
+            || message.destination != profile.topic(message.topic)
+            || message.subscriptionId != approvedSubscriptionId
+            || approvedSubscriptionId.isEmpty()) {
+            failStomp(QStringLiteral("unexpected-message"));
+        }
     }
 
     void onStompDisconnected(Xc2StompGeneration generation)
