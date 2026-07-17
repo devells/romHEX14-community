@@ -5,7 +5,9 @@
 #include <QSignalSpy>
 #include <QtTest>
 
+#include <new>
 #include <optional>
+#include <utility>
 
 using namespace ktm::xc2;
 
@@ -203,12 +205,66 @@ Xc2JobRecord signalRecord(const QSignalSpy &spy, qsizetype index)
     return qvariant_cast<Xc2JobRecord>(spy.at(index).at(0));
 }
 
-QStringList recordIds(const QList<Xc2JobRecord> &records)
+Xc2JobRecord expectedRecord(QString jobId,
+                            Xc2JobState state = Xc2JobState::Created,
+                            QList<Xc2JobEvent> events = {},
+                            bool visibilityLost = false)
 {
-    QStringList result;
-    for (const Xc2JobRecord &record : records)
-        result.append(record.jobId);
-    return result;
+    Xc2JobRecord record;
+    record.jobId = std::move(jobId);
+    record.state = state;
+    record.events = std::move(events);
+    record.visibilityLost = visibilityLost;
+    return record;
+}
+
+enum class ObservedKind { Changed, Terminal, Removed };
+
+struct ObservedNotification {
+    ObservedKind kind = ObservedKind::Changed;
+    Xc2JobRecord record;
+    QString jobId;
+};
+
+void observeNotifications(Xc2JobRegistry &registry,
+                          QObject &context,
+                          QList<ObservedNotification> &notifications)
+{
+    QObject::connect(
+        &registry, &Xc2JobRegistry::jobChanged, &context,
+        [&notifications](const Xc2JobRecord &record) {
+            notifications.append(
+                {ObservedKind::Changed, record, record.jobId});
+        },
+        Qt::DirectConnection);
+    QObject::connect(
+        &registry, &Xc2JobRegistry::jobTerminal, &context,
+        [&notifications](const Xc2JobRecord &record) {
+            notifications.append(
+                {ObservedKind::Terminal, record, record.jobId});
+        },
+        Qt::DirectConnection);
+    QObject::connect(
+        &registry, &Xc2JobRegistry::jobRemoved, &context,
+        [&notifications](const QString &jobId) {
+            notifications.append({ObservedKind::Removed, {}, jobId});
+        },
+        Qt::DirectConnection);
+}
+
+bool notificationEquals(const ObservedNotification &notification,
+                        ObservedKind kind,
+                        const Xc2JobRecord &record)
+{
+    return notification.kind == kind && notification.jobId == record.jobId
+        && recordEqual(notification.record, record);
+}
+
+bool removedNotificationEquals(const ObservedNotification &notification,
+                               const QString &jobId)
+{
+    return notification.kind == ObservedKind::Removed
+        && notification.jobId == jobId;
 }
 
 } // namespace
@@ -247,8 +303,10 @@ private slots:
         QVERIFY(record->events.isEmpty());
         QVERIFY(!record->visibilityLost);
         QVERIFY(!record->terminal());
-        QCOMPARE(registry.activeJobs().size(), 1);
-        QVERIFY(recordEqual(signalRecord(changed, 0), *record));
+        const Xc2JobRecord expected = expectedRecord(QStringLiteral("job-a"));
+        QVERIFY(recordEqual(*record, expected));
+        QVERIFY(recordsEqual(registry.activeJobs(), {expected}));
+        QVERIFY(recordEqual(signalRecord(changed, 0), expected));
     }
 
     void duplicateAcceptIsIdempotentAndNeverResets()
@@ -256,6 +314,7 @@ private slots:
         Xc2JobRegistry registry;
         QSignalSpy changed(&registry, &Xc2JobRegistry::jobChanged);
         QSignalSpy terminal(&registry, &Xc2JobRegistry::jobTerminal);
+        QSignalSpy removed(&registry, &Xc2JobRegistry::jobRemoved);
         QVERIFY(registry.accept({QStringLiteral("job-a")}));
         QVERIFY(registry.apply(makeEvent(1, QStringLiteral("m-1"),
                                          QStringLiteral("job-a"),
@@ -272,6 +331,7 @@ private slots:
                               takeSnapshot(registry, {QStringLiteral("job-a")})));
         QCOMPARE(changed.size(), 0);
         QCOMPARE(terminal.size(), 0);
+        QCOMPARE(removed.size(), 0);
 
         QVERIFY(registry.apply(makeEvent(2, QStringLiteral("m-2"),
                                          QStringLiteral("job-a"),
@@ -287,6 +347,7 @@ private slots:
                               takeSnapshot(registry, {QStringLiteral("job-a")})));
         QCOMPARE(changed.size(), 0);
         QCOMPARE(terminal.size(), 0);
+        QCOMPARE(removed.size(), 0);
     }
 
     void rejectsBlankAndRetiredJobIdsAtomically()
@@ -402,6 +463,8 @@ private slots:
         const QString invalidJob = QStringLiteral("invalid-terminal");
         const QList<Xc2JobEvent> invalidTerminalEvents{
             makeEvent(1, QStringLiteral("negative"), invalidJob, initial, -1, 0),
+            makeEvent(1, QStringLiteral("negative-total"), invalidJob,
+                      initial, 0, -1),
             makeEvent(1, QStringLiteral("over-total"), invalidJob, initial, 2, 1)
         };
         for (const Xc2JobEvent &invalid : invalidTerminalEvents) {
@@ -419,10 +482,53 @@ private slots:
             QCOMPARE(signalOrder.size(), 0);
         }
 
-        QVERIFY(registry.accept({jobId}));
-        QVERIFY(registry.apply(makeEvent(
+        {
+            const QString unknownJobId = QStringLiteral("unknown-terminal");
+            const Xc2JobEvent unknownTerminal = makeEvent(
+                1, QStringLiteral("unknown-first-terminal"), unknownJobId,
+                initial, 0, 0);
+            const Xc2JobRecord expected = expectedRecord(
+                unknownJobId, initial, {unknownTerminal});
+            Xc2JobRegistry unknownRegistry;
+            QSignalSpy unknownChanged(
+                &unknownRegistry, &Xc2JobRegistry::jobChanged);
+            QSignalSpy unknownTerminalSignal(
+                &unknownRegistry, &Xc2JobRegistry::jobTerminal);
+            QSignalSpy unknownRemoved(
+                &unknownRegistry, &Xc2JobRegistry::jobRemoved);
+            QStringList unknownOrder;
+            connect(&unknownRegistry, &Xc2JobRegistry::jobChanged,
+                    &unknownRegistry,
+                    [&unknownOrder](const Xc2JobRecord &) {
+                unknownOrder.append(QStringLiteral("changed"));
+            });
+            connect(&unknownRegistry, &Xc2JobRegistry::jobTerminal,
+                    &unknownRegistry,
+                    [&unknownOrder](const Xc2JobRecord &) {
+                unknownOrder.append(QStringLiteral("terminal"));
+            });
+
+            QVERIFY(unknownRegistry.apply(unknownTerminal));
+            QCOMPARE(unknownOrder,
+                     (QStringList{QStringLiteral("changed"),
+                                  QStringLiteral("terminal")}));
+            QCOMPARE(unknownChanged.size(), 1);
+            QCOMPARE(unknownTerminalSignal.size(), 1);
+            QCOMPARE(unknownRemoved.size(), 0);
+            QVERIFY(recordEqual(signalRecord(unknownChanged, 0), expected));
+            QVERIFY(recordEqual(signalRecord(unknownTerminalSignal, 0),
+                                expected));
+            const auto retained = unknownRegistry.job(unknownJobId);
+            QVERIFY(retained.has_value());
+            QVERIFY(recordEqual(*retained, expected));
+            QVERIFY(unknownRegistry.activeJobs().isEmpty());
+        }
+
+        const Xc2JobEvent baseline = makeEvent(
             1, QStringLiteral("baseline"), jobId,
-            Xc2JobState::InProgress, 8, 10)));
+            Xc2JobState::InProgress, 8, 10);
+        QVERIFY(registry.accept({jobId}));
+        QVERIFY(registry.apply(baseline));
         changed.clear();
         terminal.clear();
         removed.clear();
@@ -438,11 +544,11 @@ private slots:
         QCOMPARE(removed.size(), 0);
         const auto committed = registry.job(jobId);
         QVERIFY(committed.has_value());
-        QCOMPARE(committed->state, initial);
-        QCOMPARE(committed->events.size(), 2);
-        QVERIFY(eventEqual(committed->events.constLast(), first));
-        QVERIFY(recordEqual(signalRecord(changed, 0), *committed));
-        QVERIFY(recordEqual(signalRecord(terminal, 0), *committed));
+        const Xc2JobRecord expected = expectedRecord(
+            jobId, initial, {baseline, first});
+        QVERIFY(recordEqual(*committed, expected));
+        QVERIFY(recordEqual(signalRecord(changed, 0), expected));
+        QVERIFY(recordEqual(signalRecord(terminal, 0), expected));
         QVERIFY(registry.activeJobs().isEmpty());
         changed.clear();
         terminal.clear();
@@ -489,9 +595,28 @@ private slots:
         Xc2JobRegistry registry;
         QSignalSpy changed(&registry, &Xc2JobRegistry::jobChanged);
         QSignalSpy terminal(&registry, &Xc2JobRegistry::jobTerminal);
+        QSignalSpy removed(&registry, &Xc2JobRegistry::jobRemoved);
+        bool creationWasCommitted = false;
+        bool deliveryWasCommitted = false;
+        connect(&registry, &Xc2JobRegistry::jobChanged, this,
+                [&registry, &event, &creationWasCommitted,
+                 &deliveryWasCommitted](const Xc2JobRecord &record) {
+            const Xc2JobRecord expected = expectedRecord(
+                event.progress.jobId, Xc2JobState::InProgress, {event});
+            const auto retained = registry.job(event.progress.jobId);
+            creationWasCommitted = retained
+                && recordEqual(*retained, expected)
+                && recordsEqual(registry.activeJobs(), {expected});
+            Xc2Error replayError = dirtyError();
+            deliveryWasCommitted = registry.apply(event, &replayError)
+                && errorCleared(replayError);
+        }, Qt::DirectConnection);
         QVERIFY(registry.apply(event));
         QCOMPARE(changed.size(), 1);
         QCOMPARE(terminal.size(), 0);
+        QCOMPARE(removed.size(), 0);
+        QVERIFY(creationWasCommitted);
+        QVERIFY(deliveryWasCommitted);
 
         const auto record = registry.job(exactJobId);
         QVERIFY(record.has_value());
@@ -500,7 +625,11 @@ private slots:
         QCOMPARE(record->events.size(), 1);
         QVERIFY(eventEqual(record->events.constFirst(), event));
         QVERIFY(!registry.job(exactJobId.trimmed()).has_value());
-        QCOMPARE(recordIds(registry.activeJobs()), QStringList{exactJobId});
+        const Xc2JobRecord expected = expectedRecord(
+            exactJobId, Xc2JobState::InProgress, {event});
+        QVERIFY(recordEqual(*record, expected));
+        QVERIFY(recordsEqual(registry.activeJobs(), {expected}));
+        QVERIFY(recordEqual(signalRecord(changed, 0), expected));
     }
 
     void progressNeverAttachesToAnotherActiveJob()
@@ -520,9 +649,14 @@ private slots:
         QVERIFY(first->events.isEmpty());
         QCOMPARE(second->events.size(), 1);
         QVERIFY(eventEqual(second->events.constFirst(), event));
-        QCOMPARE(recordIds(registry.activeJobs()),
-                 (QStringList{QStringLiteral("only-active"),
-                              QStringLiteral("other-job")}));
+        const Xc2JobRecord expectedFirst = expectedRecord(
+            QStringLiteral("only-active"));
+        const Xc2JobRecord expectedSecond = expectedRecord(
+            QStringLiteral("other-job"), Xc2JobState::InProgress, {event});
+        QVERIFY(recordEqual(*first, expectedFirst));
+        QVERIFY(recordEqual(*second, expectedSecond));
+        QVERIFY(recordsEqual(registry.activeJobs(),
+                             {expectedFirst, expectedSecond}));
     }
 
     void duplicateDeliveryIsIdempotent()
@@ -530,6 +664,7 @@ private slots:
         Xc2JobRegistry registry;
         QSignalSpy changed(&registry, &Xc2JobRegistry::jobChanged);
         QSignalSpy terminal(&registry, &Xc2JobRegistry::jobTerminal);
+        QSignalSpy removed(&registry, &Xc2JobRegistry::jobRemoved);
         const QString jobId = QStringLiteral("job-a");
         const Xc2JobEvent progress = makeEvent(
             1, QStringLiteral("delivery"), jobId,
@@ -543,6 +678,7 @@ private slots:
         QVERIFY(snapshotEqual(before, takeSnapshot(registry, {jobId})));
         QCOMPARE(changed.size(), 0);
         QCOMPARE(terminal.size(), 0);
+        QCOMPARE(removed.size(), 0);
 
         const Xc2JobEvent finished = makeEvent(
             1, QStringLiteral("terminal"), jobId,
@@ -558,6 +694,7 @@ private slots:
                               takeSnapshot(registry, {jobId})));
         QCOMPARE(changed.size(), 0);
         QCOMPARE(terminal.size(), 0);
+        QCOMPARE(removed.size(), 0);
     }
 
     void reusedDeliveryIdentityWithDifferentPayloadIsContractError()
@@ -628,6 +765,9 @@ private slots:
     void identicalPayloadWithDifferentIdentityRemainsOrdered()
     {
         Xc2JobRegistry registry;
+        QSignalSpy changed(&registry, &Xc2JobRegistry::jobChanged);
+        QSignalSpy terminal(&registry, &Xc2JobRegistry::jobTerminal);
+        QSignalSpy removed(&registry, &Xc2JobRegistry::jobRemoved);
         const QString jobId = QStringLiteral("job-a");
         Xc2JobEvent first = makeEvent(
             5, QStringLiteral("first"), jobId,
@@ -650,6 +790,20 @@ private slots:
                               record->events.at(1).progress));
         QVERIFY(progressEqual(record->events.at(0).progress,
                               record->events.at(2).progress));
+        const Xc2JobRecord afterFirst = expectedRecord(
+            jobId, Xc2JobState::InProgress, {first});
+        const Xc2JobRecord afterSecond = expectedRecord(
+            jobId, Xc2JobState::InProgress, {first, second});
+        const Xc2JobRecord afterThird = expectedRecord(
+            jobId, Xc2JobState::InProgress, {first, second, third});
+        QVERIFY(recordEqual(*record, afterThird));
+        QVERIFY(recordsEqual(registry.activeJobs(), {afterThird}));
+        QCOMPARE(changed.size(), 3);
+        QCOMPARE(terminal.size(), 0);
+        QCOMPARE(removed.size(), 0);
+        QVERIFY(recordEqual(signalRecord(changed, 0), afterFirst));
+        QVERIFY(recordEqual(signalRecord(changed, 1), afterSecond));
+        QVERIFY(recordEqual(signalRecord(changed, 2), afterThird));
     }
 
     void semanticValidationRejectsInvalidAndRegressiveProgress()
@@ -749,13 +903,54 @@ private slots:
         QCOMPARE(removed.size(), 0);
     }
 
+    void positiveInProgressCounterEvolutionIsAccepted()
+    {
+        const QString jobId = QStringLiteral("counter-growth");
+        const Xc2JobEvent unknownTotal = makeEvent(
+            1, QStringLiteral("unknown-total"), jobId,
+            Xc2JobState::InProgress, 1, 0);
+        const Xc2JobEvent knownTotal = makeEvent(
+            2, QStringLiteral("known-total"), jobId,
+            Xc2JobState::InProgress, 2, 10);
+        const Xc2JobEvent grownTotal = makeEvent(
+            3, QStringLiteral("grown-total"), jobId,
+            Xc2JobState::InProgress, 3, 12);
+        const QList<Xc2JobEvent> events{
+            unknownTotal, knownTotal, grownTotal
+        };
+        Xc2JobRegistry registry;
+        QSignalSpy changed(&registry, &Xc2JobRegistry::jobChanged);
+        QSignalSpy terminal(&registry, &Xc2JobRegistry::jobTerminal);
+        QSignalSpy removed(&registry, &Xc2JobRegistry::jobRemoved);
+        QList<Xc2JobEvent> committedEvents;
+
+        for (qsizetype i = 0; i < events.size(); ++i) {
+            committedEvents.append(events.at(i));
+            Xc2Error error = dirtyError();
+            QVERIFY(registry.apply(events.at(i), &error));
+            QVERIFY(errorCleared(error));
+            const Xc2JobRecord expected = expectedRecord(
+                jobId, Xc2JobState::InProgress, committedEvents);
+            const auto retained = registry.job(jobId);
+            QVERIFY(retained.has_value());
+            QVERIFY(recordEqual(*retained, expected));
+            QVERIFY(recordsEqual(registry.activeJobs(), {expected}));
+            QCOMPARE(changed.size(), i + 1);
+            QVERIFY(recordEqual(signalRecord(changed, i), expected));
+            QCOMPARE(terminal.size(), 0);
+            QCOMPARE(removed.size(), 0);
+        }
+    }
+
     void terminalTransitionEmitsChangedThenTerminalExactlyOnce()
     {
         const QString jobId = QStringLiteral("job-a");
         Xc2JobRegistry registry;
         QVERIFY(registry.accept({jobId}));
-        QVERIFY(registry.apply(makeEvent(1, QStringLiteral("progress"), jobId,
-                                         Xc2JobState::InProgress, 2, 10)));
+        const Xc2JobEvent progress = makeEvent(
+            1, QStringLiteral("progress"), jobId,
+            Xc2JobState::InProgress, 2, 10);
+        QVERIFY(registry.apply(progress));
         QSignalSpy changed(&registry, &Xc2JobRegistry::jobChanged);
         QSignalSpy terminal(&registry, &Xc2JobRegistry::jobTerminal);
         QSignalSpy removed(&registry, &Xc2JobRegistry::jobRemoved);
@@ -788,6 +983,8 @@ private slots:
         const Xc2JobEvent event = makeEvent(
             2, QStringLiteral("terminal"), jobId,
             Xc2JobState::Error, 0, 0);
+        const Xc2JobRecord expected = expectedRecord(
+            jobId, Xc2JobState::Error, {progress, event});
         QVERIFY(registry.apply(event));
         QCOMPARE(order, (QStringList{QStringLiteral("changed"),
                                      QStringLiteral("terminal")}));
@@ -797,7 +994,9 @@ private slots:
         QVERIFY(changedSawCommitted);
         QVERIFY(changedSawCommittedDelivery);
         QVERIFY(terminalSawCommitted);
-        QVERIFY(recordEqual(signalRecord(changed, 0), signalRecord(terminal, 0)));
+        QVERIFY(recordEqual(signalRecord(changed, 0), expected));
+        QVERIFY(recordEqual(signalRecord(terminal, 0), expected));
+        QVERIFY(recordEqual(*registry.job(jobId), expected));
 
         Xc2Error error = dirtyError();
         QVERIFY(registry.apply(event, &error));
@@ -813,14 +1012,17 @@ private slots:
         order.clear();
         Xc2JobEvent newIdentity = event;
         newIdentity.messageId = QStringLiteral("terminal-again");
-        QVERIFY(!registry.apply(newIdentity, &error));
-        QCOMPARE(error.category, Xc2ErrorCategory::Job);
-        QCOMPARE(error.jobId, jobId);
-        QVERIFY(snapshotEqual(before, takeSnapshot(registry, {jobId})));
-        QCOMPARE(changed.size(), 0);
-        QCOMPARE(terminal.size(), 0);
-        QCOMPARE(removed.size(), 0);
-        QCOMPARE(order.size(), 0);
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            error = dirtyError();
+            QVERIFY(!registry.apply(newIdentity, &error));
+            QCOMPARE(error.category, Xc2ErrorCategory::Job);
+            QCOMPARE(error.jobId, jobId);
+            QVERIFY(snapshotEqual(before, takeSnapshot(registry, {jobId})));
+            QCOMPARE(changed.size(), 0);
+            QCOMPARE(terminal.size(), 0);
+            QCOMPARE(removed.size(), 0);
+            QCOMPARE(order.size(), 0);
+        }
     }
 
     void activeJobsHaveStableFirstObservedOrder()
@@ -829,22 +1031,24 @@ private slots:
         QVERIFY(registry.accept({QStringLiteral("job-b")}));
         QVERIFY(registry.accept({QStringLiteral("job-a")}));
         QVERIFY(registry.accept({QStringLiteral("job-c")}));
-        QVERIFY(registry.apply(makeEvent(1, QStringLiteral("finish-a"),
-                                         QStringLiteral("job-a"),
-                                         Xc2JobState::Finished)));
-        QVERIFY(registry.apply(makeEvent(1, QStringLiteral("discover-d"),
-                                         QStringLiteral("job-d"),
-                                         Xc2JobState::InProgress, 1, 1)));
+        const Xc2JobEvent finishA = makeEvent(
+            1, QStringLiteral("finish-a"), QStringLiteral("job-a"),
+            Xc2JobState::Finished);
+        const Xc2JobEvent discoverD = makeEvent(
+            1, QStringLiteral("discover-d"), QStringLiteral("job-d"),
+            Xc2JobState::InProgress, 1, 1);
+        QVERIFY(registry.apply(finishA));
+        QVERIFY(registry.apply(discoverD));
 
-        QCOMPARE(recordIds(registry.activeJobs()),
-                 (QStringList{QStringLiteral("job-b"),
-                              QStringLiteral("job-c"),
-                              QStringLiteral("job-d")}));
+        const Xc2JobRecord expectedB = expectedRecord(QStringLiteral("job-b"));
+        const Xc2JobRecord expectedC = expectedRecord(QStringLiteral("job-c"));
+        const Xc2JobRecord expectedD = expectedRecord(
+            QStringLiteral("job-d"), Xc2JobState::InProgress, {discoverD});
+        QVERIFY(recordsEqual(registry.activeJobs(),
+                             {expectedB, expectedC, expectedD}));
         QVERIFY(registry.clearTerminal(QStringLiteral("job-a")));
-        QCOMPARE(recordIds(registry.activeJobs()),
-                 (QStringList{QStringLiteral("job-b"),
-                              QStringLiteral("job-c"),
-                              QStringLiteral("job-d")}));
+        QVERIFY(recordsEqual(registry.activeJobs(),
+                             {expectedB, expectedC, expectedD}));
 
         const QString leadingSpace = QStringLiteral(" job-b");
         const QString differentCase = QStringLiteral("JOB-B");
@@ -859,16 +1063,22 @@ private slots:
         QVERIFY(registry.job(differentCase).has_value());
         QVERIFY(registry.job(composed).has_value());
         QVERIFY(registry.job(decomposed).has_value());
-        QCOMPARE(recordIds(registry.activeJobs()),
-                 (QStringList{QStringLiteral("job-b"),
-                              QStringLiteral("job-c"),
-                              QStringLiteral("job-d"), leadingSpace,
-                              differentCase, composed, decomposed}));
+        QVERIFY(recordsEqual(
+            registry.activeJobs(),
+            {expectedB, expectedC, expectedD, expectedRecord(leadingSpace),
+             expectedRecord(differentCase), expectedRecord(composed),
+             expectedRecord(decomposed)}));
     }
 
     void repeatedVisibilityLossIsIdempotentAndOrdered()
     {
         {
+            const QString onlyTerminalId = QStringLiteral("only-terminal");
+            const Xc2JobEvent onlyTerminalEvent = makeEvent(
+                3, QStringLiteral("only-terminal"), onlyTerminalId,
+                Xc2JobState::Finished);
+            const Xc2JobRecord onlyTerminalRecord = expectedRecord(
+                onlyTerminalId, Xc2JobState::Finished, {onlyTerminalEvent});
             Xc2JobRegistry terminalOnly;
             QSignalSpy changedOnly(&terminalOnly,
                                    &Xc2JobRegistry::jobChanged);
@@ -876,21 +1086,41 @@ private slots:
                                           &Xc2JobRegistry::jobTerminal);
             QSignalSpy removedOnly(&terminalOnly,
                                    &Xc2JobRegistry::jobRemoved);
-            QVERIFY(terminalOnly.apply(makeEvent(
-                3, QStringLiteral("only-terminal"),
-                QStringLiteral("only-terminal"), Xc2JobState::Finished)));
+            QVERIFY(terminalOnly.apply(onlyTerminalEvent));
             changedOnly.clear();
             terminalOnlySignal.clear();
             const RegistrySnapshot before = takeSnapshot(
-                terminalOnly, {QStringLiteral("only-terminal")});
+                terminalOnly, {onlyTerminalId});
             terminalOnly.markVisibilityLost(3);
             QVERIFY(snapshotEqual(before, takeSnapshot(
-                terminalOnly, {QStringLiteral("only-terminal")})));
+                terminalOnly, {onlyTerminalId})));
+            const auto retained = terminalOnly.job(onlyTerminalId);
+            QVERIFY(retained.has_value());
+            QVERIFY(recordEqual(*retained, onlyTerminalRecord));
+            QVERIFY(terminalOnly.activeJobs().isEmpty());
             QCOMPARE(changedOnly.size(), 0);
             QCOMPARE(terminalOnlySignal.size(), 0);
             QCOMPARE(removedOnly.size(), 0);
         }
 
+        const QString thirdId = QStringLiteral("third");
+        const QString firstId = QStringLiteral("first");
+        const QString secondId = QStringLiteral("second");
+        const Xc2JobEvent firstProgress = makeEvent(
+            2, QStringLiteral("first-progress"), firstId,
+            Xc2JobState::InProgress, 2, 10);
+        const Xc2JobEvent secondTerminal = makeEvent(
+            2, QStringLiteral("second-terminal"), secondId,
+            Xc2JobState::Canceled);
+        const Xc2JobRecord visibleThird = expectedRecord(thirdId);
+        const Xc2JobRecord visibleFirst = expectedRecord(
+            firstId, Xc2JobState::InProgress, {firstProgress});
+        const Xc2JobRecord terminalSecond = expectedRecord(
+            secondId, Xc2JobState::Canceled, {secondTerminal});
+        const Xc2JobRecord lostThird = expectedRecord(
+            thirdId, Xc2JobState::Created, {}, true);
+        const Xc2JobRecord lostFirst = expectedRecord(
+            firstId, Xc2JobState::InProgress, {firstProgress}, true);
         Xc2JobRegistry registry;
         QSignalSpy changed(&registry, &Xc2JobRegistry::jobChanged);
         QSignalSpy terminal(&registry, &Xc2JobRegistry::jobTerminal);
@@ -899,15 +1129,16 @@ private slots:
         QCOMPARE(changed.size(), 0);
         QCOMPARE(terminal.size(), 0);
         QCOMPARE(removed.size(), 0);
-        QVERIFY(registry.accept({QStringLiteral("third")}));
-        QVERIFY(registry.accept({QStringLiteral("first")}));
-        QVERIFY(registry.accept({QStringLiteral("second")}));
-        QVERIFY(registry.apply(makeEvent(2, QStringLiteral("first-progress"),
-                                         QStringLiteral("first"),
-                                         Xc2JobState::InProgress, 2, 10)));
-        QVERIFY(registry.apply(makeEvent(2, QStringLiteral("second-terminal"),
-                                         QStringLiteral("second"),
-                                         Xc2JobState::Canceled)));
+        QVERIFY(registry.accept({thirdId}));
+        QVERIFY(registry.accept({firstId}));
+        QVERIFY(registry.accept({secondId}));
+        QVERIFY(registry.apply(firstProgress));
+        QVERIFY(registry.apply(secondTerminal));
+        QVERIFY(recordEqual(*registry.job(thirdId), visibleThird));
+        QVERIFY(recordEqual(*registry.job(firstId), visibleFirst));
+        QVERIFY(recordEqual(*registry.job(secondId), terminalSecond));
+        QVERIFY(recordsEqual(registry.activeJobs(),
+                             {visibleThird, visibleFirst}));
         changed.clear();
         terminal.clear();
         removed.clear();
@@ -916,15 +1147,16 @@ private slots:
         bool everySignalSawAtomicSnapshot = true;
         connect(&registry, &Xc2JobRegistry::jobChanged, &registry,
                 [&registry, &visibilitySignalsObserved,
-                 &everySignalSawAtomicSnapshot](const Xc2JobRecord &record) {
+                 &everySignalSawAtomicSnapshot, &thirdId, &firstId,
+                 &lostThird, &lostFirst](const Xc2JobRecord &record) {
             if (!record.visibilityLost)
                 return;
             ++visibilitySignalsObserved;
-            const auto third = registry.job(QStringLiteral("third"));
-            const auto first = registry.job(QStringLiteral("first"));
+            const auto third = registry.job(thirdId);
+            const auto first = registry.job(firstId);
             everySignalSawAtomicSnapshot = everySignalSawAtomicSnapshot
-                && third && third->visibilityLost && first
-                && first->visibilityLost;
+                && third && recordEqual(*third, lostThird)
+                && first && recordEqual(*first, lostFirst);
         });
 
         registry.markVisibilityLost(7);
@@ -933,44 +1165,53 @@ private slots:
         QCOMPARE(removed.size(), 0);
         QCOMPARE(visibilitySignalsObserved, 2);
         QVERIFY(everySignalSawAtomicSnapshot);
-        QCOMPARE(signalRecord(changed, 0).jobId, QStringLiteral("third"));
-        QCOMPARE(signalRecord(changed, 1).jobId, QStringLiteral("first"));
-        const auto first = registry.job(QStringLiteral("first"));
-        const auto third = registry.job(QStringLiteral("third"));
-        const auto second = registry.job(QStringLiteral("second"));
-        QVERIFY(first && first->visibilityLost);
-        QVERIFY(third && third->visibilityLost);
-        QVERIFY(second && !second->visibilityLost);
-        QCOMPARE(first->state, Xc2JobState::InProgress);
-        QCOMPARE(first->events.size(), 1);
+        QVERIFY(recordEqual(signalRecord(changed, 0), lostThird));
+        QVERIFY(recordEqual(signalRecord(changed, 1), lostFirst));
+        QVERIFY(recordEqual(*registry.job(thirdId), lostThird));
+        QVERIFY(recordEqual(*registry.job(firstId), lostFirst));
+        QVERIFY(recordEqual(*registry.job(secondId), terminalSecond));
+        QVERIFY(recordsEqual(registry.activeJobs(), {lostThird, lostFirst}));
 
         const RegistrySnapshot before = takeSnapshot(
-            registry, {QStringLiteral("third"), QStringLiteral("first"),
-                       QStringLiteral("second")});
+            registry, {thirdId, firstId, secondId});
         changed.clear();
         registry.markVisibilityLost(10);
         registry.markVisibilityLost(10);
         registry.markVisibilityLost(6);
         QVERIFY(snapshotEqual(before, takeSnapshot(
-            registry, {QStringLiteral("third"), QStringLiteral("first"),
-                       QStringLiteral("second")})));
+            registry, {thirdId, firstId, secondId})));
         QCOMPARE(changed.size(), 0);
         QCOMPARE(terminal.size(), 0);
         QCOMPARE(removed.size(), 0);
 
+        const Xc2JobEvent stale = makeEvent(
+            9, QStringLiteral("between-loss-watermarks"), firstId,
+            Xc2JobState::InProgress, 3, 10);
         Xc2Error error = dirtyError();
-        QVERIFY(!registry.apply(makeEvent(
-            9, QStringLiteral("between-loss-watermarks"),
-            QStringLiteral("first"), Xc2JobState::InProgress, 3, 10),
-            &error));
+        QVERIFY(!registry.apply(stale, &error));
         QCOMPARE(error.category, Xc2ErrorCategory::Job);
-        QCOMPARE(error.jobId, QStringLiteral("first"));
+        QCOMPARE(error.jobId, firstId);
         QVERIFY(snapshotEqual(before, takeSnapshot(
-            registry, {QStringLiteral("third"), QStringLiteral("first"),
-                       QStringLiteral("second")})));
+            registry, {thirdId, firstId, secondId})));
         QCOMPARE(changed.size(), 0);
         QCOMPARE(terminal.size(), 0);
         QCOMPARE(removed.size(), 0);
+
+        const Xc2JobEvent fresh = makeEvent(
+            11, QStringLiteral("after-higher-watermark"), firstId,
+            Xc2JobState::InProgress, 3, 12);
+        QVERIFY(registry.apply(fresh));
+        const Xc2JobRecord recoveredFirst = expectedRecord(
+            firstId, Xc2JobState::InProgress, {firstProgress, fresh});
+        QCOMPARE(changed.size(), 1);
+        QCOMPARE(terminal.size(), 0);
+        QCOMPARE(removed.size(), 0);
+        QVERIFY(recordEqual(signalRecord(changed, 0), recoveredFirst));
+        QVERIFY(recordEqual(*registry.job(thirdId), lostThird));
+        QVERIFY(recordEqual(*registry.job(firstId), recoveredFirst));
+        QVERIFY(recordEqual(*registry.job(secondId), terminalSecond));
+        QVERIFY(recordsEqual(registry.activeJobs(),
+                             {lostThird, recoveredFirst}));
     }
 
     void laterGenerationProgressRecoversOnlyItsExactJob()
@@ -979,34 +1220,52 @@ private slots:
         QSignalSpy changed(&registry, &Xc2JobRegistry::jobChanged);
         QSignalSpy terminal(&registry, &Xc2JobRegistry::jobTerminal);
         QSignalSpy removed(&registry, &Xc2JobRegistry::jobRemoved);
-        QVERIFY(registry.apply(makeEvent(4, QStringLiteral("a-0"),
-                                         QStringLiteral("job-a"),
-                                         Xc2JobState::InProgress, 1, 10)));
-        QVERIFY(registry.apply(makeEvent(4, QStringLiteral("b-0"),
-                                         QStringLiteral("job-b"),
-                                         Xc2JobState::InProgress, 1, 10)));
+        const Xc2JobEvent a0 = makeEvent(
+            4, QStringLiteral("a-0"), QStringLiteral("job-a"),
+            Xc2JobState::InProgress, 1, 10);
+        const Xc2JobEvent b0 = makeEvent(
+            4, QStringLiteral("b-0"), QStringLiteral("job-b"),
+            Xc2JobState::InProgress, 1, 10);
+        const Xc2JobEvent c0 = makeEvent(
+            9, QStringLiteral("c-0"), QStringLiteral("job-c"),
+            Xc2JobState::InProgress, 1, 10);
+        const Xc2JobEvent a1 = makeEvent(
+            5, QStringLiteral("a-1"), QStringLiteral("job-a"),
+            Xc2JobState::InProgress, 2, 10);
+        const Xc2JobEvent staleTerminal = makeEvent(
+            4, QStringLiteral("b-stale-terminal"), QStringLiteral("job-b"),
+            Xc2JobState::Error, 0, 0);
+        const Xc2JobEvent freshTerminal = makeEvent(
+            5, QStringLiteral("b-fresh-terminal"), QStringLiteral("job-b"),
+            Xc2JobState::Error, 0, 0);
+        QVERIFY(registry.apply(a0));
+        QVERIFY(registry.apply(b0));
         registry.markVisibilityLost(4);
         changed.clear();
 
-        QVERIFY(registry.apply(makeEvent(9, QStringLiteral("c-0"),
-                                         QStringLiteral("job-c"),
-                                         Xc2JobState::InProgress, 1, 10)));
-        QVERIFY(registry.job(QStringLiteral("job-a"))->visibilityLost);
-        QVERIFY(registry.job(QStringLiteral("job-b"))->visibilityLost);
-        QVERIFY(!registry.job(QStringLiteral("job-c"))->visibilityLost);
+        QVERIFY(registry.apply(c0));
+        const Xc2JobRecord lostA = expectedRecord(
+            QStringLiteral("job-a"), Xc2JobState::InProgress, {a0}, true);
+        const Xc2JobRecord lostB = expectedRecord(
+            QStringLiteral("job-b"), Xc2JobState::InProgress, {b0}, true);
+        const Xc2JobRecord visibleC = expectedRecord(
+            QStringLiteral("job-c"), Xc2JobState::InProgress, {c0});
+        QVERIFY(recordEqual(*registry.job(QStringLiteral("job-a")), lostA));
+        QVERIFY(recordEqual(*registry.job(QStringLiteral("job-b")), lostB));
+        QVERIFY(recordEqual(*registry.job(QStringLiteral("job-c")), visibleC));
+        QVERIFY(recordsEqual(registry.activeJobs(), {lostA, lostB, visibleC}));
 
         changed.clear();
-        QVERIFY(registry.apply(makeEvent(5, QStringLiteral("a-1"),
-                                         QStringLiteral("job-a"),
-                                         Xc2JobState::InProgress, 2, 10)));
+        QVERIFY(registry.apply(a1));
+        const Xc2JobRecord recoveredA = expectedRecord(
+            QStringLiteral("job-a"), Xc2JobState::InProgress, {a0, a1});
         QCOMPARE(changed.size(), 1);
-        QCOMPARE(signalRecord(changed, 0).jobId, QStringLiteral("job-a"));
-        QVERIFY(!registry.job(QStringLiteral("job-a"))->visibilityLost);
-        QVERIFY(registry.job(QStringLiteral("job-b"))->visibilityLost);
-        QCOMPARE(recordIds(registry.activeJobs()),
-                 (QStringList{QStringLiteral("job-a"),
-                              QStringLiteral("job-b"),
-                              QStringLiteral("job-c")}));
+        QVERIFY(recordEqual(signalRecord(changed, 0), recoveredA));
+        QVERIFY(recordEqual(*registry.job(QStringLiteral("job-a")), recoveredA));
+        QVERIFY(recordEqual(*registry.job(QStringLiteral("job-b")), lostB));
+        QVERIFY(recordEqual(*registry.job(QStringLiteral("job-c")), visibleC));
+        QVERIFY(recordsEqual(registry.activeJobs(),
+                             {recoveredA, lostB, visibleC}));
 
         changed.clear();
         const QStringList keys{QStringLiteral("job-a"),
@@ -1014,9 +1273,7 @@ private slots:
                                QStringLiteral("job-c")};
         const RegistrySnapshot beforeStaleTerminal = takeSnapshot(registry, keys);
         Xc2Error error = dirtyError();
-        QVERIFY(!registry.apply(makeEvent(
-            4, QStringLiteral("b-stale-terminal"), QStringLiteral("job-b"),
-            Xc2JobState::Error, 0, 0), &error));
+        QVERIFY(!registry.apply(staleTerminal, &error));
         QCOMPARE(error.category, Xc2ErrorCategory::Job);
         QCOMPARE(error.jobId, QStringLiteral("job-b"));
         QVERIFY(snapshotEqual(beforeStaleTerminal, takeSnapshot(registry, keys)));
@@ -1024,17 +1281,19 @@ private slots:
         QCOMPARE(terminal.size(), 0);
         QCOMPARE(removed.size(), 0);
 
-        QVERIFY(registry.apply(makeEvent(
-            5, QStringLiteral("b-fresh-terminal"), QStringLiteral("job-b"),
-            Xc2JobState::Error, 0, 0)));
+        QVERIFY(registry.apply(freshTerminal));
+        const Xc2JobRecord terminalB = expectedRecord(
+            QStringLiteral("job-b"), Xc2JobState::Error,
+            {b0, freshTerminal});
         QCOMPARE(changed.size(), 1);
         QCOMPARE(terminal.size(), 1);
         QCOMPARE(removed.size(), 0);
-        QVERIFY(registry.job(QStringLiteral("job-b"))->terminal());
-        QVERIFY(!registry.job(QStringLiteral("job-b"))->visibilityLost);
-        QCOMPARE(recordIds(registry.activeJobs()),
-                 (QStringList{QStringLiteral("job-a"),
-                              QStringLiteral("job-c")}));
+        QVERIFY(recordEqual(signalRecord(changed, 0), terminalB));
+        QVERIFY(recordEqual(signalRecord(terminal, 0), terminalB));
+        QVERIFY(recordEqual(*registry.job(QStringLiteral("job-b")), terminalB));
+        QVERIFY(recordEqual(*registry.job(QStringLiteral("job-a")), recoveredA));
+        QVERIFY(recordEqual(*registry.job(QStringLiteral("job-c")), visibleC));
+        QVERIFY(recordsEqual(registry.activeJobs(), {recoveredA, visibleC}));
     }
 
     void staleGenerationCannotRecoverVisibility()
@@ -1090,13 +1349,18 @@ private slots:
         QCOMPARE(terminal.size(), 0);
         QCOMPARE(removed.size(), 0);
 
-        QVERIFY(registry.apply(makeEvent(6, QStringLiteral("fresh"), jobId,
-                                         Xc2JobState::InProgress, 2, 10)));
+        const Xc2JobEvent freshRecovery = makeEvent(
+            6, QStringLiteral("fresh"), jobId,
+            Xc2JobState::InProgress, 2, 10);
+        QVERIFY(registry.apply(freshRecovery));
+        const Xc2JobRecord recoveredRecord = expectedRecord(
+            jobId, Xc2JobState::InProgress, {original, freshRecovery});
         QCOMPARE(changed.size(), 1);
         QCOMPARE(terminal.size(), 0);
         QCOMPARE(removed.size(), 0);
-        QVERIFY(!registry.job(jobId)->visibilityLost);
-        QCOMPARE(registry.job(jobId)->events.size(), 2);
+        QVERIFY(recordEqual(signalRecord(changed, 0), recoveredRecord));
+        QVERIFY(recordEqual(*registry.job(jobId), recoveredRecord));
+        QVERIFY(recordsEqual(registry.activeJobs(), {recoveredRecord}));
 
         const RegistrySnapshot recovered = takeSnapshot(registry, {jobId});
         changed.clear();
@@ -1108,36 +1372,62 @@ private slots:
         QCOMPARE(changed.size(), 0);
         QCOMPARE(terminal.size(), 0);
         QCOMPARE(removed.size(), 0);
+
+        const Xc2JobEvent freshAfterRejectedStale = makeEvent(
+            7, QStringLiteral("fresh-after-rejected-stale"), jobId,
+            Xc2JobState::InProgress, 3, 12);
+        QVERIFY(registry.apply(freshAfterRejectedStale));
+        const Xc2JobRecord finalRecord = expectedRecord(
+            jobId, Xc2JobState::InProgress,
+            {original, freshRecovery, freshAfterRejectedStale});
+        QCOMPARE(changed.size(), 1);
+        QCOMPARE(terminal.size(), 0);
+        QCOMPARE(removed.size(), 0);
+        QVERIFY(recordEqual(signalRecord(changed, 0), finalRecord));
+        QVERIFY(recordEqual(*registry.job(jobId), finalRecord));
+        QVERIFY(recordsEqual(registry.activeJobs(), {finalRecord}));
     }
 
     void clearRemovesOnlyRequestedTerminalAndEmitsRemoved()
     {
+        const QString activeId = QStringLiteral("active");
+        const QString terminalBId = QStringLiteral("terminal-b");
+        const QString terminalCId = QStringLiteral("terminal-c");
+        const Xc2JobEvent terminalBEvent = makeEvent(
+            1, QStringLiteral("terminal-b"), terminalBId,
+            Xc2JobState::Finished);
+        const Xc2JobEvent terminalCEvent = makeEvent(
+            1, QStringLiteral("terminal-c"), terminalCId,
+            Xc2JobState::Error);
+        const Xc2JobRecord activeCreated = expectedRecord(activeId);
+        const Xc2JobRecord terminalBRecord = expectedRecord(
+            terminalBId, Xc2JobState::Finished, {terminalBEvent});
+        const Xc2JobRecord terminalCRecord = expectedRecord(
+            terminalCId, Xc2JobState::Error, {terminalCEvent});
         Xc2JobRegistry registry;
         QSignalSpy changed(&registry, &Xc2JobRegistry::jobChanged);
         QSignalSpy terminal(&registry, &Xc2JobRegistry::jobTerminal);
         QSignalSpy removed(&registry, &Xc2JobRegistry::jobRemoved);
-        QVERIFY(registry.accept({QStringLiteral("active")}));
-        QVERIFY(registry.apply(makeEvent(1, QStringLiteral("terminal-b"),
-                                         QStringLiteral("terminal-b"),
-                                         Xc2JobState::Finished)));
-        QVERIFY(registry.apply(makeEvent(1, QStringLiteral("terminal-c"),
-                                         QStringLiteral("terminal-c"),
-                                         Xc2JobState::Error)));
+        QVERIFY(registry.accept({activeId}));
+        QVERIFY(registry.apply(terminalBEvent));
+        QVERIFY(registry.apply(terminalCEvent));
+        QVERIFY(recordEqual(*registry.job(activeId), activeCreated));
+        QVERIFY(recordEqual(*registry.job(terminalBId), terminalBRecord));
+        QVERIFY(recordEqual(*registry.job(terminalCId), terminalCRecord));
+        QVERIFY(recordsEqual(registry.activeJobs(), {activeCreated}));
         changed.clear();
         terminal.clear();
         removed.clear();
 
         const QString blankId = QStringLiteral(" \t");
         const RegistrySnapshot beforeBlankClear = takeSnapshot(
-            registry, {QStringLiteral("active"), QStringLiteral("terminal-b"),
-                       QStringLiteral("terminal-c"), blankId});
+            registry, {activeId, terminalBId, terminalCId, blankId});
         Xc2Error error = dirtyError();
         QVERIFY(!registry.clearTerminal(blankId, &error));
         QCOMPARE(error.category, Xc2ErrorCategory::Contract);
         QCOMPARE(error.jobId, blankId);
         QVERIFY(snapshotEqual(beforeBlankClear, takeSnapshot(
-            registry, {QStringLiteral("active"), QStringLiteral("terminal-b"),
-                       QStringLiteral("terminal-c"), blankId})));
+            registry, {activeId, terminalBId, terminalCId, blankId})));
         QCOMPARE(changed.size(), 0);
         QCOMPARE(terminal.size(), 0);
         QCOMPARE(removed.size(), 0);
@@ -1158,23 +1448,22 @@ private slots:
         });
 
         error = dirtyError();
-        QVERIFY(registry.clearTerminal(QStringLiteral("terminal-b"), &error));
+        QVERIFY(registry.clearTerminal(terminalBId, &error));
         QVERIFY(errorCleared(error));
         QCOMPARE(removed.size(), 1);
-        QCOMPARE(removed.at(0).at(0).toString(), QStringLiteral("terminal-b"));
+        QCOMPARE(removed.at(0).at(0).toString(), terminalBId);
         QVERIFY(removedSawDeletedRecord);
         QVERIFY(removedSawCommittedTombstone);
         QCOMPARE(changed.size(), 0);
         QCOMPARE(terminal.size(), 0);
-        QVERIFY(!registry.job(QStringLiteral("terminal-b")).has_value());
-        QVERIFY(registry.job(QStringLiteral("terminal-c")).has_value());
-        QVERIFY(registry.job(QStringLiteral("active")).has_value());
-        QCOMPARE(recordIds(registry.activeJobs()),
-                 QStringList{QStringLiteral("active")});
+        QVERIFY(!registry.job(terminalBId).has_value());
+        QVERIFY(recordEqual(*registry.job(terminalCId), terminalCRecord));
+        QVERIFY(recordEqual(*registry.job(activeId), activeCreated));
+        QVERIFY(recordsEqual(registry.activeJobs(), {activeCreated}));
 
-        const QStringList keys{QStringLiteral("active"),
-                               QStringLiteral("terminal-b"),
-                               QStringLiteral("terminal-c"),
+        const QStringList keys{activeId,
+                               terminalBId,
+                               terminalCId,
                                QStringLiteral("unknown")};
         const RegistrySnapshot before = takeSnapshot(registry, keys);
         removed.clear();
@@ -1195,15 +1484,28 @@ private slots:
         QVERIFY(errorCleared(error));
         QCOMPARE(changed.size(), 1);
         error = dirtyError();
-        QVERIFY(registry.accept({QStringLiteral("active")}, &error));
+        QVERIFY(registry.accept({activeId}, &error));
         QVERIFY(errorCleared(error));
         QCOMPARE(changed.size(), 1);
-        QVERIFY(registry.apply(makeEvent(
-            2, QStringLiteral("active-progress"), QStringLiteral("active"),
-            Xc2JobState::InProgress, 1, 1)));
+        const Xc2JobEvent activeProgressEvent = makeEvent(
+            2, QStringLiteral("active-progress"), activeId,
+            Xc2JobState::InProgress, 1, 1);
+        QVERIFY(registry.apply(activeProgressEvent));
+        const Xc2JobRecord unknownCreated = expectedRecord(
+            QStringLiteral("unknown"));
+        const Xc2JobRecord activeProgress = expectedRecord(
+            activeId, Xc2JobState::InProgress, {activeProgressEvent});
         QCOMPARE(changed.size(), 2);
         QCOMPARE(terminal.size(), 0);
         QCOMPARE(removed.size(), 0);
+        QVERIFY(recordEqual(signalRecord(changed, 0), unknownCreated));
+        QVERIFY(recordEqual(signalRecord(changed, 1), activeProgress));
+        QVERIFY(recordEqual(*registry.job(activeId), activeProgress));
+        QVERIFY(recordEqual(*registry.job(terminalCId), terminalCRecord));
+        QVERIFY(recordEqual(*registry.job(QStringLiteral("unknown")),
+                            unknownCreated));
+        QVERIFY(recordsEqual(registry.activeJobs(),
+                             {activeProgress, unknownCreated}));
     }
 
     void clearedTerminalCannotBeRecreatedByLateMessages()
@@ -1246,11 +1548,16 @@ private slots:
         Xc2JobEvent late = original;
         late.generation = 8;
         late.messageId = QStringLiteral("late");
-        error = dirtyError();
-        QVERIFY(!registry.apply(late, &error));
-        QCOMPARE(error.category, Xc2ErrorCategory::Job);
-        QCOMPARE(error.jobId, jobId);
-        QVERIFY(snapshotEqual(retired, takeSnapshot(registry, {jobId})));
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            error = dirtyError();
+            QVERIFY(!registry.apply(late, &error));
+            QCOMPARE(error.category, Xc2ErrorCategory::Job);
+            QCOMPARE(error.jobId, jobId);
+            QVERIFY(snapshotEqual(retired, takeSnapshot(registry, {jobId})));
+            QCOMPARE(changed.size(), 0);
+            QCOMPARE(terminal.size(), 0);
+            QCOMPARE(removed.size(), 0);
+        }
 
         error = dirtyError();
         QVERIFY(!registry.accept({jobId}, &error));
@@ -1260,6 +1567,415 @@ private slots:
         QCOMPARE(changed.size(), 0);
         QCOMPARE(terminal.size(), 0);
         QCOMPARE(removed.size(), 0);
+    }
+
+    void terminalSignalSelfDeleteStopsSafely()
+    {
+        auto *registry = new Xc2JobRegistry;
+        QSignalSpy changed(registry, &Xc2JobRegistry::jobChanged);
+        QSignalSpy terminal(registry, &Xc2JobRegistry::jobTerminal);
+        QSignalSpy removed(registry, &Xc2JobRegistry::jobRemoved);
+        const Xc2JobEvent event = makeEvent(
+            2, QStringLiteral("delete-terminal"),
+            QStringLiteral("delete-terminal"), Xc2JobState::Finished);
+        const Xc2JobRecord expected = expectedRecord(
+            QStringLiteral("delete-terminal"), Xc2JobState::Finished,
+            {event});
+        connect(registry, &Xc2JobRegistry::jobChanged, this,
+                [&registry](const Xc2JobRecord &) {
+            delete registry;
+            registry = nullptr;
+        }, Qt::DirectConnection);
+
+        QVERIFY(registry->apply(event));
+        QVERIFY(!registry);
+        QCOMPARE(changed.size(), 1);
+        QCOMPARE(terminal.size(), 0);
+        QCOMPARE(removed.size(), 0);
+        QVERIFY(recordEqual(signalRecord(changed, 0), expected));
+    }
+
+    void visibilitySignalSelfDeleteStopsSafely()
+    {
+        auto *registry = new Xc2JobRegistry;
+        QVERIFY(registry->accept({QStringLiteral("delete-a")}));
+        QVERIFY(registry->accept({QStringLiteral("delete-b")}));
+        QSignalSpy changed(registry, &Xc2JobRegistry::jobChanged);
+        QSignalSpy terminal(registry, &Xc2JobRegistry::jobTerminal);
+        QSignalSpy removed(registry, &Xc2JobRegistry::jobRemoved);
+        const Xc2JobRecord expected = expectedRecord(
+            QStringLiteral("delete-a"), Xc2JobState::Created, {}, true);
+        connect(registry, &Xc2JobRegistry::jobChanged, this,
+                [&registry](const Xc2JobRecord &) {
+            delete registry;
+            registry = nullptr;
+        }, Qt::DirectConnection);
+
+        registry->markVisibilityLost(4);
+        QVERIFY(!registry);
+        QCOMPARE(changed.size(), 1);
+        QCOMPARE(terminal.size(), 0);
+        QCOMPARE(removed.size(), 0);
+        QVERIFY(recordEqual(signalRecord(changed, 0), expected));
+    }
+
+    void terminalSignalLifetimeReplacementStopsSafely()
+    {
+        alignas(Xc2JobRegistry)
+            unsigned char storage[sizeof(Xc2JobRegistry)];
+        auto *registry = ::new (static_cast<void *>(storage)) Xc2JobRegistry;
+        Xc2JobRegistry *replacement = nullptr;
+        int replacementTerminalSignals = 0;
+        connect(registry, &Xc2JobRegistry::jobChanged, this,
+                [this, &registry, &replacement, &replacementTerminalSignals,
+                 &storage](const Xc2JobRecord &) {
+            registry->~Xc2JobRegistry();
+            registry = nullptr;
+            replacement = ::new (static_cast<void *>(storage))
+                Xc2JobRegistry;
+            connect(replacement, &Xc2JobRegistry::jobTerminal, this,
+                    [&replacementTerminalSignals](const Xc2JobRecord &) {
+                ++replacementTerminalSignals;
+            }, Qt::DirectConnection);
+        }, Qt::DirectConnection);
+        const Xc2JobEvent terminalEvent = makeEvent(
+            2, QStringLiteral("replace-terminal"),
+            QStringLiteral("replace-terminal"), Xc2JobState::Finished);
+
+        const bool applied = registry->apply(terminalEvent);
+        const bool originalLifetimeEnded = registry == nullptr;
+        const bool replacementCreated = replacement != nullptr;
+        Xc2JobRegistry *liveObject = replacement ? replacement : registry;
+        if (liveObject)
+            liveObject->~Xc2JobRegistry();
+
+        QVERIFY(applied);
+        QVERIFY(originalLifetimeEnded);
+        QVERIFY(replacementCreated);
+        QCOMPARE(replacementTerminalSignals, 0);
+    }
+
+    void visibilitySignalLifetimeReplacementStopsSafely()
+    {
+        alignas(Xc2JobRegistry)
+            unsigned char storage[sizeof(Xc2JobRegistry)];
+        auto *registry = ::new (static_cast<void *>(storage)) Xc2JobRegistry;
+        QVERIFY(registry->accept({QStringLiteral("replace-a")}));
+        QVERIFY(registry->accept({QStringLiteral("replace-b")}));
+        Xc2JobRegistry *replacement = nullptr;
+        int replacementChangedSignals = 0;
+        connect(registry, &Xc2JobRegistry::jobChanged, this,
+                [this, &registry, &replacement, &replacementChangedSignals,
+                 &storage](const Xc2JobRecord &record) {
+            if (!record.visibilityLost || replacement)
+                return;
+            registry->~Xc2JobRegistry();
+            registry = nullptr;
+            replacement = ::new (static_cast<void *>(storage))
+                Xc2JobRegistry;
+            connect(replacement, &Xc2JobRegistry::jobChanged, this,
+                    [&replacementChangedSignals](const Xc2JobRecord &) {
+                ++replacementChangedSignals;
+            }, Qt::DirectConnection);
+        }, Qt::DirectConnection);
+
+        registry->markVisibilityLost(4);
+        const bool originalLifetimeEnded = registry == nullptr;
+        const bool replacementCreated = replacement != nullptr;
+        Xc2JobRegistry *liveObject = replacement ? replacement : registry;
+        if (liveObject)
+            liveObject->~Xc2JobRegistry();
+
+        QVERIFY(originalLifetimeEnded);
+        QVERIFY(replacementCreated);
+        QCOMPARE(replacementChangedSignals, 0);
+    }
+
+    void acceptReentrantNotificationsRemainFifo()
+    {
+        const QString jobId = QStringLiteral("fifo-accept");
+        const Xc2JobEvent progress = makeEvent(
+            2, QStringLiteral("fifo-progress"), jobId,
+            Xc2JobState::InProgress, 1, 10);
+        const Xc2JobRecord created = expectedRecord(jobId);
+        const Xc2JobRecord inProgress = expectedRecord(
+            jobId, Xc2JobState::InProgress, {progress});
+        Xc2JobRegistry registry;
+        QSignalSpy changed(&registry, &Xc2JobRegistry::jobChanged);
+        QSignalSpy terminal(&registry, &Xc2JobRegistry::jobTerminal);
+        QSignalSpy removed(&registry, &Xc2JobRegistry::jobRemoved);
+        bool nestedApplied = false;
+        bool creationWasCommitted = false;
+        bool deliveryWasCommitted = false;
+        connect(&registry, &Xc2JobRegistry::jobChanged, this,
+                [&registry, &progress, &created, &nestedApplied,
+                 &creationWasCommitted,
+                 &deliveryWasCommitted](const Xc2JobRecord &record) {
+            if (record.state == Xc2JobState::Created && !nestedApplied) {
+                const auto retained = registry.job(record.jobId);
+                creationWasCommitted = retained
+                    && recordEqual(*retained, created)
+                    && recordsEqual(registry.activeJobs(), {created});
+                Xc2Error error = dirtyError();
+                nestedApplied = registry.apply(progress, &error)
+                    && errorCleared(error);
+            } else if (record.state == Xc2JobState::InProgress
+                       && !deliveryWasCommitted) {
+                Xc2Error error = dirtyError();
+                deliveryWasCommitted = registry.apply(progress, &error)
+                    && errorCleared(error);
+            }
+        }, Qt::DirectConnection);
+        QList<ObservedNotification> notifications;
+        observeNotifications(registry, *this, notifications);
+
+        Xc2Error error = dirtyError();
+        QVERIFY(registry.accept({jobId}, &error));
+        QVERIFY(errorCleared(error));
+        QVERIFY(nestedApplied);
+        QVERIFY(creationWasCommitted);
+        QVERIFY(deliveryWasCommitted);
+        QCOMPARE(notifications.size(), 2);
+        QVERIFY(notificationEquals(notifications.at(0),
+                                   ObservedKind::Changed, created));
+        QVERIFY(notificationEquals(notifications.at(1),
+                                   ObservedKind::Changed, inProgress));
+        QCOMPARE(changed.size(), 2);
+        QCOMPARE(terminal.size(), 0);
+        QCOMPARE(removed.size(), 0);
+        QVERIFY(recordEqual(*registry.job(jobId), inProgress));
+        QVERIFY(recordsEqual(registry.activeJobs(), {inProgress}));
+    }
+
+    void terminalClearReentrantNotificationsRemainFifo()
+    {
+        const QString jobId = QStringLiteral("fifo-terminal");
+        const Xc2JobEvent progress = makeEvent(
+            2, QStringLiteral("fifo-progress"), jobId,
+            Xc2JobState::InProgress, 4, 10);
+        const Xc2JobEvent finished = makeEvent(
+            3, QStringLiteral("fifo-finished"), jobId,
+            Xc2JobState::Finished, 1, 1);
+        const Xc2JobRecord terminalRecord = expectedRecord(
+            jobId, Xc2JobState::Finished, {progress, finished});
+        Xc2JobRegistry registry;
+        QVERIFY(registry.accept({jobId}));
+        QVERIFY(registry.apply(progress));
+        QSignalSpy changed(&registry, &Xc2JobRegistry::jobChanged);
+        QSignalSpy terminal(&registry, &Xc2JobRegistry::jobTerminal);
+        QSignalSpy removed(&registry, &Xc2JobRegistry::jobRemoved);
+        bool cleared = false;
+        connect(&registry, &Xc2JobRegistry::jobChanged, this,
+                [&registry, &cleared](const Xc2JobRecord &record) {
+            if (!record.terminal() || cleared)
+                return;
+            Xc2Error error = dirtyError();
+            cleared = registry.clearTerminal(record.jobId, &error)
+                && errorCleared(error);
+        }, Qt::DirectConnection);
+        QList<ObservedNotification> notifications;
+        observeNotifications(registry, *this, notifications);
+
+        QVERIFY(registry.apply(finished));
+        QVERIFY(cleared);
+        QCOMPARE(notifications.size(), 3);
+        QVERIFY(notificationEquals(notifications.at(0),
+                                   ObservedKind::Changed, terminalRecord));
+        QVERIFY(notificationEquals(notifications.at(1),
+                                   ObservedKind::Terminal, terminalRecord));
+        QVERIFY(removedNotificationEquals(notifications.at(2), jobId));
+        QCOMPARE(changed.size(), 1);
+        QCOMPARE(terminal.size(), 1);
+        QCOMPARE(removed.size(), 1);
+        QVERIFY(!registry.job(jobId).has_value());
+        QVERIFY(registry.activeJobs().isEmpty());
+    }
+
+    void visibilityReentrantNotificationsRemainFifo()
+    {
+        const QString jobA = QStringLiteral("fifo-a");
+        const QString jobB = QStringLiteral("fifo-b");
+        const Xc2JobEvent a0 = makeEvent(
+            4, QStringLiteral("a-0"), jobA,
+            Xc2JobState::InProgress, 1, 10);
+        const Xc2JobEvent b0 = makeEvent(
+            4, QStringLiteral("b-0"), jobB,
+            Xc2JobState::InProgress, 1, 10);
+        const Xc2JobEvent recoverA = makeEvent(
+            6, QStringLiteral("a-1"), jobA,
+            Xc2JobState::InProgress, 2, 10);
+        const Xc2JobEvent finishB = makeEvent(
+            6, QStringLiteral("b-terminal"), jobB,
+            Xc2JobState::Finished, 0, 0);
+        const Xc2JobRecord lostA = expectedRecord(
+            jobA, Xc2JobState::InProgress, {a0}, true);
+        const Xc2JobRecord lostB = expectedRecord(
+            jobB, Xc2JobState::InProgress, {b0}, true);
+        const Xc2JobRecord recoveredA = expectedRecord(
+            jobA, Xc2JobState::InProgress, {a0, recoverA});
+        const Xc2JobRecord terminalB = expectedRecord(
+            jobB, Xc2JobState::Finished, {b0, finishB});
+        Xc2JobRegistry registry;
+        QVERIFY(registry.apply(a0));
+        QVERIFY(registry.apply(b0));
+        QSignalSpy changed(&registry, &Xc2JobRegistry::jobChanged);
+        QSignalSpy terminal(&registry, &Xc2JobRegistry::jobTerminal);
+        QSignalSpy removed(&registry, &Xc2JobRegistry::jobRemoved);
+        bool nestedMutationRan = false;
+        bool watermarkWasCommitted = false;
+        connect(&registry, &Xc2JobRegistry::jobChanged, this,
+                [&registry, &nestedMutationRan, &watermarkWasCommitted,
+                 &recoverA, &finishB, &jobB](const Xc2JobRecord &record) {
+            if (!record.visibilityLost || nestedMutationRan)
+                return;
+            const Xc2JobEvent stale = makeEvent(
+                5, QStringLiteral("slot-stale"), record.jobId,
+                Xc2JobState::InProgress, 2, 10);
+            Xc2Error staleError = dirtyError();
+            watermarkWasCommitted = !registry.apply(stale, &staleError)
+                && staleError.category == Xc2ErrorCategory::Job
+                && staleError.jobId == record.jobId;
+            nestedMutationRan = registry.apply(recoverA)
+                && registry.apply(finishB)
+                && registry.clearTerminal(jobB);
+        }, Qt::DirectConnection);
+        QList<ObservedNotification> notifications;
+        observeNotifications(registry, *this, notifications);
+
+        registry.markVisibilityLost(5);
+        QVERIFY(nestedMutationRan);
+        QVERIFY(watermarkWasCommitted);
+        QCOMPARE(notifications.size(), 6);
+        QVERIFY(notificationEquals(notifications.at(0),
+                                   ObservedKind::Changed, lostA));
+        QVERIFY(notificationEquals(notifications.at(1),
+                                   ObservedKind::Changed, lostB));
+        QVERIFY(notificationEquals(notifications.at(2),
+                                   ObservedKind::Changed, recoveredA));
+        QVERIFY(notificationEquals(notifications.at(3),
+                                   ObservedKind::Changed, terminalB));
+        QVERIFY(notificationEquals(notifications.at(4),
+                                   ObservedKind::Terminal, terminalB));
+        QVERIFY(removedNotificationEquals(notifications.at(5), jobB));
+        QCOMPARE(changed.size(), 4);
+        QCOMPARE(terminal.size(), 1);
+        QCOMPARE(removed.size(), 1);
+        QVERIFY(recordEqual(*registry.job(jobA), recoveredA));
+        QVERIFY(!registry.job(jobB).has_value());
+        QVERIFY(recordsEqual(registry.activeJobs(), {recoveredA}));
+    }
+
+    void staleVisibilityLossReplayIsFiltered_data()
+    {
+        QTest::addColumn<qulonglong>("lossGeneration");
+        QTest::addColumn<bool>("expectLoss");
+        QTest::newRow("lower") << qulonglong(4) << false;
+        QTest::newRow("same") << qulonglong(5) << false;
+        QTest::newRow("higher") << qulonglong(6) << true;
+    }
+
+    void staleVisibilityLossReplayIsFiltered()
+    {
+        QFETCH(qulonglong, lossGeneration);
+        QFETCH(bool, expectLoss);
+        const QString jobId = QStringLiteral("loss-watermark");
+        const Xc2JobEvent initial = makeEvent(
+            4, QStringLiteral("initial"), jobId,
+            Xc2JobState::InProgress, 1, 10);
+        const Xc2JobEvent recovered = makeEvent(
+            6, QStringLiteral("recovered"), jobId,
+            Xc2JobState::InProgress, 2, 10);
+        const Xc2JobEvent fresh = makeEvent(
+            7, QStringLiteral("fresh"), jobId,
+            Xc2JobState::InProgress, 3, 12);
+        Xc2JobRegistry registry;
+        QVERIFY(registry.apply(initial));
+        registry.markVisibilityLost(5);
+        QVERIFY(registry.apply(recovered));
+        const Xc2JobRecord visible = expectedRecord(
+            jobId, Xc2JobState::InProgress, {initial, recovered});
+        QVERIFY(recordEqual(*registry.job(jobId), visible));
+        QSignalSpy changed(&registry, &Xc2JobRegistry::jobChanged);
+        QSignalSpy terminal(&registry, &Xc2JobRegistry::jobTerminal);
+        QSignalSpy removed(&registry, &Xc2JobRegistry::jobRemoved);
+
+        registry.markVisibilityLost(Xc2StompGeneration(lossGeneration));
+        const Xc2JobRecord afterLoss = expectedRecord(
+            jobId, Xc2JobState::InProgress, {initial, recovered}, expectLoss);
+        QVERIFY(recordEqual(*registry.job(jobId), afterLoss));
+        QCOMPARE(changed.size(), expectLoss ? 1 : 0);
+        QCOMPARE(terminal.size(), 0);
+        QCOMPARE(removed.size(), 0);
+        if (expectLoss)
+            QVERIFY(recordEqual(signalRecord(changed, 0), afterLoss));
+
+        changed.clear();
+        QVERIFY(registry.apply(fresh));
+        const Xc2JobRecord afterFresh = expectedRecord(
+            jobId, Xc2JobState::InProgress, {initial, recovered, fresh});
+        QVERIFY(recordEqual(*registry.job(jobId), afterFresh));
+        QCOMPARE(changed.size(), 1);
+        QVERIFY(recordEqual(signalRecord(changed, 0), afterFresh));
+        QCOMPARE(terminal.size(), 0);
+        QCOMPARE(removed.size(), 0);
+        QVERIFY(recordsEqual(registry.activeJobs(), {afterFresh}));
+    }
+
+    void clearTerminalIsAliasSafe()
+    {
+        {
+            const QString jobId = QStringLiteral("alias-success");
+            const Xc2JobEvent finished = makeEvent(
+                2, QStringLiteral("alias-finished"), jobId,
+                Xc2JobState::Finished);
+            Xc2JobRegistry registry;
+            QVERIFY(registry.apply(finished));
+            QSignalSpy changed(&registry, &Xc2JobRegistry::jobChanged);
+            QSignalSpy terminal(&registry, &Xc2JobRegistry::jobTerminal);
+            QSignalSpy removed(&registry, &Xc2JobRegistry::jobRemoved);
+            Xc2Error error = dirtyError();
+            error.jobId = jobId;
+            QVERIFY(registry.clearTerminal(error.jobId, &error));
+            QVERIFY(errorCleared(error));
+            QCOMPARE(changed.size(), 0);
+            QCOMPARE(terminal.size(), 0);
+            QCOMPARE(removed.size(), 1);
+            QCOMPARE(removed.at(0).at(0).toString(), jobId);
+        }
+        {
+            const QString jobId = QStringLiteral("alias-payload");
+            Xc2JobRegistry registry;
+            QVERIFY(registry.apply(makeEvent(
+                2, QStringLiteral("alias-payload-finished"), jobId,
+                Xc2JobState::Finished)));
+            Xc2Error error = dirtyError();
+            error.jobId = jobId;
+            QString laterReceiverId;
+            connect(&registry, &Xc2JobRegistry::jobRemoved, this,
+                    [&error](const QString &) {
+                error.jobId = QStringLiteral("mutated-by-first-receiver");
+            }, Qt::DirectConnection);
+            connect(&registry, &Xc2JobRegistry::jobRemoved, this,
+                    [&laterReceiverId](const QString &signalJobId) {
+                laterReceiverId = signalJobId;
+            }, Qt::DirectConnection);
+            QVERIFY(registry.clearTerminal(error.jobId, &error));
+            QCOMPARE(laterReceiverId, jobId);
+        }
+        {
+            Xc2JobRegistry registry;
+            QSignalSpy changed(&registry, &Xc2JobRegistry::jobChanged);
+            QSignalSpy terminal(&registry, &Xc2JobRegistry::jobTerminal);
+            QSignalSpy removed(&registry, &Xc2JobRegistry::jobRemoved);
+            Xc2Error error = dirtyError();
+            error.jobId = QStringLiteral("alias-missing");
+            QVERIFY(!registry.clearTerminal(error.jobId, &error));
+            QCOMPARE(error.category, Xc2ErrorCategory::Job);
+            QCOMPARE(error.jobId, QStringLiteral("alias-missing"));
+            QCOMPARE(changed.size(), 0);
+            QCOMPARE(terminal.size(), 0);
+            QCOMPARE(removed.size(), 0);
+        }
     }
 
     void malformedOrNonProgressMessageDoesNotMutate()

@@ -2,7 +2,8 @@
 
 #include "Xc2JsonCodec.h"
 
-#include <algorithm>
+#include <QPointer>
+
 #include <utility>
 
 namespace ktm::xc2 {
@@ -16,14 +17,15 @@ void clearError(Xc2Error *error)
 
 bool fail(Xc2Error *error,
           Xc2ErrorCategory category,
-          const QString &jobId,
+          QString jobId,
           QString message)
 {
     if (error) {
-        *error = {};
-        error->category = category;
-        error->jobId = jobId;
-        error->message = std::move(message);
+        Xc2Error failure;
+        failure.category = category;
+        failure.jobId = std::move(jobId);
+        failure.message = std::move(message);
+        *error = std::move(failure);
     }
     return false;
 }
@@ -119,7 +121,7 @@ bool Xc2JobRegistry::accept(const Xc2JobAccepted &job, Xc2Error *error)
     m_firstObservedOrder.append(job.jobId);
     m_jobs.insert(job.jobId, record);
     clearError(error);
-    emit jobChanged(record);
+    publish({{PendingNotification::Kind::Changed, record, {}}});
     return true;
 }
 
@@ -195,9 +197,14 @@ bool Xc2JobRegistry::apply(const Xc2JobEvent &event, Xc2Error *error)
 
     const Xc2JobRecord committed = recordIt.value();
     clearError(error);
-    emit jobChanged(committed);
-    if (committed.terminal())
-        emit jobTerminal(committed);
+    QList<PendingNotification> notifications{
+        {PendingNotification::Kind::Changed, committed, {}}
+    };
+    if (committed.terminal()) {
+        notifications.append(
+            {PendingNotification::Kind::Terminal, committed, {}});
+    }
+    publish(std::move(notifications));
     return true;
 }
 
@@ -238,7 +245,7 @@ void Xc2JobRegistry::markVisibilityLost(Xc2StompGeneration generation)
     if (generation == 0)
         return;
 
-    QList<Xc2JobRecord> changed;
+    QList<PendingNotification> notifications;
     for (const QString &jobId : std::as_const(m_firstObservedOrder)) {
         auto recordIt = m_jobs.find(jobId);
         if (recordIt == m_jobs.end() || recordIt->terminal())
@@ -246,17 +253,18 @@ void Xc2JobRegistry::markVisibilityLost(Xc2StompGeneration generation)
 
         const Xc2StompGeneration oldWatermark =
             m_visibilityLostGeneration.value(jobId);
-        m_visibilityLostGeneration.insert(jobId,
-                                          std::max(oldWatermark, generation));
+        if (generation <= oldWatermark)
+            continue;
+        m_visibilityLostGeneration.insert(jobId, generation);
         if (recordIt->visibilityLost)
             continue;
 
         recordIt->visibilityLost = true;
-        changed.append(recordIt.value());
+        notifications.append(
+            {PendingNotification::Kind::Changed, recordIt.value(), {}});
     }
 
-    for (const Xc2JobRecord &record : std::as_const(changed))
-        emit jobChanged(record);
+    publish(std::move(notifications));
 }
 
 std::optional<Xc2JobRecord> Xc2JobRegistry::job(const QString &jobId) const
@@ -281,24 +289,62 @@ QList<Xc2JobRecord> Xc2JobRegistry::activeJobs() const
 
 bool Xc2JobRegistry::clearTerminal(const QString &jobId, Xc2Error *error)
 {
-    if (jobId.trimmed().isEmpty()) {
-        return fail(error, Xc2ErrorCategory::Contract, jobId,
+    const QString stableJobId = jobId;
+    if (stableJobId.trimmed().isEmpty()) {
+        return fail(error, Xc2ErrorCategory::Contract, stableJobId,
                     QStringLiteral("XC2 job ID must not be blank"));
     }
 
-    const auto it = m_jobs.constFind(jobId);
+    const auto it = m_jobs.constFind(stableJobId);
     if (it == m_jobs.cend() || !it->terminal()) {
-        return fail(error, Xc2ErrorCategory::Job, jobId,
+        return fail(error, Xc2ErrorCategory::Job, stableJobId,
                     QStringLiteral("XC2 job is not a retained terminal job"));
     }
 
-    m_jobs.remove(jobId);
-    m_firstObservedOrder.removeAll(jobId);
-    m_visibilityLostGeneration.remove(jobId);
-    m_tombstones.insert(jobId);
+    m_jobs.remove(stableJobId);
+    m_firstObservedOrder.removeAll(stableJobId);
+    m_visibilityLostGeneration.remove(stableJobId);
+    m_tombstones.insert(stableJobId);
     clearError(error);
-    emit jobRemoved(jobId);
+    publish({{PendingNotification::Kind::Removed, {}, stableJobId}});
     return true;
+}
+
+void Xc2JobRegistry::publish(QList<PendingNotification> notifications)
+{
+    if (notifications.isEmpty())
+        return;
+
+    m_pendingNotifications.reserve(m_pendingNotifications.size()
+                                   + notifications.size());
+    for (PendingNotification &notification : notifications)
+        m_pendingNotifications.append(std::move(notification));
+
+    if (m_drainingNotifications)
+        return;
+
+    m_drainingNotifications = true;
+    QPointer<Xc2JobRegistry> owner(this);
+    while (owner && !owner->m_pendingNotifications.isEmpty()) {
+        PendingNotification notification =
+            owner->m_pendingNotifications.takeFirst();
+        Xc2JobRegistry *current = owner.data();
+        switch (notification.kind) {
+        case PendingNotification::Kind::Changed:
+            emit current->jobChanged(notification.record);
+            break;
+        case PendingNotification::Kind::Terminal:
+            emit current->jobTerminal(notification.record);
+            break;
+        case PendingNotification::Kind::Removed:
+            emit current->jobRemoved(notification.jobId);
+            break;
+        }
+        if (!owner)
+            return;
+    }
+    if (owner)
+        owner->m_drainingNotifications = false;
 }
 
 } // namespace ktm::xc2

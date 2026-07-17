@@ -48,11 +48,27 @@ signals:
     void jobRemoved(const QString &jobId);
 
 private:
+    struct PendingNotification {
+        enum class Kind {
+            Changed,
+            Terminal,
+            Removed
+        };
+
+        Kind kind = Kind::Changed;
+        Xc2JobRecord record;
+        QString jobId;
+    };
+
+    void publish(QList<PendingNotification> notifications);
+
     QHash<QString, Xc2JobRecord> m_jobs;
     QStringList m_firstObservedOrder;
     QSet<QString> m_tombstones;
     QHash<Xc2StompGeneration, QHash<QString, Xc2JobEvent>> m_deliveries;
     QHash<QString, Xc2StompGeneration> m_visibilityLostGeneration;
+    QList<PendingNotification> m_pendingNotifications;
+    bool m_drainingNotifications = false;
 };
 
 } // namespace ktm::xc2
