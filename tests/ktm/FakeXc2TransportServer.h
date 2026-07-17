@@ -10,6 +10,7 @@
 #include <QPair>
 #include <QStringList>
 #include <QUrl>
+#include <QWebSocketProtocol>
 
 class QTcpServer;
 class QTcpSocket;
@@ -20,8 +21,10 @@ struct FakeXc2HttpRequest {
     QByteArray method;
     QByteArray target;
     QList<QPair<QByteArray, QByteArray>> headers;
+    QByteArray rawHeaderBlock;
 
     QByteArray headerValue(const QByteArray &name) const;
+    QList<QByteArray> headerValues(const QByteArray &name) const;
 };
 
 enum class FakeXc2WebSocketMessageKind { Text, Binary };
@@ -73,7 +76,10 @@ public:
     bool sendBinary(const QByteArray &payload);
     bool sendFrame(const ktm::xc2::Xc2StompFrame &frame,
                    bool binary = false);
-    bool sendFrameAndClose(const ktm::xc2::Xc2StompFrame &frame);
+    bool sendFrameAndClose(
+        const ktm::xc2::Xc2StompFrame &frame,
+        QWebSocketProtocol::CloseCode closeCode =
+            QWebSocketProtocol::CloseCodeNormal);
     void closeWebSocket(int delayMs = 0);
 
 signals:

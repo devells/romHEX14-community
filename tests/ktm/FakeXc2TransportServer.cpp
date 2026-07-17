@@ -3,6 +3,7 @@
 #include <QAbstractSocket>
 #include <QCryptographicHash>
 #include <QNetworkProxy>
+#include <QPointer>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QTimer>
@@ -28,11 +29,19 @@ struct FakeXc2TransportServer::RawConnection {
 
 QByteArray FakeXc2HttpRequest::headerValue(const QByteArray &name) const
 {
+    const QList<QByteArray> values = headerValues(name);
+    return values.isEmpty() ? QByteArray() : values.constFirst();
+}
+
+QList<QByteArray> FakeXc2HttpRequest::headerValues(
+    const QByteArray &name) const
+{
+    QList<QByteArray> values;
     for (const auto &header : headers) {
         if (headerEquals(header.first, name))
-            return header.second;
+            values.append(header.second);
     }
-    return {};
+    return values;
 }
 
 FakeXc2TransportServer::FakeXc2TransportServer(QObject *parent)
@@ -195,7 +204,8 @@ bool FakeXc2TransportServer::sendFrame(
 }
 
 bool FakeXc2TransportServer::sendFrameAndClose(
-    const ktm::xc2::Xc2StompFrame &frame)
+    const ktm::xc2::Xc2StompFrame &frame,
+    QWebSocketProtocol::CloseCode closeCode)
 {
     if (m_webSockets.isEmpty())
         return false;
@@ -204,7 +214,7 @@ bool FakeXc2TransportServer::sendFrameAndClose(
     const QString message = QString::fromUtf8(payload);
     const bool queued = socket->sendTextMessage(message)
         == message.toUtf8().size();
-    socket->close(QWebSocketProtocol::CloseCodeNormal,
+    socket->close(closeCode,
                   QStringLiteral("scripted close"));
     return queued;
 }
@@ -236,7 +246,10 @@ void FakeXc2TransportServer::acceptConnections()
                 socket->deleteLater();
             }
         });
+        const QPointer<FakeXc2TransportServer> guard(this);
         inspect(socket);
+        if (guard.isNull())
+            return;
     }
 }
 
@@ -267,32 +280,57 @@ void FakeXc2TransportServer::inspect(QTcpSocket *socket)
         return;
     }
 
-    const QByteArray headerBlock = bytes.left(marker);
+    const QByteArray headerBlock = bytes.left(marker + 4);
     const FakeXc2HttpRequest request = parseRequest(headerBlock);
-    const bool isUpgrade = request.target == QByteArrayLiteral("/xc2-websocket")
+    const bool requestsUpgrade =
+        request.target == QByteArrayLiteral("/xc2-websocket")
         && request.headerValue(QByteArrayLiteral("Upgrade")).compare(
                QByteArrayLiteral("websocket"), Qt::CaseInsensitive) == 0;
+    const bool isUpgrade = requestsUpgrade
+        && request.method == QByteArrayLiteral("GET");
     connection->decided = true;
 
     if (!isUpgrade) {
         socket->read(marker + 4);
-        m_restRequests.append(request);
-        emit restRequestCaptured();
-        QByteArray response = QByteArrayLiteral(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n");
-        if (!m_restCookie.isEmpty()) {
-            response += QByteArrayLiteral("Set-Cookie: ") + m_restCookie
-                + QByteArrayLiteral("; Path=/\r\n");
+        const bool exactTarget = request.target
+            == QByteArrayLiteral("/xc2/1.0/serviceStatus/status");
+        const bool exactRest = exactTarget
+            && request.method == QByteArrayLiteral("GET");
+        QByteArray response;
+        if (exactRest) {
+            m_restRequests.append(request);
+            const QPointer<FakeXc2TransportServer> guard(this);
+            emit restRequestCaptured();
+            if (guard.isNull())
+                return;
+            response = QByteArrayLiteral(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n");
+            if (!m_restCookie.isEmpty()) {
+                response += QByteArrayLiteral("Set-Cookie: ") + m_restCookie
+                    + QByteArrayLiteral("; Path=/\r\n");
+            }
+            response += QByteArrayLiteral(
+                "Content-Length: 5\r\nConnection: close\r\n\r\nalive");
+        } else if (request.method != QByteArrayLiteral("GET")
+                   && (exactTarget || requestsUpgrade)) {
+            response = QByteArrayLiteral(
+                "HTTP/1.1 405 Method Not Allowed\r\n"
+                "Content-Length: 0\r\nConnection: close\r\n\r\n");
+        } else {
+            response = QByteArrayLiteral(
+                "HTTP/1.1 404 Not Found\r\n"
+                "Content-Length: 0\r\nConnection: close\r\n\r\n");
         }
-        response += QByteArrayLiteral(
-            "Content-Length: 5\r\nConnection: close\r\n\r\nalive");
         socket->write(response);
         socket->disconnectFromHost();
         return;
     }
 
     m_upgradeRequests.append(request);
+    const QPointer<FakeXc2TransportServer> guard(this);
     emit upgradeRequestCaptured();
+    if (guard.isNull())
+        return;
     if (m_upgradeMode == UpgradeMode::NoResponse)
         return;
     if (m_upgradeMode == UpgradeMode::Redirect) {
@@ -352,7 +390,10 @@ void FakeXc2TransportServer::acceptWebSockets()
         connect(socket, &QWebSocket::disconnected, this, [this, socket] {
             emit webSocketDisconnected();
         });
+        const QPointer<FakeXc2TransportServer> guard(this);
         emit webSocketConnected();
+        if (guard.isNull())
+            return;
     }
 }
 
@@ -366,7 +407,10 @@ void FakeXc2TransportServer::captureMessage(
         m_codecs[socket].feed(payload);
     for (const auto &frame : decoded.frames) {
         m_stompFrames.append(frame);
+        const QPointer<FakeXc2TransportServer> guard(this);
         emit stompFrameReceived();
+        if (guard.isNull())
+            return;
     }
     m_decodeErrors.append(decoded.errors);
     emit webSocketMessageReceived();
@@ -376,6 +420,7 @@ FakeXc2HttpRequest FakeXc2TransportServer::parseRequest(
     const QByteArray &headerBlock)
 {
     FakeXc2HttpRequest request;
+    request.rawHeaderBlock = headerBlock;
     const QList<QByteArray> lines = headerBlock.split('\n');
     if (lines.isEmpty())
         return request;
