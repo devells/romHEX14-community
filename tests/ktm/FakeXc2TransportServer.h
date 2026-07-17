@@ -25,6 +25,8 @@ struct FakeXc2HttpRequest {
 
     QByteArray headerValue(const QByteArray &name) const;
     QList<QByteArray> headerValues(const QByteArray &name) const;
+    QList<QByteArray> rawHeaderLinesMatchingName(
+        const QByteArray &name) const;
 };
 
 enum class FakeXc2WebSocketMessageKind { Text, Binary };

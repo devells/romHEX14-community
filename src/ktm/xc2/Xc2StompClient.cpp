@@ -180,6 +180,7 @@ struct Xc2StompClient::Private {
         TimeoutLatched,
         Connected
     };
+    enum class DisconnectDecision { Inactive, Pending, CloseObserved };
 
     explicit Private(Xc2StompClient *owner, Xc2StompClientOptions value)
         : q(owner), options(value)
@@ -278,6 +279,7 @@ struct Xc2StompClient::Private {
         incomingActivity.invalidate();
         disconnectReceipt.clear();
         disconnectReceiptMatched = false;
+        disconnectDecision = DisconnectDecision::Inactive;
         disconnectFrameQueued = false;
         disconnectDeadlineActive = false;
         disconnectSocketErrorSeen = false;
@@ -307,6 +309,14 @@ struct Xc2StompClient::Private {
         if (!current(candidateGeneration, candidateSocket))
             return;
 
+        if (connectToken == candidateGeneration
+            && connectDecision == ConnectDecision::TimeoutLatched) {
+            error = transportError(
+                Xc2TransportReason::Timeout,
+                QStringLiteral("XC2 STOMP connection deadline expired"));
+            forceAbort = true;
+        }
+
         terminal = true;
         const bool lostEstablishedVisibility = established && !intentional;
         QPointer<QWebSocket> retiredSocket = socket;
@@ -328,6 +338,7 @@ struct Xc2StompClient::Private {
         established = false;
         disconnectReceipt.clear();
         disconnectReceiptMatched = false;
+        disconnectDecision = DisconnectDecision::Inactive;
         disconnectFrameQueued = false;
         disconnectDeadlineActive = false;
         disconnectSocketErrorSeen = false;
@@ -451,7 +462,8 @@ struct Xc2StompClient::Private {
         if (!current(candidateGeneration, candidateSocket)
             || state != Xc2StompState::Disconnecting
             || !disconnectDeadlineActive
-            || disconnectToken != candidateGeneration) {
+            || disconnectToken != candidateGeneration
+            || disconnectDecision != DisconnectDecision::Pending) {
             return false;
         }
         if (!disconnectDeadline.hasExpired())
@@ -537,7 +549,8 @@ struct Xc2StompClient::Private {
             if (!guarded || !current(candidateGeneration, guarded)
                 || state != Xc2StompState::Disconnecting
                 || disconnectToken != candidateGeneration
-                || !disconnectDeadlineActive) {
+                || !disconnectDeadlineActive
+                || disconnectDecision != DisconnectDecision::Pending) {
                 return;
             }
             if (!disconnectDeadline.hasExpired()) {
@@ -974,6 +987,11 @@ struct Xc2StompClient::Private {
             subscriptionFlushScheduled = false;
             if (state != Xc2StompState::Connected)
                 return;
+            QPointer<Xc2StompClient> owner(q);
+            if (!requireIncomingWindow(candidateGeneration, guarded)
+                || !owner) {
+                return;
+            }
             flushSubscriptions(candidateGeneration, guarded);
         }, Qt::QueuedConnection);
     }
@@ -987,6 +1005,10 @@ struct Xc2StompClient::Private {
             return;
         }
         QPointer<Xc2StompClient> owner(q);
+        if (!requireIncomingWindow(candidateGeneration, candidateSocket)
+            || !owner) {
+            return;
+        }
         subscriptionFlushRunning = true;
         subscriptionWritesDeferred = true;
         const QSet<int> desiredSnapshot = desired;
@@ -1000,6 +1022,10 @@ struct Xc2StompClient::Private {
                 || state != Xc2StompState::Connected) {
                 break;
             }
+            if (!requireIncomingWindow(candidateGeneration, candidateSocket)
+                || !owner) {
+                return;
+            }
             const int key = int(topic);
             const bool wanted = desiredSnapshot.contains(key);
             const bool active = activeSnapshot.contains(key);
@@ -1012,6 +1038,10 @@ struct Xc2StompClient::Private {
                 return;
             if (!current(candidateGeneration, candidateSocket))
                 return;
+            if (!requireIncomingWindow(candidateGeneration, candidateSocket)
+                || !owner) {
+                return;
+            }
             if (!sent || state != Xc2StompState::Connected)
                 break;
         }
@@ -1179,9 +1209,17 @@ struct Xc2StompClient::Private {
     {
         if (state == Xc2StompState::Disconnecting) {
             QPointer<Xc2StompClient> owner(q);
-            if (!requireDisconnectWindow(candidateGeneration, candidateSocket)
-                || !owner) {
-                return;
+            if (disconnectDecision == DisconnectDecision::CloseObserved) {
+                if (!current(candidateGeneration, candidateSocket)
+                    || disconnectToken != candidateGeneration) {
+                    return;
+                }
+            } else {
+                if (!requireDisconnectWindow(candidateGeneration,
+                                             candidateSocket)
+                    || !owner) {
+                    return;
+                }
             }
             disconnectSocketErrorSeen = true;
         } else if ((state == Xc2StompState::WebSocketConnecting
@@ -1222,15 +1260,15 @@ struct Xc2StompClient::Private {
                            false);
                 return;
             }
+            disconnectDecision = DisconnectDecision::CloseObserved;
+            disconnectDeadlineActive = false;
+            retireTimer(disconnectTimer);
             const QPointer<QWebSocket> guarded(candidateSocket);
             QMetaObject::invokeMethod(q, [this, candidateGeneration, guarded] {
                 if (!guarded || !current(candidateGeneration, guarded)
-                    || state != Xc2StompState::Disconnecting) {
-                    return;
-                }
-                QPointer<Xc2StompClient> owner(q);
-                if (!requireDisconnectWindow(candidateGeneration, guarded)
-                    || !owner) {
+                    || state != Xc2StompState::Disconnecting
+                    || disconnectDecision
+                        != DisconnectDecision::CloseObserved) {
                     return;
                 }
                 if (!disconnectSocketErrorSeen
@@ -1282,6 +1320,7 @@ struct Xc2StompClient::Private {
     Xc2StompGeneration connectToken = 0;
     Xc2StompGeneration disconnectToken = 0;
     ConnectDecision connectDecision = ConnectDecision::Inactive;
+    DisconnectDecision disconnectDecision = DisconnectDecision::Inactive;
     bool terminal = true;
     bool established = false;
     bool intentional = false;
@@ -1409,7 +1448,18 @@ bool Xc2StompClient::subscribe(Topic topic, Xc2Error *error)
     if (d->state == Xc2StompState::Connected
         && !d->subscriptionWritesDeferred
         && !d->subscriptionFlushRunning) {
+        const Xc2StompGeneration candidateGeneration = d->generation;
+        QWebSocket *const candidateSocket = d->socket;
         QPointer<Xc2StompClient> owner(this);
+        if (!d->requireIncomingWindow(candidateGeneration, candidateSocket)
+            || !owner) {
+            if (owner && error) {
+                *error = transportError(
+                    Xc2TransportReason::Timeout,
+                    QStringLiteral("XC2 STOMP heartbeat timed out"));
+            }
+            return false;
+        }
         const bool sent = d->sendSubscription(topic);
         if (!owner)
             return sent;
@@ -1418,6 +1468,17 @@ bool Xc2StompClient::subscribe(Topic topic, Xc2Error *error)
                 *error = transportError(
                     Xc2TransportReason::Network,
                     QStringLiteral("Failed to queue STOMP SUBSCRIBE"));
+            }
+            return false;
+        }
+        if (d->current(candidateGeneration, candidateSocket)
+            && (!d->requireIncomingWindow(candidateGeneration,
+                                          candidateSocket)
+                || !owner)) {
+            if (owner && error) {
+                *error = transportError(
+                    Xc2TransportReason::Timeout,
+                    QStringLiteral("XC2 STOMP heartbeat timed out"));
             }
             return false;
         }
@@ -1443,7 +1504,18 @@ bool Xc2StompClient::unsubscribe(Topic topic, Xc2Error *error)
     if (d->state == Xc2StompState::Connected
         && !d->subscriptionWritesDeferred
         && !d->subscriptionFlushRunning) {
+        const Xc2StompGeneration candidateGeneration = d->generation;
+        QWebSocket *const candidateSocket = d->socket;
         QPointer<Xc2StompClient> owner(this);
+        if (!d->requireIncomingWindow(candidateGeneration, candidateSocket)
+            || !owner) {
+            if (owner && error) {
+                *error = transportError(
+                    Xc2TransportReason::Timeout,
+                    QStringLiteral("XC2 STOMP heartbeat timed out"));
+            }
+            return false;
+        }
         const bool sent = d->sendUnsubscription(topic);
         if (!owner)
             return sent;
@@ -1452,6 +1524,17 @@ bool Xc2StompClient::unsubscribe(Topic topic, Xc2Error *error)
                 *error = transportError(
                     Xc2TransportReason::Network,
                     QStringLiteral("Failed to queue STOMP UNSUBSCRIBE"));
+            }
+            return false;
+        }
+        if (d->current(candidateGeneration, candidateSocket)
+            && (!d->requireIncomingWindow(candidateGeneration,
+                                          candidateSocket)
+                || !owner)) {
+            if (owner && error) {
+                *error = transportError(
+                    Xc2TransportReason::Timeout,
+                    QStringLiteral("XC2 STOMP heartbeat timed out"));
             }
             return false;
         }
@@ -1495,6 +1578,7 @@ void Xc2StompClient::disconnectFromBackend()
                          receipt.toUtf8());
     d->stopHeartbeatTimers();
     d->disconnectReceipt = receipt;
+    d->disconnectDecision = Private::DisconnectDecision::Pending;
     d->disconnectFrameQueued = false;
     d->disconnectDeadline = callDeadline;
     d->disconnectToken = candidateGeneration;
@@ -1527,6 +1611,11 @@ void Xc2StompClient::abortCurrentGeneration()
 {
     if (!d->socket || d->terminal)
         return;
+    if (d->state == Xc2StompState::Disconnecting
+        && d->disconnectDecision
+            == Private::DisconnectDecision::CloseObserved) {
+        return;
+    }
     d->intentional = true;
     d->finishOnce(d->generation, d->socket,
                   transportError(Xc2TransportReason::Canceled,

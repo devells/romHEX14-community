@@ -90,6 +90,15 @@ bool waitDurationExcludingSocketNotifiers(int durationMs)
     return !timer.isActive();
 }
 
+void blockEventDeliveryFor(int durationMs)
+{
+    // Keep posted verdicts queued while the monotonic deadline advances.
+    QElapsedTimer elapsed;
+    elapsed.start();
+    while (elapsed.elapsed() < durationMs) {
+    }
+}
+
 QTimer *activeOwnedTimer(Xc2StompClient &client)
 {
     for (QTimer *timer : client.findChildren<QTimer *>(
@@ -254,18 +263,54 @@ private slots:
         const QList<QByteArray> cookies = request.headerValues("Cookie");
         QCOMPARE(cookies.size(), 1);
         QCOMPARE(cookies.constFirst(), *expectedCookie.value);
+        const QList<QByteArray> exactCookieLines =
+            request.rawHeaderLinesMatchingName("Cookie");
+        const QList<QByteArray> expectedCookieLines = {
+            QByteArrayLiteral("cookie: ") + *expectedCookie.value};
+        QCOMPARE(exactCookieLines, expectedCookieLines);
         const QList<QByteArray> protocols = request.headerValues(
             "Sec-WebSocket-Protocol");
         QCOMPARE(protocols.size(), 1);
-        QList<QByteArray> protocolTokens;
-        for (const QByteArray &token : protocols.constFirst().split(','))
-            protocolTokens.append(token.trimmed());
-        QCOMPARE(protocolTokens,
-                 QList<QByteArray>{QByteArrayLiteral("v12.stomp")});
+        QCOMPARE(protocols.constFirst(), QByteArrayLiteral("v12.stomp"));
+        const QList<QByteArray> exactProtocolLines =
+            request.rawHeaderLinesMatchingName("Sec-WebSocket-Protocol");
+        const QList<QByteArray> expectedProtocolLines = {
+            QByteArrayLiteral("Sec-WebSocket-Protocol: v12.stomp")};
+        QCOMPARE(exactProtocolLines, expectedProtocolLines);
         QVERIFY(request.rawHeaderBlock.endsWith("\r\n\r\n"));
         QVERIFY(request.rawHeaderBlock.startsWith(
             "GET /xc2-websocket HTTP/1.1\r\n"));
         QCOMPARE(server.requestUrl(), rest.webSocketUrl());
+    }
+
+    void rawHeaderLineMatchingPreservesMalformedWhitespace()
+    {
+        FakeXc2HttpRequest request;
+        request.rawHeaderBlock = QByteArrayLiteral(
+            "GET /xc2-websocket HTTP/1.1\r\n"
+            " Cookie : session=authority-bound \r\n"
+            "Cookie:\tsession=authority-bound\r\n"
+            "Sec-WebSocket-Protocol : v12.stomp \r\n"
+            "sec-websocket-protocol:v12.stomp, v11.stomp\r\n\r\n");
+
+        const QList<QByteArray> cookieLines =
+            request.rawHeaderLinesMatchingName("Cookie");
+        const QList<QByteArray> malformedCookieLines = {
+            QByteArrayLiteral("Cookie:\tsession=authority-bound")};
+        QCOMPARE(cookieLines, malformedCookieLines);
+        const QList<QByteArray> exactCookieLine = {
+            QByteArrayLiteral("Cookie: session=authority-bound")};
+        QVERIFY(cookieLines != exactCookieLine);
+
+        const QList<QByteArray> protocolLines =
+            request.rawHeaderLinesMatchingName("Sec-WebSocket-Protocol");
+        const QList<QByteArray> malformedProtocolLines = {
+            QByteArrayLiteral(
+                "sec-websocket-protocol:v12.stomp, v11.stomp")};
+        QCOMPARE(protocolLines, malformedProtocolLines);
+        const QList<QByteArray> exactProtocolLine = {
+            QByteArrayLiteral("Sec-WebSocket-Protocol: v12.stomp")};
+        QVERIFY(protocolLines != exactProtocolLine);
     }
 
     void cannotRetargetCookieToAnotherAuthority()
@@ -778,6 +823,55 @@ private slots:
         QCoreApplication::sendPostedEvents(&client, QEvent::MetaCall);
         QCOMPARE(errors.count(), 1);
         QCOMPARE(disconnected.count(), 1);
+        QCOMPARE(client.state(), Xc2StompState::Failed);
+    }
+
+    void latchedConnectTimeoutCannotBecomeCanceled_data()
+    {
+        QTest::addColumn<bool>("useDisconnect");
+        QTest::newRow("abort") << false;
+        QTest::newRow("disconnect") << true;
+    }
+
+    void latchedConnectTimeoutCannotBecomeCanceled()
+    {
+        QFETCH(bool, useDisconnect);
+        FakeXc2TransportServer server;
+        Xc2RestClient rest;
+        QVERIFY(establishRestSession(server, rest));
+        Xc2StompClient client({300, 100, 10000, 10000, 2});
+        QSignalSpy errors(&client, &Xc2StompClient::errorOccurred);
+        QSignalSpy disconnected(&client, &Xc2StompClient::disconnected);
+        QSignalSpy lost(&client, &Xc2StompClient::visibilityLost);
+        QVERIFY(client.connectToBackend(rest));
+        QVERIFY(waitForFrames(server, 1));
+        QTimer *const deadline = activeOwnedTimer(client);
+        QVERIFY(deadline);
+        deadline->stop();
+        QVERIFY(waitDuration(330));
+        bool publicTerminalPathCalled = false;
+        connect(deadline, &QTimer::timeout, &client,
+                [&client, &publicTerminalPathCalled, useDisconnect] {
+            publicTerminalPathCalled = true;
+            if (useDisconnect)
+                client.disconnectFromBackend();
+            else
+                client.abortCurrentGeneration();
+        }, Qt::DirectConnection);
+        QVERIFY(QMetaObject::invokeMethod(deadline, "timeout",
+                                          Qt::DirectConnection));
+        QVERIFY(publicTerminalPathCalled);
+        QCoreApplication::sendPostedEvents(&client, QEvent::MetaCall);
+        QCOMPARE(errors.count(), 1);
+        QCOMPARE(disconnected.count(), 1);
+        QCOMPARE(lost.count(), 0);
+        QCOMPARE(errors.constFirst().at(0).toULongLong(), client.generation());
+        QCOMPARE(disconnected.constFirst().at(0).toULongLong(),
+                 client.generation());
+        const Xc2Error error = qvariant_cast<Xc2Error>(
+            errors.constFirst().at(1));
+        QCOMPARE(error.category, Xc2ErrorCategory::Transport);
+        QCOMPARE(error.transportReason, Xc2TransportReason::Timeout);
         QCOMPARE(client.state(), Xc2StompState::Failed);
     }
 
@@ -1405,6 +1499,105 @@ private slots:
                  QStringLiteral("vci-status-subscription"));
     }
 
+    void subscriptionFlushStopsWhenIncomingGraceExpiresInSignal()
+    {
+        FakeXc2TransportServer server;
+        Xc2RestClient rest;
+        QVERIFY(establishRestSession(server, rest));
+        Xc2StompClient client({500, 100, 0, 40, 2});
+        QVERIFY(client.subscribe(Topic::VciStatus));
+        QVERIFY(client.subscribe(Topic::Ecu));
+        bool blockedPastGrace = false;
+        connect(&client, &Xc2StompClient::subscriptionSent, &client,
+                [&client, &blockedPastGrace](Topic topic, const QString &) {
+            if (blockedPastGrace || topic != Topic::VciStatus)
+                return;
+            QTimer *const deadline = activeOwnedTimer(client);
+            QVERIFY(deadline);
+            deadline->stop();
+            blockedPastGrace = waitDuration(110);
+        });
+        QSignalSpy sent(&client, &Xc2StompClient::subscriptionSent);
+        QSignalSpy errors(&client, &Xc2StompClient::errorOccurred);
+        QSignalSpy lost(&client, &Xc2StompClient::visibilityLost);
+        QSignalSpy disconnected(&client, &Xc2StompClient::disconnected);
+        QVERIFY(establishStompSession(server, rest, client,
+                                      QByteArrayLiteral("40,0")));
+        QVERIFY(blockedPastGrace);
+        QCOMPARE(sent.count(), 1);
+        QVERIFY(waitForCount(disconnected, 1));
+        QVERIFY(waitForFrames(server, 2));
+        QCOMPARE(server.stompFrames().size(), 2);
+        QCOMPARE(server.stompFrames().at(1).command,
+                 QByteArrayLiteral("SUBSCRIBE"));
+        QCOMPARE(server.stompFrames().at(1).headers.value("id"),
+                 QByteArrayLiteral("vci-status-subscription"));
+        QCOMPARE(errors.count(), 1);
+        QCOMPARE(lost.count(), 1);
+        QCOMPARE(disconnected.count(), 1);
+        QCOMPARE(qvariant_cast<Xc2Error>(errors.constFirst().at(1))
+                     .transportReason,
+                 Xc2TransportReason::Timeout);
+        QCOMPARE(errors.constFirst().at(0).toULongLong(), client.generation());
+        QCOMPARE(lost.constFirst().at(0).toULongLong(), client.generation());
+        QCOMPARE(disconnected.constFirst().at(0).toULongLong(),
+                 client.generation());
+        QCOMPARE(client.state(), Xc2StompState::Failed);
+    }
+
+    void reentrantUnsubscriptionCannotWriteAfterIncomingGrace()
+    {
+        FakeXc2TransportServer server;
+        Xc2RestClient rest;
+        QVERIFY(establishRestSession(server, rest));
+        Xc2StompClient client({500, 100, 0, 100, 2});
+        QVERIFY(client.subscribe(Topic::VciStatus));
+        QVERIFY(client.subscribe(Topic::Ecu));
+        QVERIFY(establishStompSession(server, rest, client,
+                                      QByteArrayLiteral("100,0")));
+        QVERIFY(waitForFrames(server, 3));
+        bool blockedPastGrace = false;
+        bool reentrantAttempted = false;
+        connect(&client, &Xc2StompClient::unsubscriptionSent, &client,
+                [&client, &blockedPastGrace](Topic topic, const QString &) {
+            if (blockedPastGrace || topic != Topic::VciStatus)
+                return;
+            QTimer *const deadline = activeOwnedTimer(client);
+            QVERIFY(deadline);
+            deadline->stop();
+            blockedPastGrace = waitDuration(230);
+        });
+        connect(&client, &Xc2StompClient::unsubscriptionSent, &client,
+                [&client, &reentrantAttempted](Topic topic, const QString &) {
+            if (topic != Topic::VciStatus)
+                return;
+            reentrantAttempted = true;
+            client.unsubscribe(Topic::Ecu);
+        });
+        QSignalSpy unsent(&client, &Xc2StompClient::unsubscriptionSent);
+        QSignalSpy errors(&client, &Xc2StompClient::errorOccurred);
+        QSignalSpy lost(&client, &Xc2StompClient::visibilityLost);
+        QSignalSpy disconnected(&client, &Xc2StompClient::disconnected);
+        client.unsubscribe(Topic::VciStatus);
+        QVERIFY(blockedPastGrace);
+        QVERIFY(reentrantAttempted);
+        QCOMPARE(unsent.count(), 1);
+        QVERIFY(waitForCount(disconnected, 1));
+        QVERIFY(waitForFrames(server, 4));
+        QCOMPARE(server.stompFrames().size(), 4);
+        QCOMPARE(server.stompFrames().at(3).command,
+                 QByteArrayLiteral("UNSUBSCRIBE"));
+        QCOMPARE(server.stompFrames().at(3).headers.value("id"),
+                 QByteArrayLiteral("vci-status-subscription"));
+        QCOMPARE(errors.count(), 1);
+        QCOMPARE(lost.count(), 1);
+        QCOMPARE(disconnected.count(), 1);
+        QCOMPARE(qvariant_cast<Xc2Error>(errors.constFirst().at(1))
+                     .transportReason,
+                 Xc2TransportReason::Timeout);
+        QCOMPARE(client.state(), Xc2StompState::Failed);
+    }
+
     void unsubscribeBeforeConnectedRemovesQueuedDesire()
     {
         FakeXc2TransportServer server;
@@ -1722,7 +1915,7 @@ private slots:
         QVERIFY(establishRestSession(server, rest));
         if (mode == 0)
             server.setUpgradeMode(FakeXc2TransportServer::UpgradeMode::NoResponse);
-        Xc2StompClient client({120, 100, 10000, 10000, 2});
+        Xc2StompClient client({500, 100, 10000, 10000, 2});
         QSignalSpy errors(&client, &Xc2StompClient::errorOccurred);
         QSignalSpy disconnected(&client, &Xc2StompClient::disconnected);
         QSignalSpy lost(&client, &Xc2StompClient::visibilityLost);
@@ -1739,12 +1932,6 @@ private slots:
         }
         const Xc2StompGeneration generation = client.generation();
         const int connections = server.connectionCount();
-        QTimer *const deadline = activeOwnedTimer(client);
-        QVERIFY(deadline);
-        deadline->stop();
-        QVERIFY(waitDurationExcludingSocketNotifiers(150));
-        QVERIFY(QMetaObject::invokeMethod(deadline, "timeout",
-                                          Qt::DirectConnection));
         QCOMPARE(errors.count(), 0);
         client.disconnectFromBackend();
         QVERIFY(waitForCount(disconnected, 1));
@@ -2145,6 +2332,46 @@ private slots:
         QCOMPARE(client.state(), Xc2StompState::Failed);
     }
 
+    void closeObservedSocketErrorWinsQueuedVerdict()
+    {
+        FakeXc2TransportServer server;
+        Xc2RestClient rest;
+        QVERIFY(establishRestSession(server, rest));
+        Xc2StompClient client({500, 300, 10000, 10000, 2});
+        QVERIFY(establishStompSession(server, rest, client));
+        QSignalSpy errors(&client, &Xc2StompClient::errorOccurred);
+        QSignalSpy disconnected(&client, &Xc2StompClient::disconnected);
+        QSignalSpy lost(&client, &Xc2StompClient::visibilityLost);
+        client.disconnectFromBackend();
+        QVERIFY(waitForFrames(server, 2));
+        QWebSocket *const socket = ownedWebSocket(client);
+        QVERIFY(socket);
+        bool closeObservedBeforeError = false;
+        connect(socket, &QWebSocket::disconnected, &client,
+                [socket, &closeObservedBeforeError] {
+            closeObservedBeforeError = true;
+            QVERIFY(QMetaObject::invokeMethod(
+                socket, "errorOccurred", Qt::DirectConnection,
+                Q_ARG(QAbstractSocket::SocketError,
+                      QAbstractSocket::RemoteHostClosedError)));
+        }, Qt::DirectConnection);
+        const QByteArray receipt = server.stompFrames().constLast()
+                                       .headers.value("receipt");
+        QVERIFY(server.sendFrame(receiptFrame(receipt)));
+        QVERIFY(waitForCount(disconnected, 1));
+        QVERIFY(closeObservedBeforeError);
+        QCOMPARE(errors.count(), 1);
+        QCOMPARE(disconnected.count(), 1);
+        QCOMPARE(lost.count(), 0);
+        QCOMPARE(qvariant_cast<Xc2Error>(errors.constFirst().at(1))
+                     .transportReason,
+                 Xc2TransportReason::Network);
+        QCoreApplication::sendPostedEvents(&client, QEvent::MetaCall);
+        QCOMPARE(errors.count(), 1);
+        QCOMPARE(disconnected.count(), 1);
+        QCOMPARE(client.state(), Xc2StompState::Failed);
+    }
+
     void receiptThenAbnormalPeerCloseIsNotGraceful()
     {
         FakeXc2TransportServer server;
@@ -2197,6 +2424,39 @@ private slots:
         QCOMPARE(server.messages().at(1).kind,
                  FakeXc2WebSocketMessageKind::Text);
         QCOMPARE(errors.count(), 0);
+        QCOMPARE(disconnected.constFirst().at(0).toULongLong(),
+                 client.generation());
+        QCOMPARE(client.state(), Xc2StompState::Disconnected);
+    }
+
+    void timelyDisconnectObservationSurvivesQueuedVerdictDelay()
+    {
+        FakeXc2TransportServer server;
+        Xc2RestClient rest;
+        QVERIFY(establishRestSession(server, rest));
+        Xc2StompClient client({500, 500, 10000, 10000, 2});
+        QVERIFY(establishStompSession(server, rest, client));
+        QWebSocket *const socket = ownedWebSocket(client);
+        QVERIFY(socket);
+        bool delayedQueuedVerdict = false;
+        connect(socket, &QWebSocket::disconnected, &client,
+                [&delayedQueuedVerdict] {
+            delayedQueuedVerdict = true;
+            blockEventDeliveryFor(600);
+        }, Qt::DirectConnection);
+        QSignalSpy errors(&client, &Xc2StompClient::errorOccurred);
+        QSignalSpy disconnected(&client, &Xc2StompClient::disconnected);
+        QSignalSpy lost(&client, &Xc2StompClient::visibilityLost);
+        client.disconnectFromBackend();
+        QVERIFY(waitForFrames(server, 2));
+        const QByteArray receipt = server.stompFrames().constLast()
+                                       .headers.value("receipt");
+        QVERIFY(server.sendFrame(receiptFrame(receipt)));
+        QVERIFY(waitForCount(disconnected, 1));
+        QVERIFY(delayedQueuedVerdict);
+        QCOMPARE(errors.count(), 0);
+        QCOMPARE(disconnected.count(), 1);
+        QCOMPARE(lost.count(), 0);
         QCOMPARE(disconnected.constFirst().at(0).toULongLong(),
                  client.generation());
         QCOMPARE(client.state(), Xc2StompState::Disconnected);

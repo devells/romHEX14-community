@@ -44,6 +44,31 @@ QList<QByteArray> FakeXc2HttpRequest::headerValues(
     return values;
 }
 
+QList<QByteArray> FakeXc2HttpRequest::rawHeaderLinesMatchingName(
+    const QByteArray &name) const
+{
+    QList<QByteArray> matches;
+    qsizetype start = rawHeaderBlock.indexOf("\r\n");
+    if (start < 0)
+        return matches;
+    start += 2;
+    while (start < rawHeaderBlock.size()) {
+        const qsizetype end = rawHeaderBlock.indexOf("\r\n", start);
+        if (end < 0)
+            break;
+        const QByteArray line = rawHeaderBlock.mid(start, end - start);
+        if (line.isEmpty())
+            break;
+        const qsizetype colon = line.indexOf(':');
+        if (colon > 0
+            && headerEquals(line.left(colon), name)) {
+            matches.append(line);
+        }
+        start = end + 2;
+    }
+    return matches;
+}
+
 FakeXc2TransportServer::FakeXc2TransportServer(QObject *parent)
     : QObject(parent),
       m_tcpServer(new QTcpServer(this)),
