@@ -224,4 +224,14 @@ QString Xc2ContractProfile::topic(Topic topic) const
     return {};
 }
 
+QList<Topic> Xc2ContractProfile::foundationProbeTopics() const
+{
+    return {Topic::VciStatus, Topic::Login};
+}
+
+QStringList Xc2ContractProfile::foundationProbePermissions() const
+{
+    return {QStringLiteral("EcuDiagnosticRead")};
+}
+
 } // namespace ktm::xc2

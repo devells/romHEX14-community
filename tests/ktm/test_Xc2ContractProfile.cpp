@@ -86,6 +86,18 @@ private slots:
             QVERIFY2(spec.path != deadRoute, qPrintable(spec.path));
         }
     }
+
+    void foundationProbePolicyIsExactOrderedAndCaseSensitive()
+    {
+        const Xc2ContractProfile &profile = Xc2ContractProfile::approved();
+        QCOMPARE(profile.foundationProbeTopics(),
+                 QList<Topic>({Topic::VciStatus, Topic::Login}));
+        QCOMPARE(profile.foundationProbePermissions(),
+                 QStringList({QStringLiteral("EcuDiagnosticRead")}));
+        QVERIFY(!profile.foundationProbePermissions().contains(
+            QStringLiteral("ecudiagnosticread")));
+        QVERIFY(!profile.foundationProbeTopics().contains(Topic::Progress));
+    }
 };
 
 QTEST_APPLESS_MAIN(Xc2ContractProfileTest)

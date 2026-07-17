@@ -637,6 +637,52 @@ if(BUILD_TESTING AND RX14_KTM_XC2)
         LABELS "unit;contract;ktm"
     )
 
+    add_executable(xc2_contract_probe
+        tests/ktm/xc2_contract_probe.cpp
+        src/ktm/xc2/Xc2ContractProfile.cpp
+        src/ktm/xc2/Xc2ContractProfile.h
+        src/ktm/xc2/Xc2JsonCodec.cpp
+        src/ktm/xc2/Xc2JsonCodec.h
+        src/ktm/xc2/Xc2Models.cpp
+        src/ktm/xc2/Xc2Models.h
+        src/ktm/xc2/Xc2RestClient.cpp
+        src/ktm/xc2/Xc2RestClient.h
+        src/ktm/xc2/Xc2StompClient.cpp
+        src/ktm/xc2/Xc2StompClient.h
+        src/ktm/xc2/Xc2StompCodec.cpp
+        src/ktm/xc2/Xc2StompCodec.h
+    )
+    target_include_directories(xc2_contract_probe PRIVATE src)
+    target_link_libraries(xc2_contract_probe PRIVATE
+        Qt6::Core
+        Qt6::Network
+        Qt6::WebSockets
+    )
+
+    add_executable(test_Xc2ContractProbe
+        tests/ktm/FakeXc2TransportServer.cpp
+        tests/ktm/FakeXc2TransportServer.h
+        tests/ktm/test_Xc2ContractProbe.cpp
+    )
+    target_compile_definitions(test_Xc2ContractProbe PRIVATE
+        XC2_CONTRACT_PROBE_PATH="$<TARGET_FILE:xc2_contract_probe>"
+        XC2_CONTRACT_WRAPPER_PATH="${CMAKE_CURRENT_SOURCE_DIR}/tests/ktm/run_xc2_mock_contract.ps1"
+    )
+    target_link_libraries(test_Xc2ContractProbe PRIVATE
+        rx14_ktm_xc2
+        Qt6::Network
+        Qt6::Test
+        Qt6::WebSockets
+    )
+    add_dependencies(test_Xc2ContractProbe xc2_contract_probe)
+    add_test(NAME xc2_contract_probe_integration
+        COMMAND test_Xc2ContractProbe
+    )
+    set_tests_properties(xc2_contract_probe_integration PROPERTIES
+        LABELS "contract;integration;ktm"
+        TIMEOUT 60
+    )
+
     add_executable(test_Xc2InstallationProbe
         tests/ktm/test_Xc2InstallationProbe.cpp
     )

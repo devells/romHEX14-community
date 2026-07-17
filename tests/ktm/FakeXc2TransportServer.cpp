@@ -1,5 +1,7 @@
 #include "FakeXc2TransportServer.h"
 
+#include "ktm/xc2/Xc2ContractProfile.h"
+
 #include <QAbstractSocket>
 #include <QCryptographicHash>
 #include <QNetworkProxy>
@@ -18,6 +20,84 @@ namespace {
 bool headerEquals(const QByteArray &left, const QByteArray &right)
 {
     return left.compare(right, Qt::CaseInsensitive) == 0;
+}
+
+QByteArray httpResponse(int status,
+                        const QByteArray &reason,
+                        const QByteArray &body,
+                        const QByteArray &extraHeaders = {})
+{
+    return QByteArrayLiteral("HTTP/1.1 ") + QByteArray::number(status) + ' '
+        + reason + QByteArrayLiteral("\r\n") + extraHeaders
+        + QByteArrayLiteral("Content-Length: ")
+        + QByteArray::number(body.size())
+        + QByteArrayLiteral("\r\nConnection: close\r\n\r\n") + body;
+}
+
+QByteArray validErrorPayload(int status)
+{
+    return QByteArrayLiteral("{\"status\":") + QByteArray::number(status)
+        + QByteArrayLiteral(
+            ",\"message\":\"BACKEND_MESSAGE_SENTINEL_6f25\","
+            "\"code\":7319,"
+            "\"devMessage\":\"DEVELOPER_SENTINEL_844a\","
+            "\"info\":\"INFO_SENTINEL_502d\"}");
+}
+
+QByteArray currentUserPayload(const QStringList &permissions,
+                              const QByteArray &loginName =
+                                  QByteArrayLiteral("LOGIN_SENTINEL_15c8"),
+                              const QByteArray &name =
+                                  QByteArrayLiteral("NAME_SENTINEL_b97e"))
+{
+    QByteArray permissionJson;
+    for (const QString &permission : permissions) {
+        if (!permissionJson.isEmpty())
+            permissionJson += ',';
+        permissionJson += '"' + permission.toUtf8() + '"';
+    }
+    return QByteArrayLiteral("{\"loginName\":\"") + loginName
+        + QByteArrayLiteral("\",\"name\":\"") + name
+        + QByteArrayLiteral(
+            "\",\"dealerId\":\"DEALER_SENTINEL_51aa\","
+            "\"country\":\"AT\",\"address1\":\"ADDRESS_SENTINEL_70d4\","
+            "\"address2\":\"\",\"dealerType\":\"DEALER\","
+            "\"audience\":\"KTM\",\"permissions\":[")
+        + permissionJson
+        + QByteArrayLiteral(
+            "],\"sessionIndex\":\"SESSION_SENTINEL_5ed1\"}");
+}
+
+QByteArray methodName(ktm::xc2::HttpMethod method)
+{
+    switch (method) {
+    case ktm::xc2::HttpMethod::Get:
+        return QByteArrayLiteral("GET");
+    case ktm::xc2::HttpMethod::PostJson:
+    case ktm::xc2::HttpMethod::PostForm:
+        return QByteArrayLiteral("POST");
+    case ktm::xc2::HttpMethod::Delete:
+        return QByteArrayLiteral("DELETE");
+    }
+    return {};
+}
+
+bool targetMatchesProfilePath(const QByteArray &target,
+                              const QByteArray &profileTarget)
+{
+    const QByteArray marker = QByteArrayLiteral("{ecuId}");
+    const qsizetype markerIndex = profileTarget.indexOf(marker);
+    if (markerIndex < 0)
+        return target == profileTarget;
+    const QByteArray prefix = profileTarget.left(markerIndex);
+    const QByteArray suffix = profileTarget.mid(markerIndex + marker.size());
+    if (!target.startsWith(prefix) || !target.endsWith(suffix)
+        || target.size() <= prefix.size() + suffix.size()) {
+        return false;
+    }
+    const QByteArray value = target.mid(
+        prefix.size(), target.size() - prefix.size() - suffix.size());
+    return !value.contains('/');
 }
 
 } // namespace
@@ -141,9 +221,42 @@ int FakeXc2TransportServer::webSocketConnectionCount() const
     return m_webSocketConnectionCount;
 }
 
+int FakeXc2TransportServer::openConnectionCount() const
+{
+    int count = 0;
+    for (const RawConnection *connection : m_rawConnections) {
+        if (connection->socket
+            && connection->socket->state()
+                != QAbstractSocket::UnconnectedState) {
+            ++count;
+        }
+    }
+    for (const QWebSocket *socket : m_webSockets) {
+        if (socket->state() != QAbstractSocket::UnconnectedState)
+            ++count;
+    }
+    return count;
+}
+
+int FakeXc2TransportServer::stateChangingRestRequestCount() const
+{
+    return m_stateChangingRestRequestCount;
+}
+
+int FakeXc2TransportServer::unexpectedOperationCount() const
+{
+    return m_unexpectedOperationCount;
+}
+
 const QList<FakeXc2HttpRequest> &FakeXc2TransportServer::restRequests() const
 {
     return m_restRequests;
+}
+
+const QList<FakeXc2HttpRequest> &
+FakeXc2TransportServer::capturedRestRequests() const
+{
+    return m_capturedRestRequests;
 }
 
 const QList<FakeXc2HttpRequest> &FakeXc2TransportServer::upgradeRequests() const
@@ -162,6 +275,12 @@ FakeXc2TransportServer::stompFrames() const
     return m_stompFrames;
 }
 
+const QList<ktm::xc2::Xc2StompFrame> &
+FakeXc2TransportServer::sentStompFrames() const
+{
+    return m_sentStompFrames;
+}
+
 const QList<ktm::xc2::Xc2Error> &FakeXc2TransportServer::decodeErrors() const
 {
     return m_decodeErrors;
@@ -176,6 +295,12 @@ QString FakeXc2TransportServer::negotiatedSubprotocol() const
 {
     return m_webSockets.isEmpty()
         ? QString() : m_webSockets.constLast()->subprotocol();
+}
+
+QWebSocketProtocol::CloseCode
+FakeXc2TransportServer::lastPeerCloseCode() const
+{
+    return m_lastPeerCloseCode;
 }
 
 void FakeXc2TransportServer::setRestCookie(QByteArray cookie)
@@ -205,6 +330,30 @@ void FakeXc2TransportServer::setOutgoingFrameSize(quint64 bytes)
         m_webSockets.constLast()->setOutgoingFrameSize(bytes);
 }
 
+void FakeXc2TransportServer::setProbeScript(ProbeScript script)
+{
+    m_probeScript = script;
+    switch (script) {
+    case ProbeScript::UpgradeNoResponse:
+        setUpgradeMode(UpgradeMode::NoResponse);
+        break;
+    case ProbeScript::UpgradeRejected:
+        setUpgradeMode(UpgradeMode::Reject);
+        break;
+    case ProbeScript::UpgradeWrongSubprotocol:
+        setUpgradeMode(UpgradeMode::DifferentSubprotocol);
+        break;
+    default:
+        setUpgradeMode(UpgradeMode::WebSocket);
+        break;
+    }
+}
+
+void FakeXc2TransportServer::setProbeDelayMs(int delayMs)
+{
+    m_probeDelayMs = qMax(0, delayMs);
+}
+
 bool FakeXc2TransportServer::sendText(const QByteArray &payload)
 {
     if (m_webSockets.isEmpty())
@@ -225,7 +374,10 @@ bool FakeXc2TransportServer::sendFrame(
     const ktm::xc2::Xc2StompFrame &frame, bool binary)
 {
     const QByteArray payload = ktm::xc2::Xc2StompCodec::encode(frame);
-    return binary ? sendBinary(payload) : sendText(payload);
+    const bool sent = binary ? sendBinary(payload) : sendText(payload);
+    if (sent)
+        m_sentStompFrames.append(frame);
+    return sent;
 }
 
 bool FakeXc2TransportServer::sendFrameAndClose(
@@ -239,6 +391,8 @@ bool FakeXc2TransportServer::sendFrameAndClose(
     const QString message = QString::fromUtf8(payload);
     const bool queued = socket->sendTextMessage(message)
         == message.toUtf8().size();
+    if (queued)
+        m_sentStompFrames.append(frame);
     socket->close(closeCode,
                   QStringLiteral("scripted close"));
     return queued;
@@ -270,6 +424,7 @@ void FakeXc2TransportServer::acceptConnections()
                 delete connection;
                 socket->deleteLater();
             }
+            emit connectionClosed();
         });
         const QPointer<FakeXc2TransportServer> guard(this);
         inspect(socket);
@@ -306,7 +461,24 @@ void FakeXc2TransportServer::inspect(QTcpSocket *socket)
     }
 
     const QByteArray headerBlock = bytes.left(marker + 4);
-    const FakeXc2HttpRequest request = parseRequest(headerBlock);
+    FakeXc2HttpRequest request = parseRequest(headerBlock);
+    qint64 contentLength = 0;
+    const QList<QByteArray> contentLengths =
+        request.headerValues(QByteArrayLiteral("Content-Length"));
+    if (!contentLengths.isEmpty()) {
+        bool lengthOk = false;
+        contentLength = contentLengths.constFirst().toLongLong(&lengthOk);
+        if (!lengthOk || contentLength < 0
+            || contentLength > 8 * 1024 * 1024) {
+            connection->decided = true;
+            socket->abort();
+            return;
+        }
+    }
+    const qint64 totalRequestBytes = marker + 4 + contentLength;
+    if (bytes.size() < totalRequestBytes)
+        return;
+    request.body = bytes.mid(marker + 4, contentLength);
     const bool requestsUpgrade =
         request.target == QByteArrayLiteral("/xc2-websocket")
         && request.headerValue(QByteArrayLiteral("Upgrade")).compare(
@@ -316,28 +488,30 @@ void FakeXc2TransportServer::inspect(QTcpSocket *socket)
     connection->decided = true;
 
     if (!isUpgrade) {
-        socket->read(marker + 4);
-        const bool exactTarget = request.target
+        socket->read(totalRequestBytes);
+        m_capturedRestRequests.append(request);
+        classifyRestOperation(request);
+        const bool healthTarget = request.target
             == QByteArrayLiteral("/xc2/1.0/serviceStatus/status");
-        const bool exactRest = exactTarget
-            && request.method == QByteArrayLiteral("GET");
-        QByteArray response;
+        const bool currentUserTarget = request.target
+            == QByteArrayLiteral("/xc2/1.0/auth/currentUser");
+        const bool exactRest = request.method == QByteArrayLiteral("GET")
+            && (healthTarget
+                || (m_probeScript != ProbeScript::Disabled
+                    && currentUserTarget));
         if (exactRest) {
             m_restRequests.append(request);
             const QPointer<FakeXc2TransportServer> guard(this);
             emit restRequestCaptured();
             if (guard.isNull())
                 return;
-            response = QByteArrayLiteral(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n");
-            if (!m_restCookie.isEmpty()) {
-                response += QByteArrayLiteral("Set-Cookie: ") + m_restCookie
-                    + QByteArrayLiteral("; Path=/\r\n");
-            }
-            response += QByteArrayLiteral(
-                "Content-Length: 5\r\nConnection: close\r\n\r\nalive");
-        } else if (request.method != QByteArrayLiteral("GET")
-                   && (exactTarget || requestsUpgrade)) {
+            respondToRest(socket, request);
+            return;
+        }
+
+        QByteArray response;
+        if (request.method != QByteArrayLiteral("GET")
+            && (healthTarget || currentUserTarget || requestsUpgrade)) {
             response = QByteArrayLiteral(
                 "HTTP/1.1 405 Method Not Allowed\r\n"
                 "Content-Length: 0\r\nConnection: close\r\n\r\n");
@@ -351,6 +525,13 @@ void FakeXc2TransportServer::inspect(QTcpSocket *socket)
         return;
     }
 
+    if (m_probeScript != ProbeScript::Disabled) {
+        const bool exactUpgrade = request.method == QByteArrayLiteral("GET")
+            && request.target == QByteArrayLiteral("/xc2-websocket")
+            && request.body.isEmpty();
+        if (!exactUpgrade || !m_upgradeRequests.isEmpty())
+            ++m_unexpectedOperationCount;
+    }
     m_upgradeRequests.append(request);
     const QPointer<FakeXc2TransportServer> guard(this);
     emit upgradeRequestCaptured();
@@ -359,7 +540,7 @@ void FakeXc2TransportServer::inspect(QTcpSocket *socket)
     if (m_upgradeMode == UpgradeMode::NoResponse)
         return;
     if (m_upgradeMode == UpgradeMode::Redirect) {
-        socket->read(marker + 4);
+        socket->read(totalRequestBytes);
         const QByteArray location = m_redirectTarget.toEncoded(QUrl::FullyEncoded);
         const QByteArray response = QByteArrayLiteral(
             "HTTP/1.1 302 Found\r\nLocation: ") + location
@@ -369,8 +550,16 @@ void FakeXc2TransportServer::inspect(QTcpSocket *socket)
         socket->disconnectFromHost();
         return;
     }
+    if (m_upgradeMode == UpgradeMode::Reject) {
+        socket->read(totalRequestBytes);
+        socket->write(QByteArrayLiteral(
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n"
+            "Connection: close\r\n\r\n"));
+        socket->disconnectFromHost();
+        return;
+    }
     if (m_upgradeMode == UpgradeMode::DifferentSubprotocol) {
-        socket->read(marker + 4);
+        socket->read(totalRequestBytes);
         const QByteArray accept = QCryptographicHash::hash(
             request.headerValue(QByteArrayLiteral("Sec-WebSocket-Key"))
                 + QByteArrayLiteral("258EAFA5-E914-47DA-95CA-C5AB0DC85B11"),
@@ -390,6 +579,220 @@ void FakeXc2TransportServer::inspect(QTcpSocket *socket)
     m_rawConnections.removeOne(connection);
     delete connection;
     m_webSocketServer->handleConnection(socket);
+}
+
+void FakeXc2TransportServer::respondToRest(
+    QTcpSocket *socket, const FakeXc2HttpRequest &request)
+{
+    const bool health = request.target
+        == QByteArrayLiteral("/xc2/1.0/serviceStatus/status");
+    if (health) {
+        switch (m_probeScript) {
+        case ProbeScript::HealthNoResponse:
+            return;
+        case ProbeScript::HealthTruncated:
+            socket->write(QByteArrayLiteral(
+                "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"
+                "Connection: close\r\n\r\nal"));
+            socket->disconnectFromHost();
+            return;
+        case ProbeScript::Health204:
+            socket->write(QByteArrayLiteral(
+                "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"));
+            socket->disconnectFromHost();
+            return;
+        case ProbeScript::HealthMalformedSuccess:
+            socket->write(httpResponse(
+                200, QByteArrayLiteral("OK"), QByteArrayLiteral("dead"),
+                QByteArrayLiteral("Content-Type: text/plain\r\n")));
+            socket->disconnectFromHost();
+            return;
+        case ProbeScript::HealthBackendUnavailable:
+            socket->write(httpResponse(
+                503, QByteArrayLiteral("Service Unavailable"),
+                validErrorPayload(503),
+                QByteArrayLiteral("Content-Type: application/json\r\n")));
+            socket->disconnectFromHost();
+            return;
+        case ProbeScript::HealthAuth401:
+            socket->write(httpResponse(
+                401, QByteArrayLiteral("Unauthorized"),
+                validErrorPayload(401),
+                QByteArrayLiteral("Content-Type: application/json\r\n")));
+            socket->disconnectFromHost();
+            return;
+        case ProbeScript::HealthMalformedError:
+            socket->write(httpResponse(
+                503, QByteArrayLiteral("Service Unavailable"),
+                QByteArrayLiteral("{"),
+                QByteArrayLiteral("Content-Type: application/json\r\n")));
+            socket->disconnectFromHost();
+            return;
+        default:
+            break;
+        }
+
+        QByteArray headers = QByteArrayLiteral("Content-Type: text/plain\r\n");
+        if (!m_restCookie.isEmpty()) {
+            headers += QByteArrayLiteral("Set-Cookie: ") + m_restCookie
+                + QByteArrayLiteral("; Path=/\r\n");
+        }
+        socket->write(httpResponse(200, QByteArrayLiteral("OK"),
+                                   QByteArrayLiteral("alive"), headers));
+        socket->disconnectFromHost();
+        return;
+    }
+
+    switch (m_probeScript) {
+    case ProbeScript::CurrentUserNoResponse:
+        return;
+    case ProbeScript::CurrentUserTruncated:
+        socket->write(QByteArrayLiteral(
+            "HTTP/1.1 200 OK\r\nContent-Length: 64\r\n"
+            "Connection: close\r\n\r\n{\"loginName\":"));
+        socket->disconnectFromHost();
+        return;
+    case ProbeScript::CurrentUser204:
+        socket->write(QByteArrayLiteral(
+            "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"));
+        socket->disconnectFromHost();
+        return;
+    case ProbeScript::CurrentUserMalformedSuccess:
+        socket->write(httpResponse(
+            200, QByteArrayLiteral("OK"),
+            QByteArrayLiteral("{\"loginName\":"),
+            QByteArrayLiteral("Content-Type: application/json\r\n")));
+        socket->disconnectFromHost();
+        return;
+    case ProbeScript::CurrentUserBackendUnavailable:
+        socket->write(httpResponse(
+            503, QByteArrayLiteral("Service Unavailable"),
+            validErrorPayload(503),
+            QByteArrayLiteral("Content-Type: application/json\r\n")));
+        socket->disconnectFromHost();
+        return;
+    case ProbeScript::CurrentUserAuth401:
+        socket->write(httpResponse(
+            401, QByteArrayLiteral("Unauthorized"), validErrorPayload(401),
+            QByteArrayLiteral("Content-Type: application/json\r\n")));
+        socket->disconnectFromHost();
+        return;
+    case ProbeScript::CurrentUserAuth403:
+        socket->write(httpResponse(
+            403, QByteArrayLiteral("Forbidden"), validErrorPayload(403),
+            QByteArrayLiteral("Content-Type: application/json\r\n")));
+        socket->disconnectFromHost();
+        return;
+    case ProbeScript::CurrentUserMalformedAuthError:
+        socket->write(httpResponse(
+            401, QByteArrayLiteral("Unauthorized"), QByteArrayLiteral("{"),
+            QByteArrayLiteral("Content-Type: application/json\r\n")));
+        socket->disconnectFromHost();
+        return;
+    default:
+        break;
+    }
+
+    QStringList permissions{QStringLiteral("EcuDiagnosticRead")};
+    QByteArray login = QByteArrayLiteral("LOGIN_SENTINEL_15c8");
+    QByteArray name = QByteArrayLiteral("NAME_SENTINEL_b97e");
+    if (m_probeScript == ProbeScript::CurrentUserMissingPermission)
+        permissions = {QStringLiteral("VehicleDetectExecute")};
+    else if (m_probeScript
+             == ProbeScript::CurrentUserCaseMismatchedPermission) {
+        permissions = {QStringLiteral("ecudiagnosticread")};
+    } else if (m_probeScript == ProbeScript::CurrentUserBlankLogin) {
+        login = QByteArrayLiteral("   ");
+    } else if (m_probeScript == ProbeScript::CurrentUserBlankName) {
+        name = QByteArrayLiteral("   ");
+    }
+    socket->write(httpResponse(
+        200, QByteArrayLiteral("OK"),
+        currentUserPayload(permissions, login, name),
+        QByteArrayLiteral("Content-Type: application/json\r\n")));
+    socket->disconnectFromHost();
+}
+
+void FakeXc2TransportServer::classifyRestOperation(
+    const FakeXc2HttpRequest &request)
+{
+    const ktm::xc2::Xc2ContractProfile &profile =
+        ktm::xc2::Xc2ContractProfile::approved();
+    for (const ktm::xc2::Endpoint endpoint
+         : ktm::xc2::Xc2ContractProfile::allEndpoints()) {
+        const ktm::xc2::EndpointSpec spec = profile.endpoint(endpoint);
+        const QByteArray target = profile.restContext().toLatin1() + '/'
+            + spec.path.toLatin1();
+        if (targetMatchesProfilePath(request.target, target)
+            && request.method == methodName(spec.method)
+            && spec.semantics
+                == ktm::xc2::OperationSemantics::StateChanging) {
+            ++m_stateChangingRestRequestCount;
+        }
+    }
+
+    if (m_probeScript == ProbeScript::Disabled)
+        return;
+    const qsizetype index = m_capturedRestRequests.size() - 1;
+    const QByteArray expectedTarget = index == 0
+        ? QByteArrayLiteral("/xc2/1.0/serviceStatus/status")
+        : index == 1
+            ? QByteArrayLiteral("/xc2/1.0/auth/currentUser")
+            : QByteArray();
+    if (request.method != QByteArrayLiteral("GET")
+        || request.target != expectedTarget || !request.body.isEmpty()) {
+        ++m_unexpectedOperationCount;
+    }
+}
+
+void FakeXc2TransportServer::classifyStompOperation(
+    const ktm::xc2::Xc2StompFrame &frame)
+{
+    if (m_probeScript == ProbeScript::Disabled)
+        return;
+
+    const qsizetype index = m_stompFrames.size() - 1;
+    bool expected = frame.body.isEmpty();
+    if (index == 0) {
+        expected = expected
+            && frame.command == QByteArrayLiteral("CONNECT")
+            && frame.headers.size() == 3
+            && frame.headers.value(QByteArrayLiteral("accept-version"))
+                == QByteArrayLiteral("1.2")
+            && frame.headers.value(QByteArrayLiteral("host"))
+                == QByteArrayLiteral("127.0.0.1")
+            && frame.headers.contains(QByteArrayLiteral("heart-beat"));
+    } else if (index == 1 || index == 2) {
+        const bool vci = index == 1;
+        expected = expected
+            && frame.command == QByteArrayLiteral("SUBSCRIBE")
+            && frame.headers.size() == 3
+            && frame.headers.value(QByteArrayLiteral("ack"))
+                == QByteArrayLiteral("auto")
+            && frame.headers.value(QByteArrayLiteral("destination"))
+                == (vci ? QByteArrayLiteral("/topic/vci/status")
+                        : QByteArrayLiteral("/topic/login"))
+            && frame.headers.value(QByteArrayLiteral("id"))
+                == (vci ? QByteArrayLiteral("vci-status-subscription")
+                        : QByteArrayLiteral("login-subscription"));
+    } else if (index == 3) {
+        const QByteArray receipt =
+            frame.headers.value(QByteArrayLiteral("receipt"));
+        const QByteArray suffix = receipt.mid(
+            QByteArrayLiteral("disconnect-").size());
+        bool generationOk = !suffix.isEmpty();
+        for (const char byte : suffix)
+            generationOk = generationOk && byte >= '0' && byte <= '9';
+        expected = expected
+            && frame.command == QByteArrayLiteral("DISCONNECT")
+            && frame.headers.size() == 1
+            && receipt.startsWith(QByteArrayLiteral("disconnect-"))
+            && generationOk;
+    } else {
+        expected = false;
+    }
+    if (!expected)
+        ++m_unexpectedOperationCount;
 }
 
 void FakeXc2TransportServer::acceptWebSockets()
@@ -413,12 +816,82 @@ void FakeXc2TransportServer::acceptWebSockets()
                            message);
         });
         connect(socket, &QWebSocket::disconnected, this, [this, socket] {
+            m_lastPeerCloseCode = socket->closeCode();
             emit webSocketDisconnected();
+            emit connectionClosed();
         });
         const QPointer<FakeXc2TransportServer> guard(this);
         emit webSocketConnected();
         if (guard.isNull())
             return;
+    }
+}
+
+void FakeXc2TransportServer::runProbeStompScript(
+    QWebSocket *socket, const ktm::xc2::Xc2StompFrame &frame)
+{
+    if (m_probeScript == ProbeScript::Disabled)
+        return;
+
+    if (frame.command == QByteArrayLiteral("CONNECT")) {
+        if (m_probeScript == ProbeScript::MissingConnected)
+            return;
+        ktm::xc2::Xc2StompFrame response;
+        if (m_probeScript == ProbeScript::StompError) {
+            response.command = QByteArrayLiteral("ERROR");
+            response.headers.insert(
+                QByteArrayLiteral("message"),
+                QByteArrayLiteral("STOMP_MESSAGE_SENTINEL_95be"));
+            response.body = QByteArrayLiteral("STOMP_BODY_SENTINEL_d71a");
+        } else {
+            response.command = QByteArrayLiteral("CONNECTED");
+            if (m_probeScript != ProbeScript::MalformedConnected) {
+                response.headers.insert(QByteArrayLiteral("version"),
+                                        QByteArrayLiteral("1.2"));
+            }
+            response.headers.insert(QByteArrayLiteral("heart-beat"),
+                                    QByteArrayLiteral("0,0"));
+        }
+        sendFrame(response);
+        return;
+    }
+
+    if (frame.command != QByteArrayLiteral("DISCONNECT"))
+        return;
+    const QByteArray receipt =
+        frame.headers.value(QByteArrayLiteral("receipt"));
+    if (m_probeScript == ProbeScript::MissingDisconnectReceipt)
+        return;
+    if (m_probeScript == ProbeScript::CloseBeforeDisconnectReceipt) {
+        socket->close(QWebSocketProtocol::CloseCodeNormal,
+                      QStringLiteral("close-before-receipt"));
+        return;
+    }
+
+    ktm::xc2::Xc2StompFrame response;
+    response.command = QByteArrayLiteral("RECEIPT");
+    response.headers.insert(
+        QByteArrayLiteral("receipt-id"),
+        m_probeScript == ProbeScript::WrongDisconnectReceipt
+            ? QByteArrayLiteral("disconnect-wrong-generation")
+            : receipt);
+    if (m_probeScript == ProbeScript::LateDisconnectReceipt) {
+        const QPointer<FakeXc2TransportServer> owner(this);
+        const QPointer<QWebSocket> guarded(socket);
+        QTimer::singleShot(m_probeDelayMs, this,
+                           [owner, guarded, response] {
+            if (owner && guarded
+                && guarded->state() == QAbstractSocket::ConnectedState) {
+                owner->sendFrame(response);
+            }
+        });
+        return;
+    }
+
+    sendFrame(response);
+    if (m_probeScript == ProbeScript::ReceiptThenAbnormalClose) {
+        socket->close(QWebSocketProtocol::CloseCodeGoingAway,
+                      QStringLiteral("abnormal-after-receipt"));
     }
 }
 
@@ -432,8 +905,12 @@ void FakeXc2TransportServer::captureMessage(
         m_codecs[socket].feed(payload);
     for (const auto &frame : decoded.frames) {
         m_stompFrames.append(frame);
+        classifyStompOperation(frame);
         const QPointer<FakeXc2TransportServer> guard(this);
         emit stompFrameReceived();
+        if (guard.isNull())
+            return;
+        runProbeStompScript(socket, frame);
         if (guard.isNull())
             return;
     }

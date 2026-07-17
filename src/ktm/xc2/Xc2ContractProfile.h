@@ -3,6 +3,7 @@
 #include <QByteArray>
 #include <QList>
 #include <QString>
+#include <QStringList>
 
 namespace ktm::xc2 {
 
@@ -47,6 +48,8 @@ public:
     QString supportedPduApiShortName() const;
     EndpointSpec endpoint(Endpoint endpoint) const;
     QString topic(Topic topic) const;
+    QList<Topic> foundationProbeTopics() const;
+    QStringList foundationProbePermissions() const;
 
 private:
     Xc2ContractProfile() = default;
