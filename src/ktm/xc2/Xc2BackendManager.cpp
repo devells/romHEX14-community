@@ -526,6 +526,7 @@ struct Xc2BackendManager::RunContext final : QObject {
         bool outputFinalized = false;
         bool outputFinalizationRequested = false;
         bool outputFinalizationInProgress = false;
+        bool outputPublicationAbandoned = false;
         bool cleanupCompleted = false;
         bool shutdownAttempted = false;
         bool shutdownWritten = false;
@@ -1171,6 +1172,7 @@ struct Xc2BackendManager::RunContext final : QObject {
         std::array<char, kProcessReadBlockBytes> buffer{};
         bool readAny = false;
         while (isCurrentAttempt(attemptId) && !attempt->outputFinalized) {
+            discardOwnerlessOutputPublications();
             Attempt::OutputPublication &publication =
                 outputPublication(stream);
             // A byte can complete at most one line. Keep room for the held
@@ -1212,6 +1214,12 @@ struct Xc2BackendManager::RunContext final : QObject {
         if (current.outputFinalized || current.outputFinalizationInProgress)
             return false;
         current.outputFinalizationRequested = true;
+        if (plan.outputFinalizationAllowedForTest
+            && !plan.outputFinalizationAllowedForTest()) {
+            observe(QStringLiteral("output-finalization-deferred:%1")
+                        .arg(current.attemptId));
+            return false;
+        }
         current.outputFinalizationInProgress = true;
         const quint64 attemptId = current.attemptId;
         const bool readStandardOutput = drainProcessOutput(
@@ -1224,10 +1232,14 @@ struct Xc2BackendManager::RunContext final : QObject {
                 Xc2ProcessOutput::Stream::StandardOutput)
             || hasBufferedProcessOutput(
                 Xc2ProcessOutput::Stream::StandardError)) {
+            observe(QStringLiteral("output-raw-drain-blocked:%1")
+                        .arg(attemptId));
             current.outputFinalizationInProgress = false;
             return readStandardOutput || readStandardError;
         }
 
+        observe(QStringLiteral("output-raw-drain-complete:%1")
+                    .arg(attemptId));
         Xc2ProcessOutput::FinishedLines lines = current.output.finish();
         current.outputFinalized = true;
         queueOutputLines(Xc2ProcessOutput::Stream::StandardOutput,
@@ -1256,6 +1268,22 @@ struct Xc2BackendManager::RunContext final : QObject {
         publication.pending.append(std::move(line));
     }
 
+    bool hasCurrentPublicOutputOwner() const
+    {
+        return attempt && owner && !reaperOwned && !completed
+            && !attempt->outputPublicationAbandoned;
+    }
+
+    void discardOwnerlessOutputPublications()
+    {
+        if (!attempt || hasCurrentPublicOutputOwner())
+            return;
+        attempt->standardOutputPublication.pending.clear();
+        attempt->standardOutputPublication.held.reset();
+        attempt->standardErrorPublication.pending.clear();
+        attempt->standardErrorPublication.held.reset();
+    }
+
     void publishHeldWhenRequired(Xc2ProcessOutput::Stream stream)
     {
         if (!attempt || shouldHoldOutputTail())
@@ -1272,6 +1300,9 @@ struct Xc2BackendManager::RunContext final : QObject {
                           const QStringList &lines)
     {
         if (!attempt)
+            return;
+        discardOwnerlessOutputPublications();
+        if (!hasCurrentPublicOutputOwner())
             return;
         Attempt::OutputPublication &publication = outputPublication(stream);
         const quint64 attemptId = attempt->attemptId;
@@ -1331,6 +1362,9 @@ struct Xc2BackendManager::RunContext final : QObject {
     {
         if (!attempt)
             return;
+        discardOwnerlessOutputPublications();
+        if (!hasCurrentPublicOutputOwner())
+            return;
         const quint64 attemptId = attempt->attemptId;
         Attempt::OutputPublication &initial = outputPublication(stream);
         if (initial.draining)
@@ -1353,9 +1387,12 @@ struct Xc2BackendManager::RunContext final : QObject {
             const bool stillOwned = publishOutputLineNow(stream, line);
             if (!isCurrentAttempt(attemptId))
                 break;
-            outputPublication(stream).pending.removeFirst();
-            if (!stillOwned)
+            if (!stillOwned) {
+                attempt->outputPublicationAbandoned = true;
+                discardOwnerlessOutputPublications();
                 break;
+            }
+            outputPublication(stream).pending.removeFirst();
         }
         if (isCurrentAttempt(attemptId))
             outputPublication(stream).draining = false;
@@ -1861,6 +1898,15 @@ struct Xc2BackendManager::RunContext final : QObject {
         }
         if (!current.outputFinalized)
             finalizeOutput(current);
+        if (!current.outputFinalized) {
+            observe(QStringLiteral("output-finalization-wait:%1")
+                        .arg(attemptId));
+            QTimer::singleShot(kOwnershipRetryMs, this,
+                               [this, attemptId] {
+                finalizeAttemptWhenSafe(attemptId);
+            });
+            return;
+        }
         if (current.started && !current.finishedObserved) {
             if (!finalReapDeadlineStarted) {
                 finalReapDeadline.setRemainingTime(
@@ -1992,6 +2038,7 @@ struct Xc2BackendManager::RunContext final : QObject {
             return;
         }
         if (reaperOwned) {
+            observe(QStringLiteral("reaper-finished:%1").arg(runId));
             applicationReaper()->finished(this);
             return;
         }

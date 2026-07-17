@@ -121,7 +121,9 @@ public:
                           std::function<void(std::function<void()>)>
                               shutdownDeadlineEarlyWakeupHook = {},
                           std::function<void(const QString &)>
-                              lifecycleObserver = {})
+                              lifecycleObserver = {},
+                          std::function<bool()>
+                              outputFinalizationAllowed = {})
     {
         Xc2BackendManager::PrivateLaunchPlan plan;
         plan.program = QString::fromUtf8(FAKE_XC2_SIDECAR_PATH);
@@ -147,6 +149,8 @@ public:
         plan.errorNotificationDelayMsForTest = errorNotificationDelayMs;
         plan.shutdownDeadlineEarlyWakeupHookForTest =
             std::move(shutdownDeadlineEarlyWakeupHook);
+        plan.outputFinalizationAllowedForTest =
+            std::move(outputFinalizationAllowed);
         if (lifecycleTrace || lifecycleObserver) {
             plan.lifecycleObserver = [lifecycleTrace,
                                       lifecycleObserver =
@@ -185,7 +189,8 @@ public:
         quint16 candidate, const QString &stagedOutputDirectory,
         const QString &eventLog,
         std::shared_ptr<QStringList> lifecycleTrace,
-        std::function<void(const QString &)> lifecycleObserver)
+        std::function<void(const QString &)> lifecycleObserver,
+        std::function<bool()> outputFinalizationAllowed = {})
     {
         return startFake(
             manager, lockPath, {candidate},
@@ -194,7 +199,8 @@ public:
             eventLog, 5000, 500, 100, 1, {}, {}, nullptr,
             std::move(lifecycleTrace), false, false, {}, {}, false, 0,
             ShutdownProofMutation::None, 0, {},
-            std::move(lifecycleObserver));
+            std::move(lifecycleObserver),
+            std::move(outputFinalizationAllowed));
     }
 
     static bool startInvalid(Xc2BackendManager &manager,
@@ -498,6 +504,12 @@ QString queriedImagePath(HANDLE handle)
 
 class QuitSink final : public QObject {
 public:
+    ~QuitSink() override
+    {
+        if (qApp != nullptr)
+            qApp->removeEventFilter(this);
+    }
+
     int count = 0;
     std::function<void()> onQuit;
 
@@ -3009,6 +3021,238 @@ private slots:
                               QStringLiteral("output:A"),
                               QStringLiteral("output:EOF-partial"),
                               QStringLiteral("stopped")}));
+        QVERIFY(handleIsSignaled(child));
+        QVERIFY(lockIsAvailable(lockPath));
+        CloseHandle(child);
+    }
+
+    void ownerlessLargeOutputDrainsBeforeCleanup_data()
+    {
+        QTest::addColumn<bool>("standardError");
+        QTest::newRow("stdout") << false;
+        QTest::newRow("stderr") << true;
+    }
+
+    void ownerlessLargeOutputDrainsBeforeCleanup()
+    {
+        QFETCH(bool, standardError);
+        ReaperRepostHookReset reset;
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString lockPath = privateLockPath(directory);
+        const QString eventLog = directory.filePath("ownerless-large.jsonl");
+        const auto trace = std::make_shared<QStringList>();
+        auto *manager = new Xc2BackendManager;
+        QPointer<Xc2BackendManager> guardedManager(manager);
+        QSignalSpy ready(manager, &Xc2BackendManager::ready);
+        HANDLE child = nullptr;
+        QStringList publicLines;
+        bool deletedFromOutput = false;
+        bool nestedCompleted = false;
+        bool nestedTimedOut = false;
+        QString nestedTerminalBoundary;
+        QEventLoop *nestedLoop = nullptr;
+        bool quitHeldSynchronously = false;
+        bool childSignaledAtQuit = false;
+        bool lockAvailableAtQuit = false;
+        QuitSink sink;
+        sink.onQuit = [&] {
+            trace->append(QStringLiteral("downstream-quit"));
+            childSignaledAtQuit = handleIsSignaled(child);
+            lockAvailableAtQuit = lockIsAvailable(lockPath);
+        };
+        qApp->installEventFilter(&sink);
+        const auto lifecycleObserver = [&](const QString &event) {
+            if (nestedLoop == nullptr
+                || (!event.startsWith(
+                        QStringLiteral("output-raw-drain-blocked:"))
+                    && !event.startsWith(
+                        QStringLiteral("output-finalized:")))) {
+                return;
+            }
+            nestedTerminalBoundary = event;
+            nestedLoop->quit();
+        };
+        QObject::connect(manager, &Xc2BackendManager::outputLine,
+                         qApp, [&](bool emittedStandardError,
+                                   const QString &line) {
+            if (emittedStandardError != standardError)
+                return;
+            publicLines.append(line);
+            if (deletedFromOutput)
+                return;
+            deletedFromOutput = true;
+            trace->append(QStringLiteral("manager-delete-from-output"));
+            delete manager;
+            manager = nullptr;
+            QEvent quit(QEvent::Quit);
+            QCoreApplication::sendEvent(qApp, &quit);
+            quitHeldSynchronously = sink.count == 0;
+            QEventLoop nested;
+            nestedLoop = &nested;
+            QTimer::singleShot(5000, &nested, [&] {
+                nestedTimedOut = true;
+                nested.quit();
+            });
+            nested.exec();
+            nestedLoop = nullptr;
+            nestedCompleted = !nestedTimedOut
+                && !nestedTerminalBoundary.isEmpty();
+        });
+        QVERIFY(Xc2BackendManagerTestAccess::startStagedOutputFake(
+            *manager, lockPath,
+            Xc2BackendManagerTestAccess::allocateCandidate(), directory.path(),
+            eventLog, trace, lifecycleObserver));
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 7000);
+        child = openStableHandle(manager->ownedProcessId());
+        QVERIFY(child != nullptr && handleIsLive(child));
+        QByteArray payload;
+        for (int index = 0; index < 400; ++index) {
+            payload += QByteArrayLiteral("line-")
+                + QByteArray::number(index).rightJustified(3, '0') + '\n';
+        }
+        payload += QByteArrayLiteral("terminal-partial");
+        QVERIFY(writeStagedOutput(directory.path(), 1, standardError,
+                                  payload, true));
+        QTRY_VERIFY_WITH_TIMEOUT(guardedManager.isNull(), 5000);
+        QTRY_VERIFY2_WITH_TIMEOUT(
+            sink.count == 1,
+            qPrintable(QStringLiteral("nestedCompleted=%1 nestedTimedOut=%2 "
+                                      "boundary=%3 trace=%4")
+                           .arg(nestedCompleted)
+                           .arg(nestedTimedOut)
+                           .arg(nestedTerminalBoundary,
+                                trace->join(QStringLiteral(" | ")))),
+            10000);
+        qApp->removeEventFilter(&sink);
+
+        const int deleteIndex = traceIndex(
+            *trace, QStringLiteral("manager-delete-from-output"));
+        const int rawDrainedIndex = traceIndex(
+            *trace, QStringLiteral("output-raw-drain-complete:"));
+        const int finalizedIndex = traceIndex(
+            *trace, QStringLiteral("output-finalized:"));
+        const int cleanupIndex = traceIndex(
+            *trace, QStringLiteral("attempt-cleanup-complete:"));
+        const int lockIndex = traceIndex(
+            *trace, QStringLiteral("lock-released:"));
+        const int reaperIndex = traceIndex(
+            *trace, QStringLiteral("reaper-finished:"));
+        const int quitIndex = traceIndex(
+            *trace, QStringLiteral("downstream-quit"));
+        QVERIFY(deletedFromOutput);
+        QVERIFY(quitHeldSynchronously);
+        QVERIFY2(nestedCompleted,
+                 qPrintable(QStringLiteral("nestedTimedOut=%1 boundary=%2 "
+                                           "trace=%3")
+                                .arg(nestedTimedOut)
+                                .arg(nestedTerminalBoundary,
+                                     trace->join(QStringLiteral(" | ")))));
+        QVERIFY(!nestedTimedOut);
+        QVERIFY2(nestedTerminalBoundary.startsWith(
+                     QStringLiteral("output-finalized:")),
+                 qPrintable(trace->join(QStringLiteral(" | "))));
+        QVERIFY2(traceIndex(*trace,
+                            QStringLiteral("output-raw-drain-blocked:")) < 0,
+                 qPrintable(trace->join(QStringLiteral(" | "))));
+        QCOMPARE(publicLines.size(), 1);
+        QCOMPARE(eventCount(eventLog, QStringLiteral("STAGED_OUTPUT")), 1);
+        QVERIFY(deleteIndex >= 0);
+        QVERIFY(rawDrainedIndex > deleteIndex);
+        QVERIFY(finalizedIndex > rawDrainedIndex);
+        QVERIFY(cleanupIndex > finalizedIndex);
+        QVERIFY(lockIndex > cleanupIndex);
+        QVERIFY(reaperIndex > lockIndex);
+        QVERIFY(quitIndex > reaperIndex);
+        QVERIFY(childSignaledAtQuit);
+        QVERIFY(lockAvailableAtQuit);
+        QVERIFY(handleIsSignaled(child));
+        QVERIFY(lockIsAvailable(lockPath));
+        CloseHandle(child);
+    }
+
+    void cleanupWaitsForDeferredOutputFinalization()
+    {
+        ReaperRepostHookReset reset;
+        QTemporaryDir directory;
+        QVERIFY(directory.isValid());
+        const QString lockPath = privateLockPath(directory);
+        const auto trace = std::make_shared<QStringList>();
+        const auto allowFinalization = std::make_shared<bool>(false);
+        auto *manager = new Xc2BackendManager;
+        QSignalSpy ready(manager, &Xc2BackendManager::ready);
+        HANDLE child = nullptr;
+        bool releaseScheduled = false;
+        bool gateHeldAtRelease = false;
+        bool childSignaledAtQuit = false;
+        bool lockAvailableAtQuit = false;
+        QuitSink sink;
+        sink.onQuit = [&] {
+            trace->append(QStringLiteral("downstream-quit"));
+            childSignaledAtQuit = handleIsSignaled(child);
+            lockAvailableAtQuit = lockIsAvailable(lockPath);
+        };
+        qApp->installEventFilter(&sink);
+        const auto lifecycleObserver = [&](const QString &event) {
+            if (releaseScheduled
+                || !event.startsWith(
+                    QStringLiteral("output-finalization-deferred:"))) {
+                return;
+            }
+            releaseScheduled = true;
+            QTimer::singleShot(100, qApp, [&] {
+                gateHeldAtRelease = !lockIsAvailable(lockPath)
+                    && sink.count == 0
+                    && traceIndex(*trace,
+                                  QStringLiteral("attempt-cleanup-complete:"))
+                        < 0
+                    && traceIndex(*trace, QStringLiteral("lock-released:")) < 0
+                    && traceIndex(*trace, QStringLiteral("reaper-finished:"))
+                        < 0;
+                *allowFinalization = true;
+            });
+        };
+        QVERIFY(Xc2BackendManagerTestAccess::startStagedOutputFake(
+            *manager, lockPath,
+            Xc2BackendManagerTestAccess::allocateCandidate(), directory.path(),
+            directory.filePath("deferred-finalization.jsonl"), trace,
+            lifecycleObserver,
+            [allowFinalization] { return *allowFinalization; }));
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 7000);
+        child = openStableHandle(manager->ownedProcessId());
+        QVERIFY(child != nullptr && handleIsLive(child));
+        delete manager;
+        manager = nullptr;
+        QCoreApplication::postEvent(qApp, new QEvent(QEvent::Quit));
+        QTRY_VERIFY_WITH_TIMEOUT(*allowFinalization, 3000);
+        QTRY_COMPARE_WITH_TIMEOUT(sink.count, 1, 10000);
+        qApp->removeEventFilter(&sink);
+
+        const int deferredIndex = traceIndex(
+            *trace, QStringLiteral("output-finalization-deferred:"));
+        const int rawDrainedIndex = traceIndex(
+            *trace, QStringLiteral("output-raw-drain-complete:"));
+        const int finalizedIndex = traceIndex(
+            *trace, QStringLiteral("output-finalized:"));
+        const int cleanupIndex = traceIndex(
+            *trace, QStringLiteral("attempt-cleanup-complete:"));
+        const int lockIndex = traceIndex(
+            *trace, QStringLiteral("lock-released:"));
+        const int reaperIndex = traceIndex(
+            *trace, QStringLiteral("reaper-finished:"));
+        const int quitIndex = traceIndex(
+            *trace, QStringLiteral("downstream-quit"));
+        QVERIFY(releaseScheduled);
+        QVERIFY(gateHeldAtRelease);
+        QVERIFY(deferredIndex >= 0);
+        QVERIFY(rawDrainedIndex > deferredIndex);
+        QVERIFY(finalizedIndex > rawDrainedIndex);
+        QVERIFY(cleanupIndex > finalizedIndex);
+        QVERIFY(lockIndex > cleanupIndex);
+        QVERIFY(reaperIndex > lockIndex);
+        QVERIFY(quitIndex > reaperIndex);
+        QVERIFY(childSignaledAtQuit);
+        QVERIFY(lockAvailableAtQuit);
         QVERIFY(handleIsSignaled(child));
         QVERIFY(lockIsAvailable(lockPath));
         CloseHandle(child);

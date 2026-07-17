@@ -89,6 +89,7 @@ private:
         int errorNotificationDelayMsForTest = 0;
         std::function<void(std::function<void()>)>
             shutdownDeadlineEarlyWakeupHookForTest;
+        std::function<bool()> outputFinalizationAllowedForTest;
         ShutdownProofMutation shutdownProofMutationForTest =
             ShutdownProofMutation::None;
     };
