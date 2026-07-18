@@ -51,7 +51,19 @@ KtmSessionController::KtmSessionController(QObject *parent)
 bool KtmSessionController::startProduction(const QString &installRoot,
                                            xc2::Xc2Error *error)
 {
-    if (backendState() != xc2::Xc2BackendState::Stopped) {
+    if (m_resetting || m_stopping || m_projectingPayload || m_failing)
+        return false;
+    const quint64 entryEpoch = m_sessionEpoch;
+    const KtmSessionState entryState = m_state;
+    const KtmSessionOperation entryOperation = m_operation;
+    QPointer<KtmSessionController> entryGuard(this);
+    QPointer<xc2::Xc2BackendManager> backendGuard = m_backend;
+    const xc2::Xc2BackendState observedBackendState = backendState();
+    if (!entryGuard || entryEpoch != m_sessionEpoch
+        || !backendGuard || backendGuard != m_backend
+        || entryState != m_state || entryOperation != m_operation)
+        return false;
+    if (observedBackendState != xc2::Xc2BackendState::Stopped) {
         const xc2::Xc2Error failure = localError(
             xc2::Xc2ErrorCategory::Backend,
             QStringLiteral("An XC2 backend run is already active"));
@@ -60,22 +72,52 @@ bool KtmSessionController::startProduction(const QString &installRoot,
         return false;
     }
 
+    if (m_operation != KtmSessionOperation::None) {
+        m_stopping = true;
+        const bool normalized =
+            publishOperation(KtmSessionOperation::None);
+        if (!entryGuard)
+            return false;
+        m_stopping = false;
+        if (!normalized || entryEpoch != m_sessionEpoch
+            || entryState != m_state || !backendGuard
+            || backendGuard != m_backend
+            || m_operation != KtmSessionOperation::None) {
+            return false;
+        }
+    }
+
     if (error)
         *error = {};
     ++m_sessionEpoch;
+    const quint64 epoch = m_sessionEpoch;
     ++m_selectionEpoch;
     m_requestId = 0;
     m_stompGeneration = 0;
-    resetSessionObjects();
-    const quint64 epoch = m_sessionEpoch;
+    if (!resetSessionObjects())
+        return false;
+    if (!entryGuard || !backendGuard || backendGuard != m_backend
+        || epoch != m_sessionEpoch || m_state != entryState
+        || m_operation != KtmSessionOperation::None) {
+        return false;
+    }
     QPointer<KtmSessionController> guard(this);
     if (!publishState(KtmSessionState::BackendStarting) || !guard
-        || epoch != m_sessionEpoch) {
+        || epoch != m_sessionEpoch || !backendGuard
+        || backendGuard != m_backend
+        || m_state != KtmSessionState::BackendStarting
+        || m_operation != KtmSessionOperation::None) {
         return false;
     }
 
     xc2::Xc2Error failure;
-    if (!startBackend(installRoot, &failure)) {
+    const bool started = startBackend(installRoot, &failure);
+    if (!guard || epoch != m_sessionEpoch
+        || !backendGuard || backendGuard != m_backend
+        || m_state != KtmSessionState::BackendStarting
+        || m_operation != KtmSessionOperation::None)
+        return false;
+    if (!started) {
         if (error)
             *error = failure;
         if (guard && epoch == m_sessionEpoch)
@@ -87,7 +129,8 @@ bool KtmSessionController::startProduction(const QString &installRoot,
 
 bool KtmSessionController::lookupVci(xc2::Xc2Error *error)
 {
-    if (m_state != KtmSessionState::SessionReady
+    if (m_resetting || m_stopping || m_projectingPayload || m_failing
+        || m_state != KtmSessionState::SessionReady
         || m_operation != KtmSessionOperation::None) {
         const xc2::Xc2Error failure = localError(
             xc2::Xc2ErrorCategory::Vci,
@@ -103,10 +146,19 @@ bool KtmSessionController::lookupVci(xc2::Xc2Error *error)
     m_lookupDevicesRequested = false;
     const quint64 epoch = m_sessionEpoch;
     QPointer<KtmSessionController> guard(this);
+    QPointer<xc2::Xc2RestClient> restGuard = m_restClient;
     if (!publishOperation(KtmSessionOperation::Lookup) || !guard
-        || epoch != m_sessionEpoch
-        || !publishState(KtmSessionState::VciLookup) || !guard
-        || epoch != m_sessionEpoch) {
+        || epoch != m_sessionEpoch || !restGuard
+        || restGuard != m_restClient
+        || m_state != KtmSessionState::SessionReady
+        || m_operation != KtmSessionOperation::Lookup) {
+        return false;
+    }
+    if (!publishState(KtmSessionState::VciLookup) || !guard
+        || epoch != m_sessionEpoch || !restGuard
+        || restGuard != m_restClient
+        || m_state != KtmSessionState::VciLookup
+        || m_operation != KtmSessionOperation::Lookup) {
         return false;
     }
     if (m_progressSubscriptionSent)
@@ -117,6 +169,8 @@ bool KtmSessionController::lookupVci(xc2::Xc2Error *error)
 bool KtmSessionController::applyVci(const xc2::Xc2VciDevice &device,
                                     xc2::Xc2Error *error)
 {
+    if (m_resetting || m_stopping || m_projectingPayload || m_failing)
+        return false;
     const QString approvedProvider =
         xc2::Xc2ContractProfile::approved().supportedPduApiShortName();
     if (device.id.trimmed().isEmpty()
@@ -142,6 +196,7 @@ bool KtmSessionController::applyVci(const xc2::Xc2VciDevice &device,
 
     ++m_selectionEpoch;
     const quint64 sessionEpoch = m_sessionEpoch;
+    QPointer<xc2::Xc2RestClient> restGuard = m_restClient;
     const quint64 selectionEpoch = m_selectionEpoch;
     m_applyTarget = device;
     m_confirmedDevice.reset();
@@ -157,21 +212,45 @@ bool KtmSessionController::applyVci(const xc2::Xc2VciDevice &device,
     if (!publishOperation(KtmSessionOperation::Apply) || !guard
         || sessionEpoch != m_sessionEpoch
         || selectionEpoch != m_selectionEpoch
-        || !publishState(KtmSessionState::VciApplying) || !guard
+        || !restGuard || restGuard != m_restClient
+        || m_state != KtmSessionState::SessionReady
+        || m_operation != KtmSessionOperation::Apply) {
+        return false;
+    }
+    if (!publishState(KtmSessionState::VciApplying) || !guard
         || sessionEpoch != m_sessionEpoch
-        || selectionEpoch != m_selectionEpoch) {
+        || selectionEpoch != m_selectionEpoch
+        || !restGuard || restGuard != m_restClient
+        || m_state != KtmSessionState::VciApplying
+        || m_operation != KtmSessionOperation::Apply) {
         return false;
     }
 
-    m_applyRequestId = requestApplyDevice(device);
-    if (m_applyRequestId == 0) {
+    const xc2::Xc2RequestId applyRequestId = requestApplyDevice(device);
+    if (!guard || sessionEpoch != m_sessionEpoch
+        || selectionEpoch != m_selectionEpoch
+        || !restGuard || restGuard != m_restClient
+        || m_operation != KtmSessionOperation::Apply
+        || m_state != KtmSessionState::VciApplying) {
+        return false;
+    }
+    m_applyRequestId = applyRequestId;
+    if (applyRequestId == 0) {
         m_applyRequestSelectionEpoch = 0;
         failLocal(xc2::Xc2ErrorCategory::Transport,
                   QStringLiteral("Failed to start VCI apply request"));
         return false;
     }
-    m_selectedRequestId = requestSelectedDevice();
-    if (m_selectedRequestId == 0) {
+    const xc2::Xc2RequestId selectedRequestId = requestSelectedDevice();
+    if (!guard || sessionEpoch != m_sessionEpoch
+        || selectionEpoch != m_selectionEpoch
+        || !restGuard || restGuard != m_restClient
+        || m_operation != KtmSessionOperation::Apply
+        || m_state != KtmSessionState::VciApplying) {
+        return false;
+    }
+    m_selectedRequestId = selectedRequestId;
+    if (selectedRequestId == 0) {
         m_selectedRequestSelectionEpoch = 0;
         failLocal(xc2::Xc2ErrorCategory::Transport,
                   QStringLiteral("Failed to start selected-VCI request"));
@@ -182,7 +261,8 @@ bool KtmSessionController::applyVci(const xc2::Xc2VciDevice &device,
 
 bool KtmSessionController::closeVci(xc2::Xc2Error *error)
 {
-    if (m_state != KtmSessionState::VciReady
+    if (m_resetting || m_stopping || m_projectingPayload || m_failing
+        || m_state != KtmSessionState::VciReady
         || m_operation != KtmSessionOperation::None
         || !m_confirmedDevice) {
         const xc2::Xc2Error failure = localError(
@@ -197,18 +277,35 @@ bool KtmSessionController::closeVci(xc2::Xc2Error *error)
     const quint64 sessionEpoch = m_sessionEpoch;
     const quint64 selectionEpoch = m_selectionEpoch;
     const xc2::Xc2VciDevice confirmed = *m_confirmedDevice;
+    QPointer<xc2::Xc2RestClient> restGuard = m_restClient;
     QPointer<KtmSessionController> guard(this);
     if (!publishOperation(KtmSessionOperation::Close) || !guard
         || sessionEpoch != m_sessionEpoch
         || selectionEpoch != m_selectionEpoch
-        || !publishState(KtmSessionState::VciClosing) || !guard
+        || !restGuard || restGuard != m_restClient
+        || m_state != KtmSessionState::VciReady
+        || m_operation != KtmSessionOperation::Close) {
+        return false;
+    }
+    if (!publishState(KtmSessionState::VciClosing) || !guard
         || sessionEpoch != m_sessionEpoch
-        || selectionEpoch != m_selectionEpoch) {
+        || selectionEpoch != m_selectionEpoch
+        || !restGuard || restGuard != m_restClient
+        || m_state != KtmSessionState::VciClosing
+        || m_operation != KtmSessionOperation::Close) {
         return false;
     }
     m_closeRequestSelectionEpoch = selectionEpoch;
-    m_closeRequestId = requestCloseDevice(confirmed);
-    if (m_closeRequestId != 0)
+    const xc2::Xc2RequestId closeRequestId = requestCloseDevice(confirmed);
+    if (!guard || sessionEpoch != m_sessionEpoch
+        || selectionEpoch != m_selectionEpoch
+        || !restGuard || restGuard != m_restClient
+        || m_operation != KtmSessionOperation::Close
+        || m_state != KtmSessionState::VciClosing) {
+        return false;
+    }
+    m_closeRequestId = closeRequestId;
+    if (closeRequestId != 0)
         return true;
     m_closeRequestSelectionEpoch = 0;
     failLocal(xc2::Xc2ErrorCategory::Transport,
@@ -218,8 +315,9 @@ bool KtmSessionController::closeVci(xc2::Xc2Error *error)
 
 void KtmSessionController::stop()
 {
-    if (m_stopping)
+    if (m_stopping || m_resetting || m_projectingPayload)
         return;
+    m_failing = false;
     m_stopping = true;
     ++m_sessionEpoch;
     ++m_selectionEpoch;
@@ -243,21 +341,66 @@ void KtmSessionController::stop()
     m_applySucceeded = false;
     m_selectedConfirmed = false;
     m_connectedForSelectionEpoch = false;
+    const quint64 stopEpoch = m_sessionEpoch;
+    QPointer<xc2::Xc2RestClient> restGuard = m_restClient;
+    QPointer<xc2::Xc2StompClient> stompComponentGuard = m_stompClient;
     QPointer<KtmSessionController> stopGuard(this);
-    if (!publishOperation(KtmSessionOperation::None) || !stopGuard)
+    const KtmSessionState stopState = m_state;
+    if (!publishOperation(KtmSessionOperation::None) || !stopGuard
+        || stopEpoch != m_sessionEpoch || !restGuard
+        || restGuard != m_restClient || !stompComponentGuard
+        || stompComponentGuard != m_stompClient
+        || m_operation != KtmSessionOperation::None
+        || !m_stopping || m_state != stopState) {
         return;
+    }
 
     QList<xc2::Xc2RequestId> aborted;
     for (xc2::Xc2RequestId id : pendingIds) {
         if (id != 0 && !aborted.contains(id)) {
             aborted.append(id);
             abortRest(id);
+            if (!stopGuard || stopEpoch != m_sessionEpoch
+                || !restGuard || restGuard != m_restClient
+                || m_operation != KtmSessionOperation::None
+                || !m_stopping || m_state != stopState) {
+                return;
+            }
         }
     }
     disconnectStomp();
+    if (!stopGuard || stopEpoch != m_sessionEpoch
+        || !stompComponentGuard || stompComponentGuard != m_stompClient
+        || m_operation != KtmSessionOperation::None
+        || !m_stopping || m_state != stopState) {
+        return;
+    }
     abortStomp();
-    resetSessionObjects(true);
-    m_stopping = false;
+    if (!stopGuard || stopEpoch != m_sessionEpoch
+        || !stompComponentGuard || stompComponentGuard != m_stompClient
+        || m_operation != KtmSessionOperation::None
+        || !m_stopping || m_state != stopState) {
+        return;
+    }
+    if (!resetSessionObjects(true) || !stopGuard
+        || stopEpoch != m_sessionEpoch
+        || m_operation != KtmSessionOperation::None
+        || !m_stopping || m_state != stopState) {
+        return;
+    }
+    QPointer<xc2::Xc2BackendManager> backendGuard = m_backend;
+    const xc2::Xc2BackendState observedBackendState = backendState();
+    if (!stopGuard || stopEpoch != m_sessionEpoch
+        || !backendGuard || backendGuard != m_backend
+        || !m_stopping || m_operation != KtmSessionOperation::None
+        || m_state != stopState) {
+        return;
+    }
+    if (observedBackendState == xc2::Xc2BackendState::Stopped) {
+        m_stopping = false;
+        publishState(KtmSessionState::Stopped);
+        return;
+    }
     stopBackend();
 }
 
@@ -283,8 +426,16 @@ bool KtmSessionController::publishOperation(KtmSessionOperation operation)
 
 bool KtmSessionController::failSession(const xc2::Xc2Error &error)
 {
+    if (m_resetting || m_stopping || m_projectingPayload || m_failing)
+        return false;
+    const xc2::Xc2Error stableError = error;
+    m_failing = true;
     ++m_selectionEpoch;
     const quint64 sessionEpoch = m_sessionEpoch;
+    const quint64 failureSelectionEpoch = m_selectionEpoch;
+    const KtmSessionState failureState = m_state;
+    QPointer<xc2::Xc2RestClient> restGuard = m_restClient;
+    QPointer<xc2::Xc2StompClient> stompGuard = m_stompClient;
     const xc2::Xc2RequestId pendingIds[] = {
         m_requestId, m_applyRequestId, m_selectedRequestId, m_closeRequestId};
     m_stompGeneration = 0;
@@ -298,9 +449,19 @@ bool KtmSessionController::failSession(const xc2::Xc2Error &error)
     m_selectedConfirmed = false;
     m_connectedForSelectionEpoch = false;
     QPointer<KtmSessionController> guard(this);
-    if (!publishOperation(KtmSessionOperation::None) || !guard
-        || sessionEpoch != m_sessionEpoch)
+    const auto abandonFailure = [&guard]() {
+        if (guard)
+            guard->m_failing = false;
         return false;
+    };
+    if (!publishOperation(KtmSessionOperation::None) || !guard
+        || sessionEpoch != m_sessionEpoch
+        || !restGuard || restGuard != m_restClient
+        || !stompGuard || stompGuard != m_stompClient
+        || failureSelectionEpoch != m_selectionEpoch
+        || m_state != failureState
+        || m_operation != KtmSessionOperation::None)
+        return abandonFailure();
 
     m_requestId = 0;
     m_applyRequestId = 0;
@@ -315,13 +476,56 @@ bool KtmSessionController::failSession(const xc2::Xc2Error &error)
             continue;
         aborted.append(id);
         abortRest(id);
-        if (!guard || sessionEpoch != m_sessionEpoch)
-            return false;
+        if (!guard || sessionEpoch != m_sessionEpoch
+            || !restGuard || restGuard != m_restClient
+            || m_operation != KtmSessionOperation::None
+            || failureSelectionEpoch != m_selectionEpoch
+            || m_state != failureState)
+            return abandonFailure();
     }
+    disconnectStomp();
+    if (!guard || sessionEpoch != m_sessionEpoch
+        || !stompGuard || stompGuard != m_stompClient
+        || m_operation != KtmSessionOperation::None
+        || failureSelectionEpoch != m_selectionEpoch
+        || m_state != failureState) {
+        return abandonFailure();
+    }
+    abortStomp();
+    if (!guard || sessionEpoch != m_sessionEpoch
+        || !stompGuard || stompGuard != m_stompClient
+        || m_operation != KtmSessionOperation::None
+        || failureSelectionEpoch != m_selectionEpoch
+        || m_state != failureState) {
+        return abandonFailure();
+    }
+    if (!resetSessionObjects(true) || !guard
+        || sessionEpoch != m_sessionEpoch
+        || m_operation != KtmSessionOperation::None
+        || failureSelectionEpoch != m_selectionEpoch
+        || m_state != failureState) {
+        return abandonFailure();
+    }
+    QPointer<xc2::Xc2RestClient> failedRestGuard = m_restClient;
+    QPointer<xc2::Xc2StompClient> failedStompGuard = m_stompClient;
+    m_projectingPayload = true;
     if (!publishState(KtmSessionState::Failed) || !guard)
+        return abandonFailure();
+    if (sessionEpoch != m_sessionEpoch
+        || failureSelectionEpoch != m_selectionEpoch
+        || !failedRestGuard || failedRestGuard != m_restClient
+        || !failedStompGuard || failedStompGuard != m_stompClient
+        || m_state != KtmSessionState::Failed
+        || m_operation != KtmSessionOperation::None) {
+        m_projectingPayload = false;
+        return abandonFailure();
+    }
+    emit failed(stableError);
+    if (!guard)
         return false;
-    emit failed(error);
-    return !guard.isNull();
+    m_projectingPayload = false;
+    m_failing = false;
+    return true;
 }
 
 bool KtmSessionController::failLocal(xc2::Xc2ErrorCategory category,
@@ -330,11 +534,41 @@ bool KtmSessionController::failLocal(xc2::Xc2ErrorCategory category,
     return failSession(localError(category, message));
 }
 
-void KtmSessionController::resetSessionObjects(bool notifyTest)
+bool KtmSessionController::resetSessionObjects(bool notifyTest)
 {
-    delete m_jobRegistry;
-    delete m_stompClient;
-    delete m_restClient;
+    if (m_resetting)
+        return false;
+    m_resetting = true;
+    const quint64 resetEpoch = m_sessionEpoch;
+    QPointer<KtmSessionController> guard(this);
+    QPointer<xc2::Xc2JobRegistry> oldRegistry = m_jobRegistry;
+    QPointer<xc2::Xc2StompClient> oldStomp = m_stompClient;
+    QPointer<xc2::Xc2RestClient> oldRest = m_restClient;
+    m_jobRegistry = nullptr;
+    m_stompClient = nullptr;
+    m_restClient = nullptr;
+    delete oldRegistry;
+    if (!guard)
+        return false;
+    if (resetEpoch != m_sessionEpoch) {
+        m_resetting = false;
+        return false;
+    }
+    delete oldStomp;
+    if (!guard)
+        return false;
+    if (resetEpoch != m_sessionEpoch) {
+        m_resetting = false;
+        return false;
+    }
+    delete oldRest;
+    if (!guard)
+        return false;
+    if (resetEpoch != m_sessionEpoch) {
+        m_resetting = false;
+        return false;
+    }
+
     m_jobRegistry = new xc2::Xc2JobRegistry(this);
     m_stompClient = new xc2::Xc2StompClient({}, this);
     m_restClient = new xc2::Xc2RestClient({}, this);
@@ -344,6 +578,9 @@ void KtmSessionController::resetSessionObjects(bool notifyTest)
     const quintptr stompIdentity = reinterpret_cast<quintptr>(m_stompClient);
     const quintptr registryIdentity =
         reinterpret_cast<quintptr>(m_jobRegistry);
+    QPointer<xc2::Xc2RestClient> resetRestGuard = m_restClient;
+    QPointer<xc2::Xc2StompClient> resetStompGuard = m_stompClient;
+    QPointer<xc2::Xc2JobRegistry> resetRegistryGuard = m_jobRegistry;
     connect(m_restClient, &xc2::Xc2RestClient::serviceStatusFinished,
             this, [this, epoch, restIdentity](
                       xc2::Xc2RequestId id,
@@ -442,8 +679,19 @@ void KtmSessionController::resetSessionObjects(bool notifyTest)
     m_applySucceeded = false;
     m_selectedConfirmed = false;
     m_connectedForSelectionEpoch = false;
-    if (notifyTest && m_testOps.sessionObjectsReset)
-        m_testOps.sessionObjectsReset();
+    m_resetting = false;
+    const auto resetObserved = m_testOps.sessionObjectsReset;
+    if (notifyTest && resetObserved) {
+        resetObserved();
+        if (!guard || resetEpoch != m_sessionEpoch
+            || !resetRestGuard || resetRestGuard != m_restClient
+            || !resetStompGuard || resetStompGuard != m_stompClient
+            || !resetRegistryGuard
+            || resetRegistryGuard != m_jobRegistry) {
+            return false;
+        }
+    }
+    return true;
 }
 
 bool KtmSessionController::callbackMatches(
@@ -456,132 +704,150 @@ bool KtmSessionController::callbackMatches(
 
 xc2::Xc2BackendState KtmSessionController::backendState() const
 {
-    return m_testOps.backendState ? m_testOps.backendState()
-                                  : m_backend->state();
+    const auto operation = m_testOps.backendState;
+    return operation ? operation() : m_backend->state();
 }
 
 bool KtmSessionController::startBackend(const QString &installRoot,
                                         xc2::Xc2Error *error)
 {
-    return m_testOps.startBackend
-        ? m_testOps.startBackend(installRoot, error)
+    const auto operation = m_testOps.startBackend;
+    return operation
+        ? operation(installRoot, error)
         : m_backend->startProduction(installRoot, error);
 }
 
 bool KtmSessionController::setRestBaseUrl(const QByteArray &encodedBase,
                                           xc2::Xc2Error *error)
 {
-    return m_testOps.setRestBaseUrl
-        ? m_testOps.setRestBaseUrl(encodedBase, error)
-        : m_restClient->setBaseUrl(encodedBase, error);
+    const auto operation = m_testOps.setRestBaseUrl;
+    return operation
+        ? operation(encodedBase, error)
+        : m_restClient && m_restClient->setBaseUrl(encodedBase, error);
 }
 
 QUrl KtmSessionController::restWebSocketUrl() const
 {
-    return m_testOps.restWebSocketUrl ? m_testOps.restWebSocketUrl()
-                                      : m_restClient->webSocketUrl();
+    const auto operation = m_testOps.restWebSocketUrl;
+    return operation ? operation()
+                     : m_restClient ? m_restClient->webSocketUrl() : QUrl{};
 }
 
 xc2::Xc2RequestId KtmSessionController::requestServiceStatus()
 {
-    return m_testOps.requestServiceStatus
-        ? m_testOps.requestServiceStatus()
-        : m_restClient->requestServiceStatus();
+    const auto operation = m_testOps.requestServiceStatus;
+    return operation
+        ? operation()
+        : m_restClient ? m_restClient->requestServiceStatus() : 0;
 }
 
 xc2::Xc2RequestId KtmSessionController::requestCurrentUser()
 {
-    return m_testOps.requestCurrentUser ? m_testOps.requestCurrentUser()
-                                        : m_restClient->requestCurrentUser();
+    const auto operation = m_testOps.requestCurrentUser;
+    return operation ? operation()
+                     : m_restClient ? m_restClient->requestCurrentUser() : 0;
 }
 
 xc2::Xc2RequestId KtmSessionController::requestDeviceLookup()
 {
-    return m_testOps.requestDeviceLookup
-        ? m_testOps.requestDeviceLookup()
-        : m_restClient->requestDeviceLookup();
+    const auto operation = m_testOps.requestDeviceLookup;
+    return operation
+        ? operation()
+        : m_restClient ? m_restClient->requestDeviceLookup() : 0;
 }
 
 xc2::Xc2RequestId KtmSessionController::requestDevices()
 {
-    return m_testOps.requestDevices ? m_testOps.requestDevices()
-                                    : m_restClient->requestDevices();
+    const auto operation = m_testOps.requestDevices;
+    return operation ? operation()
+                     : m_restClient ? m_restClient->requestDevices() : 0;
 }
 
 xc2::Xc2RequestId KtmSessionController::requestApplyDevice(
     const xc2::Xc2VciDevice &device)
 {
-    return m_testOps.requestApplyDevice
-        ? m_testOps.requestApplyDevice(device)
-        : m_restClient->requestApplyDevice(device);
+    const auto operation = m_testOps.requestApplyDevice;
+    return operation
+        ? operation(device)
+        : m_restClient ? m_restClient->requestApplyDevice(device) : 0;
 }
 
 xc2::Xc2RequestId KtmSessionController::requestSelectedDevice()
 {
-    return m_testOps.requestSelectedDevice
-        ? m_testOps.requestSelectedDevice()
-        : m_restClient->requestSelectedDevice();
+    const auto operation = m_testOps.requestSelectedDevice;
+    return operation
+        ? operation()
+        : m_restClient ? m_restClient->requestSelectedDevice() : 0;
 }
 
 xc2::Xc2RequestId KtmSessionController::requestCloseDevice(
     const xc2::Xc2VciDevice &device)
 {
-    return m_testOps.requestCloseDevice
-        ? m_testOps.requestCloseDevice(device)
-        : m_restClient->requestCloseDevice(device);
+    const auto operation = m_testOps.requestCloseDevice;
+    return operation
+        ? operation(device)
+        : m_restClient ? m_restClient->requestCloseDevice(device) : 0;
 }
 
 void KtmSessionController::abortRest(xc2::Xc2RequestId id)
 {
-    if (m_testOps.abortRest)
-        m_testOps.abortRest(id);
-    else
+    const auto operation = m_testOps.abortRest;
+    if (operation)
+        operation(id);
+    else if (m_restClient)
         m_restClient->abort(id);
 }
 
 void KtmSessionController::disconnectStomp()
 {
-    if (m_testOps.disconnectStomp)
-        m_testOps.disconnectStomp();
-    else
+    const auto operation = m_testOps.disconnectStomp;
+    if (operation)
+        operation();
+    else if (m_stompClient)
         m_stompClient->disconnectFromBackend();
 }
 
 void KtmSessionController::abortStomp()
 {
-    if (m_testOps.abortStomp)
-        m_testOps.abortStomp();
-    else
+    const auto operation = m_testOps.abortStomp;
+    if (operation)
+        operation();
+    else if (m_stompClient)
         m_stompClient->abortCurrentGeneration();
 }
 
 void KtmSessionController::stopBackend()
 {
-    if (m_testOps.stopBackend)
-        m_testOps.stopBackend();
+    const auto operation = m_testOps.stopBackend;
+    if (operation)
+        operation();
     else
         m_backend->stop();
 }
 
 bool KtmSessionController::connectStomp(xc2::Xc2Error *error)
 {
-    return m_testOps.connectStomp
-        ? m_testOps.connectStomp(error)
-        : m_stompClient->connectToBackend(*m_restClient, error);
+    const auto operation = m_testOps.connectStomp;
+    return operation
+        ? operation(error)
+        : m_stompClient && m_restClient
+            && m_stompClient->connectToBackend(*m_restClient, error);
 }
 
 bool KtmSessionController::subscribeStomp(xc2::Topic topic,
                                           xc2::Xc2Error *error)
 {
-    return m_testOps.subscribeStomp
-        ? m_testOps.subscribeStomp(topic, error)
-        : m_stompClient->subscribe(topic, error);
+    const auto operation = m_testOps.subscribeStomp;
+    return operation
+        ? operation(topic, error)
+        : m_stompClient && m_stompClient->subscribe(topic, error);
 }
 
 xc2::Xc2StompGeneration KtmSessionController::stompGeneration() const
 {
-    return m_testOps.stompGeneration ? m_testOps.stompGeneration()
-                                     : m_stompClient->generation();
+    const auto operation = m_testOps.stompGeneration;
+    return operation ? operation()
+                     : m_stompClient ? m_stompClient->generation() : 0;
 }
 
 void KtmSessionController::handleBackendStateChanged(
@@ -591,6 +857,22 @@ void KtmSessionController::handleBackendStateChanged(
         && m_state == KtmSessionState::BackendStarting) {
         publishState(KtmSessionState::BackendReady);
     } else if (state == xc2::Xc2BackendState::Stopped) {
+        if (m_resetting)
+            return;
+        const quint64 sessionEpoch = m_sessionEpoch;
+        const KtmSessionState expectedState = m_state;
+        QPointer<KtmSessionController> guard(this);
+        m_stopping = true;
+        if (!publishOperation(KtmSessionOperation::None) || !guard
+            || sessionEpoch != m_sessionEpoch
+            || m_state != expectedState
+            || m_operation != KtmSessionOperation::None
+            || !m_stopping) {
+            return;
+        }
+        m_stopping = false;
+        m_failing = false;
+        m_projectingPayload = false;
         publishState(KtmSessionState::Stopped);
     }
 }
@@ -598,30 +880,64 @@ void KtmSessionController::handleBackendStateChanged(
 void KtmSessionController::handleBackendReady(
     const xc2::Xc2BackendEndpoints &endpoints)
 {
-    if (m_state != KtmSessionState::BackendReady
-        || backendState() != xc2::Xc2BackendState::Ready) {
+    if (m_state != KtmSessionState::BackendReady)
         return;
-    }
     const quint64 epoch = m_sessionEpoch;
     QPointer<KtmSessionController> guard(this);
+    QPointer<xc2::Xc2BackendManager> backendGuard = m_backend;
+    QPointer<xc2::Xc2RestClient> restGuard = m_restClient;
+    const xc2::Xc2BackendState observedBackendState = backendState();
+    if (!guard || epoch != m_sessionEpoch
+        || !backendGuard || backendGuard != m_backend
+        || !restGuard || restGuard != m_restClient
+        || m_state != KtmSessionState::BackendReady
+        || m_operation != KtmSessionOperation::None
+        || observedBackendState != xc2::Xc2BackendState::Ready) {
+        return;
+    }
     if (!publishState(KtmSessionState::SessionStarting) || !guard
-        || epoch != m_sessionEpoch) {
+        || epoch != m_sessionEpoch
+        || !backendGuard || backendGuard != m_backend
+        || !restGuard || restGuard != m_restClient
+        || m_state != KtmSessionState::SessionStarting
+        || m_operation != KtmSessionOperation::None) {
         return;
     }
 
     xc2::Xc2Error error;
-    if (!setRestBaseUrl(
-            endpoints.restBaseUrl.toEncoded(QUrl::FullyEncoded), &error)) {
+    const bool baseConfigured = setRestBaseUrl(
+        endpoints.restBaseUrl.toEncoded(QUrl::FullyEncoded), &error);
+    if (!guard || epoch != m_sessionEpoch
+        || !restGuard || restGuard != m_restClient
+        || m_state != KtmSessionState::SessionStarting
+        || m_operation != KtmSessionOperation::None) {
+        return;
+    }
+    if (!baseConfigured) {
         failSession(error);
         return;
     }
-    if (!sameEncodedUrl(restWebSocketUrl(), endpoints.webSocketUrl)) {
+    const QUrl derivedWebSocketUrl = restWebSocketUrl();
+    if (!guard || epoch != m_sessionEpoch
+        || !restGuard || restGuard != m_restClient
+        || m_state != KtmSessionState::SessionStarting
+        || m_operation != KtmSessionOperation::None) {
+        return;
+    }
+    if (!sameEncodedUrl(derivedWebSocketUrl, endpoints.webSocketUrl)) {
         failLocal(xc2::Xc2ErrorCategory::Contract,
                   QStringLiteral("REST and STOMP authorities do not match"));
         return;
     }
-    m_requestId = requestServiceStatus();
-    if (m_requestId == 0) {
+    const xc2::Xc2RequestId requestId = requestServiceStatus();
+    if (!guard || epoch != m_sessionEpoch
+        || !restGuard || restGuard != m_restClient
+        || m_state != KtmSessionState::SessionStarting
+        || m_operation != KtmSessionOperation::None) {
+        return;
+    }
+    m_requestId = requestId;
+    if (requestId == 0) {
         failLocal(xc2::Xc2ErrorCategory::Transport,
                   QStringLiteral("Failed to start service-status request"));
     }
@@ -652,8 +968,18 @@ void KtmSessionController::handleServiceStatusFinished(
                   QStringLiteral("XC2 service is not alive"));
         return;
     }
-    m_requestId = requestCurrentUser();
-    if (m_requestId == 0) {
+    QPointer<xc2::Xc2RestClient> restGuard = m_restClient;
+    QPointer<KtmSessionController> guard(this);
+    const xc2::Xc2RequestId requestId = requestCurrentUser();
+    if (!guard || epoch != m_sessionEpoch
+        || identity != reinterpret_cast<quintptr>(restGuard.data())
+        || !restGuard || restGuard != m_restClient
+        || m_state != KtmSessionState::SessionStarting
+        || m_operation != KtmSessionOperation::None) {
+        return;
+    }
+    m_requestId = requestId;
+    if (requestId == 0) {
         failLocal(xc2::Xc2ErrorCategory::Transport,
                   QStringLiteral("Failed to start current-user request"));
     }
@@ -679,13 +1005,34 @@ void KtmSessionController::handleCurrentUserFinished(
         return;
     }
 
+    const quint64 sessionEpoch = m_sessionEpoch;
+    QPointer<xc2::Xc2RestClient> restGuard = m_restClient;
+    QPointer<xc2::Xc2StompClient> stompGuard = m_stompClient;
+    QPointer<KtmSessionController> guard(this);
     xc2::Xc2Error error;
-    if (!connectStomp(&error)) {
+    const bool connecting = connectStomp(&error);
+    if (!guard || sessionEpoch != m_sessionEpoch
+        || identity != reinterpret_cast<quintptr>(restGuard.data())
+        || !restGuard || restGuard != m_restClient
+        || !stompGuard || stompGuard != m_stompClient
+        || m_state != KtmSessionState::SessionStarting
+        || m_operation != KtmSessionOperation::None) {
+        return;
+    }
+    if (!connecting) {
         failSession(error);
         return;
     }
-    m_stompGeneration = stompGeneration();
-    if (m_stompGeneration == 0) {
+    const xc2::Xc2StompGeneration generation = stompGeneration();
+    if (!guard || sessionEpoch != m_sessionEpoch
+        || !restGuard || restGuard != m_restClient
+        || !stompGuard || stompGuard != m_stompClient
+        || m_state != KtmSessionState::SessionStarting
+        || m_operation != KtmSessionOperation::None) {
+        return;
+    }
+    m_stompGeneration = generation;
+    if (generation == 0) {
         failLocal(xc2::Xc2ErrorCategory::Session,
                   QStringLiteral("STOMP generation is zero"));
     }
@@ -698,20 +1045,31 @@ void KtmSessionController::handleStompConnected(
         || identity != reinterpret_cast<quintptr>(m_stompClient)
         || m_state != KtmSessionState::SessionStarting
         || session.generation == 0
-        || session.generation != m_stompGeneration
-        || stompGeneration() != m_stompGeneration) {
+        || session.generation != m_stompGeneration) {
         return;
     }
 
     const quint64 sessionEpoch = m_sessionEpoch;
+    QPointer<xc2::Xc2StompClient> stompGuard = m_stompClient;
     QPointer<KtmSessionController> guard(this);
+    const xc2::Xc2StompGeneration generation = stompGeneration();
+    if (!guard || sessionEpoch != m_sessionEpoch
+        || identity != reinterpret_cast<quintptr>(stompGuard.data())
+        || !stompGuard || stompGuard != m_stompClient
+        || m_state != KtmSessionState::SessionStarting
+        || m_operation != KtmSessionOperation::None
+        || generation != m_stompGeneration) {
+        return;
+    }
     xc2::Xc2Error error;
     const xc2::Topic topics[] = {
         xc2::Topic::Login, xc2::Topic::VciStatus, xc2::Topic::Progress};
     for (xc2::Topic topic : topics) {
         const bool subscribed = subscribeStomp(topic, &error);
         if (!guard || sessionEpoch != m_sessionEpoch
-            || m_state != KtmSessionState::SessionStarting) {
+            || !stompGuard || stompGuard != m_stompClient
+            || m_state != KtmSessionState::SessionStarting
+            || m_operation != KtmSessionOperation::None) {
             return;
         }
         if (!subscribed) {
@@ -719,7 +1077,10 @@ void KtmSessionController::handleStompConnected(
             return;
         }
     }
-    if (guard && sessionEpoch == m_sessionEpoch)
+    if (guard && sessionEpoch == m_sessionEpoch
+        && stompGuard && stompGuard == m_stompClient
+        && m_state == KtmSessionState::SessionStarting
+        && m_operation == KtmSessionOperation::None)
         publishState(KtmSessionState::SessionReady);
 }
 
@@ -728,8 +1089,21 @@ void KtmSessionController::handleSubscriptionSent(
 {
     if (epoch != m_sessionEpoch
         || identity != reinterpret_cast<quintptr>(m_stompClient)
-        || topic != xc2::Topic::Progress || m_stompGeneration == 0
-        || stompGeneration() != m_stompGeneration) {
+        || topic != xc2::Topic::Progress || m_stompGeneration == 0) {
+        return;
+    }
+    const KtmSessionState expectedState = m_state;
+    const KtmSessionOperation expectedOperation = m_operation;
+    QPointer<KtmSessionController> guard(this);
+    QPointer<xc2::Xc2StompClient> stompGuard = m_stompClient;
+    QPointer<xc2::Xc2RestClient> restGuard = m_restClient;
+    const xc2::Xc2StompGeneration generation = stompGeneration();
+    if (!guard || epoch != m_sessionEpoch
+        || identity != reinterpret_cast<quintptr>(stompGuard.data())
+        || !stompGuard || stompGuard != m_stompClient
+        || !restGuard || restGuard != m_restClient
+        || expectedState != m_state || expectedOperation != m_operation
+        || generation != m_stompGeneration) {
         return;
     }
     m_progressSubscriptionSent = true;
@@ -743,12 +1117,25 @@ void KtmSessionController::handleStompMessage(
     if (epoch != m_sessionEpoch
         || identity != reinterpret_cast<quintptr>(m_stompClient)
         || message.generation == 0
-        || message.generation != m_stompGeneration
-        || stompGeneration() != m_stompGeneration) {
+        || message.generation != m_stompGeneration) {
         return;
     }
     if (m_state == KtmSessionState::Stopped
         || m_state == KtmSessionState::Failed) {
+        return;
+    }
+    const KtmSessionState expectedState = m_state;
+    const KtmSessionOperation expectedOperation = m_operation;
+    QPointer<KtmSessionController> guard(this);
+    QPointer<xc2::Xc2StompClient> stompGuard = m_stompClient;
+    QPointer<xc2::Xc2JobRegistry> registryGuard = m_jobRegistry;
+    const xc2::Xc2StompGeneration generation = stompGeneration();
+    if (!guard || epoch != m_sessionEpoch
+        || identity != reinterpret_cast<quintptr>(stompGuard.data())
+        || !stompGuard || stompGuard != m_stompClient
+        || !registryGuard || registryGuard != m_jobRegistry
+        || expectedState != m_state || expectedOperation != m_operation
+        || generation != m_stompGeneration) {
         return;
     }
     if (message.topic != xc2::Topic::Progress)
@@ -760,8 +1147,14 @@ void KtmSessionController::handleStompMessage(
     }
 
     xc2::Xc2Error error;
-    if (!m_jobRegistry->applyMessage(message, &error)
-        && m_operation == KtmSessionOperation::Lookup) {
+    const bool applied = m_jobRegistry->applyMessage(message, &error);
+    if (!guard || epoch != m_sessionEpoch
+        || !stompGuard || stompGuard != m_stompClient
+        || !registryGuard || registryGuard != m_jobRegistry
+        || expectedState != m_state || expectedOperation != m_operation) {
+        return;
+    }
+    if (!applied && m_operation == KtmSessionOperation::Lookup) {
         failSession(error);
     }
 }
@@ -772,8 +1165,7 @@ void KtmSessionController::handleVciStatus(
 {
     if (epoch != m_sessionEpoch || selectionEpoch != m_selectionEpoch
         || identity != reinterpret_cast<quintptr>(m_stompClient)
-        || message.generation != m_stompGeneration
-        || stompGeneration() != m_stompGeneration) {
+        || message.generation != m_stompGeneration) {
         return;
     }
     const xc2::Xc2Result<xc2::Xc2VciStatus> decoded =
@@ -825,6 +1217,19 @@ void KtmSessionController::handleStompError(
         || generation != m_stompGeneration) {
         return;
     }
+    const KtmSessionState expectedState = m_state;
+    const KtmSessionOperation expectedOperation = m_operation;
+    QPointer<KtmSessionController> guard(this);
+    QPointer<xc2::Xc2StompClient> stompGuard = m_stompClient;
+    QPointer<xc2::Xc2JobRegistry> registryGuard = m_jobRegistry;
+    m_jobRegistry->markVisibilityLost(generation);
+    if (!guard || epoch != m_sessionEpoch || !stompGuard
+        || stompGuard != m_stompClient || !registryGuard
+        || registryGuard != m_jobRegistry
+        || expectedState != m_state || expectedOperation != m_operation
+        || generation != m_stompGeneration) {
+        return;
+    }
     failWithReadinessRevoked(error);
 }
 
@@ -834,11 +1239,30 @@ void KtmSessionController::handleVisibilityLost(
 {
     if (epoch != m_sessionEpoch
         || identity != reinterpret_cast<quintptr>(m_stompClient)
-        || generation == 0 || generation != m_stompGeneration
-        || stompGeneration() != m_stompGeneration) {
+        || generation == 0 || generation != m_stompGeneration) {
+        return;
+    }
+    const KtmSessionState expectedState = m_state;
+    const KtmSessionOperation expectedOperation = m_operation;
+    QPointer<KtmSessionController> guard(this);
+    QPointer<xc2::Xc2StompClient> stompGuard = m_stompClient;
+    QPointer<xc2::Xc2JobRegistry> registryGuard = m_jobRegistry;
+    const xc2::Xc2StompGeneration activeGeneration = stompGeneration();
+    if (!guard || epoch != m_sessionEpoch
+        || identity != reinterpret_cast<quintptr>(stompGuard.data())
+        || !stompGuard || stompGuard != m_stompClient
+        || !registryGuard || registryGuard != m_jobRegistry
+        || expectedState != m_state || expectedOperation != m_operation
+        || activeGeneration != m_stompGeneration) {
         return;
     }
     m_jobRegistry->markVisibilityLost(generation);
+    if (!guard || epoch != m_sessionEpoch
+        || !stompGuard || stompGuard != m_stompClient
+        || !registryGuard || registryGuard != m_jobRegistry
+        || expectedState != m_state || expectedOperation != m_operation) {
+        return;
+    }
     failWithReadinessRevoked(error);
 }
 
@@ -858,8 +1282,20 @@ void KtmSessionController::handleDeviceLookupFinished(
         return;
     }
 
+    QPointer<KtmSessionController> guard(this);
+    QPointer<xc2::Xc2RestClient> restGuard = m_restClient;
+    QPointer<xc2::Xc2JobRegistry> registryGuard = m_jobRegistry;
     xc2::Xc2Error error;
-    if (!m_jobRegistry->accept(*result.value, &error)) {
+    const bool accepted = m_jobRegistry->accept(*result.value, &error);
+    if (!guard || epoch != m_sessionEpoch
+        || identity != reinterpret_cast<quintptr>(restGuard.data())
+        || !restGuard || restGuard != m_restClient
+        || !registryGuard || registryGuard != m_jobRegistry
+        || m_operation != KtmSessionOperation::Lookup
+        || m_state != KtmSessionState::VciLookup) {
+        return;
+    }
+    if (!accepted) {
         failSession(error);
         return;
     }
@@ -886,23 +1322,51 @@ void KtmSessionController::handleDevicesFinished(
         return;
     }
 
+    QPointer<KtmSessionController> guard(this);
+    QPointer<xc2::Xc2RestClient> restGuard = m_restClient;
+    QPointer<xc2::Xc2JobRegistry> registryGuard = m_jobRegistry;
     if (!m_lookupJobId.isEmpty()) {
         xc2::Xc2Error ignored;
         m_jobRegistry->clearTerminal(m_lookupJobId, &ignored);
+        if (!guard || epoch != m_sessionEpoch
+            || identity != reinterpret_cast<quintptr>(restGuard.data())
+            || !restGuard || restGuard != m_restClient
+            || !registryGuard || registryGuard != m_jobRegistry
+            || m_operation != KtmSessionOperation::Lookup
+            || m_state != KtmSessionState::VciLookup) {
+            return;
+        }
     }
     m_lookupJobId.clear();
     m_lookupRequestStarted = false;
     m_lookupDevicesRequested = false;
     const QList<xc2::Xc2VciDevice> devices = *result.value;
     const quint64 currentEpoch = m_sessionEpoch;
-    QPointer<KtmSessionController> guard(this);
+    const quint64 currentSelectionEpoch = m_selectionEpoch;
     if (!publishOperation(KtmSessionOperation::None) || !guard
         || currentEpoch != m_sessionEpoch
-        || !publishState(KtmSessionState::SessionReady) || !guard
-        || currentEpoch != m_sessionEpoch) {
+        || currentSelectionEpoch != m_selectionEpoch
+        || !restGuard || restGuard != m_restClient
+        || !registryGuard || registryGuard != m_jobRegistry
+        || m_state != KtmSessionState::VciLookup
+        || m_operation != KtmSessionOperation::None) {
+        return;
+    }
+    m_projectingPayload = true;
+    if (!publishState(KtmSessionState::SessionReady) || !guard)
+        return;
+    if (currentEpoch != m_sessionEpoch
+        || currentSelectionEpoch != m_selectionEpoch
+        || !restGuard || restGuard != m_restClient
+        || !registryGuard || registryGuard != m_jobRegistry
+        || m_state != KtmSessionState::SessionReady
+        || m_operation != KtmSessionOperation::None) {
+        m_projectingPayload = false;
         return;
     }
     emit vciLookupFinished(devices);
+    if (guard)
+        m_projectingPayload = false;
 }
 
 void KtmSessionController::handleApplyDeviceFinished(
@@ -984,14 +1448,31 @@ void KtmSessionController::handleCloseDeviceFinished(
     m_selectedConfirmed = false;
     m_connectedForSelectionEpoch = false;
     const quint64 currentSessionEpoch = m_sessionEpoch;
+    const quint64 currentSelectionEpoch = m_selectionEpoch;
+    QPointer<xc2::Xc2RestClient> restGuard = m_restClient;
     QPointer<KtmSessionController> guard(this);
     if (!publishOperation(KtmSessionOperation::None) || !guard
         || currentSessionEpoch != m_sessionEpoch
-        || !publishState(KtmSessionState::SessionReady) || !guard
-        || currentSessionEpoch != m_sessionEpoch) {
+        || currentSelectionEpoch != m_selectionEpoch
+        || !restGuard || restGuard != m_restClient
+        || m_state != KtmSessionState::VciClosing
+        || m_operation != KtmSessionOperation::None) {
+        return;
+    }
+    m_projectingPayload = true;
+    if (!publishState(KtmSessionState::SessionReady) || !guard)
+        return;
+    if (currentSessionEpoch != m_sessionEpoch
+        || currentSelectionEpoch != m_selectionEpoch
+        || !restGuard || restGuard != m_restClient
+        || m_state != KtmSessionState::SessionReady
+        || m_operation != KtmSessionOperation::None) {
+        m_projectingPayload = false;
         return;
     }
     emit vciClosed();
+    if (guard)
+        m_projectingPayload = false;
 }
 
 void KtmSessionController::handleJobTerminal(
@@ -1014,8 +1495,18 @@ bool KtmSessionController::startDeferredLookup()
         return true;
     }
     m_lookupRequestStarted = true;
-    m_requestId = requestDeviceLookup();
-    if (m_requestId != 0)
+    const quint64 sessionEpoch = m_sessionEpoch;
+    QPointer<KtmSessionController> guard(this);
+    QPointer<xc2::Xc2RestClient> restGuard = m_restClient;
+    const xc2::Xc2RequestId requestId = requestDeviceLookup();
+    if (!guard || sessionEpoch != m_sessionEpoch
+        || !restGuard || restGuard != m_restClient
+        || m_operation != KtmSessionOperation::Lookup
+        || m_state != KtmSessionState::VciLookup) {
+        return false;
+    }
+    m_requestId = requestId;
+    if (requestId != 0)
         return true;
     failLocal(xc2::Xc2ErrorCategory::Transport,
               QStringLiteral("Failed to start VCI lookup request"));
@@ -1027,8 +1518,18 @@ bool KtmSessionController::requestLookupDevices()
     if (m_lookupDevicesRequested)
         return true;
     m_lookupDevicesRequested = true;
-    m_requestId = requestDevices();
-    if (m_requestId != 0)
+    const quint64 sessionEpoch = m_sessionEpoch;
+    QPointer<KtmSessionController> guard(this);
+    QPointer<xc2::Xc2RestClient> restGuard = m_restClient;
+    const xc2::Xc2RequestId requestId = requestDevices();
+    if (!guard || sessionEpoch != m_sessionEpoch
+        || !restGuard || restGuard != m_restClient
+        || m_operation != KtmSessionOperation::Lookup
+        || m_state != KtmSessionState::VciLookup) {
+        return false;
+    }
+    m_requestId = requestId;
+    if (requestId != 0)
         return true;
     failLocal(xc2::Xc2ErrorCategory::Transport,
               QStringLiteral("Failed to start VCI devices request"));
@@ -1070,16 +1571,33 @@ void KtmSessionController::tryPublishVciReady()
     const xc2::Xc2VciStatus status = *m_latestVciStatus;
     const quint64 sessionEpoch = m_sessionEpoch;
     const quint64 selectionEpoch = m_selectionEpoch;
+    QPointer<xc2::Xc2RestClient> restGuard = m_restClient;
+    QPointer<xc2::Xc2StompClient> stompGuard = m_stompClient;
     QPointer<KtmSessionController> guard(this);
     if (!publishOperation(KtmSessionOperation::None) || !guard
         || sessionEpoch != m_sessionEpoch
         || selectionEpoch != m_selectionEpoch
-        || !publishState(KtmSessionState::VciReady) || !guard
-        || sessionEpoch != m_sessionEpoch
-        || selectionEpoch != m_selectionEpoch) {
+        || !restGuard || restGuard != m_restClient
+        || !stompGuard || stompGuard != m_stompClient
+        || m_state != KtmSessionState::VciApplying
+        || m_operation != KtmSessionOperation::None) {
+        return;
+    }
+    m_projectingPayload = true;
+    if (!publishState(KtmSessionState::VciReady) || !guard)
+        return;
+    if (sessionEpoch != m_sessionEpoch
+        || selectionEpoch != m_selectionEpoch
+        || !restGuard || restGuard != m_restClient
+        || !stompGuard || stompGuard != m_stompClient
+        || m_state != KtmSessionState::VciReady
+        || m_operation != KtmSessionOperation::None) {
+        m_projectingPayload = false;
         return;
     }
     emit vciReady(device, status);
+    if (guard)
+        m_projectingPayload = false;
 }
 
 bool KtmSessionController::failWithReadinessRevoked(
@@ -1095,10 +1613,14 @@ bool KtmSessionController::failWithReadinessRevoked(
         m_connectedForSelectionEpoch = false;
         const quint64 sessionEpoch = m_sessionEpoch;
         const quint64 selectionEpoch = m_selectionEpoch;
+        const KtmSessionState expectedState = m_state;
+        const KtmSessionOperation expectedOperation = m_operation;
         QPointer<KtmSessionController> guard(this);
         emit vciReadinessRevoked(error);
         if (!guard || sessionEpoch != m_sessionEpoch
-            || selectionEpoch != m_selectionEpoch) {
+            || selectionEpoch != m_selectionEpoch
+            || m_state != expectedState
+            || m_operation != expectedOperation) {
             return false;
         }
     }
@@ -1119,13 +1641,21 @@ void KtmSessionController::revokeReadinessToSession(
     m_connectedForSelectionEpoch = false;
     const quint64 sessionEpoch = m_sessionEpoch;
     const quint64 selectionEpoch = m_selectionEpoch;
+    const KtmSessionState expectedState = m_state;
+    const KtmSessionOperation expectedOperation = m_operation;
     QPointer<KtmSessionController> guard(this);
     emit vciReadinessRevoked(error);
     if (!guard || sessionEpoch != m_sessionEpoch
         || selectionEpoch != m_selectionEpoch
-        || !publishState(KtmSessionState::SessionReady) || !guard
+        || m_state != expectedState
+        || m_operation != expectedOperation) {
+        return;
+    }
+    if (!publishState(KtmSessionState::SessionReady) || !guard
         || sessionEpoch != m_sessionEpoch
-        || selectionEpoch != m_selectionEpoch) {
+        || selectionEpoch != m_selectionEpoch
+        || m_state != KtmSessionState::SessionReady
+        || m_operation != expectedOperation) {
         return;
     }
 }

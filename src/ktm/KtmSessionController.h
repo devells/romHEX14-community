@@ -87,7 +87,7 @@ private:
     bool publishOperation(KtmSessionOperation operation);
     bool failSession(const xc2::Xc2Error &error);
     bool failLocal(xc2::Xc2ErrorCategory category, const QString &message);
-    void resetSessionObjects(bool notifyTest = false);
+    bool resetSessionObjects(bool notifyTest = false);
     bool callbackMatches(quint64 epoch, quintptr identity,
                          xc2::Xc2RequestId id) const;
 
@@ -190,6 +190,9 @@ private:
     bool m_selectedConfirmed = false;
     bool m_connectedForSelectionEpoch = false;
     bool m_stopping = false;
+    bool m_resetting = false;
+    bool m_projectingPayload = false;
+    bool m_failing = false;
 };
 
 } // namespace ktm
