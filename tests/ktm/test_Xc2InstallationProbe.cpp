@@ -363,6 +363,36 @@ private slots:
         QVERIFY(!report.ok());
     }
 
+    void providerHashMismatchIsBlocking()
+    {
+        QTemporaryDir temp;
+        QVERIFY(temp.isValid());
+        const InstallationPaths paths = installationPaths(temp.path());
+        const QByteArray java = syntheticPe(0x014c);
+        const QByteArray backend("backend");
+        const QByteArray provider = syntheticPe(0x014c);
+        QVERIFY(populateInstallation(paths, java, backend, provider));
+
+        QByteArray mismatchedProviderHash = sha256Hex(provider);
+        QCOMPARE(mismatchedProviderHash.size(), 64);
+        mismatchedProviderHash[0] = mismatchedProviderHash.at(0) == 'A'
+            ? 'B'
+            : 'A';
+        const Xc2ValidationPolicy policy = {
+            sha256Hex(backend),
+            mismatchedProviderHash,
+        };
+
+        const Xc2PrerequisiteReport report =
+            Xc2InstallationProbe::inspectForTest(
+                paths.root, policy, readerFor(paths.rootXml));
+        QVERIFY(hasIssueForPath(report,
+                                QStringLiteral("provider_hash_mismatch"),
+                                paths.providerDll));
+        QVERIFY(!hasIssue(report, QStringLiteral("backend_hash_mismatch")));
+        QVERIFY(!report.ok());
+    }
+
     void invalidHashPolicyIsBlocking()
     {
         QTemporaryDir temp;

@@ -37,6 +37,11 @@ option(RX14_KTM_XC2 "Enable KTM XC2 integration" ${RX14_KTM_XC2_DEFAULT})
 
 include(CTest)
 
+# romHEX14 does not consume Qt's optional Vulkan header surface.
+if(NOT DEFINED CMAKE_DISABLE_FIND_PACKAGE_WrapVulkanHeaders)
+    set(CMAKE_DISABLE_FIND_PACKAGE_WrapVulkanHeaders ON)
+endif()
+
 if(RX14_KTM_XC2)
     if(NOT WIN32)
         message(FATAL_ERROR "RX14_KTM_XC2 is supported only on Windows.")
