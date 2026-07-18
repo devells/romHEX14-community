@@ -256,6 +256,32 @@ have an idempotency classification and are never automatically repeated; the
 Task 5 foundation transport itself automatically repeats no request of any
 class.
 
+The first diagnostic slice freezes the served XC2 VCI contract more narrowly.
+`GET device/lookup` has no request body and returns a job object whose key is
+exactly `jobID`; `/topic/progress` uses the different key `jobId`. The client
+queues the Progress subscription before lookup. A `FINISHED` or `CANCELED`
+lookup terminal both continue to `GET device/get`, matching the served XC2
+frontend, while `ERROR` and `NOT_AUTHORIZED` fail. Progress may be observed
+before the REST acceptance, so the controller connects registry notifications
+first and checks the accepted record immediately after accepting the job ID.
+
+`GET device/get` returns an array of devices. `GET device/getSelected` returns a
+device or JSON null; empty 200/204 responses are treated as no selection until
+HIL evidence narrows the per-route behavior. `POST device/apply` and
+`POST device/close` send the complete four-field device JSON with
+`Content-Type: application/json`. The exact fields are `id`, `name`,
+`internalName`, and nullable `additionalModuleInformation`. Only 200/204 are
+accepted, empty bodies map to null, and every nonempty response must be valid
+JSON, including a legal top-level scalar. Device operations use a 30-second
+deadline and are never retried automatically.
+
+`/topic/vci/status` has the exact lowercase fields `voltage` and `connected`.
+Voltage is a finite JSON number already expressed in volts, including valid
+`0.0`; the Qt client performs no second scaling. Connected is a JSON boolean.
+The only approved provider short name is the case-sensitive
+`AVL Ditest VCI2K_DPDU_API`; matching that string in a real enumeration remains
+a HIL gate rather than a static-contract claim.
+
 ### 6.3 `Xc2StompClient`
 
 The STOMP client uses Qt WebSockets and implements the subset required by XC2:
@@ -344,14 +370,20 @@ does not infer operation ownership from job order.
 The controller is the single owner of UI-visible workflow state:
 
 ```text
-Unavailable
+Stopped
   -> BackendStarting
   -> BackendReady
+  -> SessionStarting
   -> SessionReady
+  -> VciLookup
+  -> VciApplying
   -> VciReady
+  -> VciClosing
   -> VehicleSelected
   -> EcuAvailable
   -> JobRunning
+
+Any nonrecoverable transition -> Failed
 ```
 
 It guards every command, closes open ECU sessions when leaving a vehicle, stops
@@ -361,6 +393,24 @@ The sidecar must report a current local user with the permissions required by
 the requested operation. The Qt client does not implement an authentication
 bypass. If the configured patched sidecar cannot establish its approved local
 session, state-changing features remain disabled and the failure is shown.
+
+The controller creates its own REST client from the manager's ownership-proved
+base, verifies the derived WebSocket authority still equals the manager's
+published authority, then performs `serviceStatus/status` followed by
+`auth/currentUser` on that same client. This order establishes the Cookie in
+the client that is subsequently passed to STOMP. The VCI slice requires the
+case-sensitive `EcuDiagnosticRead` permission.
+
+Each apply has a distinct selection epoch. `VciReady` requires apply HTTP
+success, a current-epoch selected-device confirmation with the same `id` and
+approved provider, and a `connected:true` status observed in the current STOMP
+generation and selection epoch; the latter two facts may arrive in either
+order. A status cached before apply cannot satisfy a new epoch. Invalid or
+unapproved candidates are rejected before any network write. A later
+`connected:false` or visibility loss immediately revokes readiness, with no
+hidden retry or reconnect. Stop aborts pending REST, aborts/disconnects STOMP,
+discards generation-persistent desired subscriptions, and only then stops the
+owned backend.
 
 ### 6.6 `KtmServiceWorkspace`
 
@@ -378,7 +428,9 @@ romHEX14 adds a `KTM Service` action and a native Qt workspace with these pages:
 
 The workspace shares the application's theme and translation infrastructure but
 does not couple diagnostic state to `MainWindow` internals. `MainWindow` owns
-only the action and workspace lifetime.
+only the action and workspace lifetime. It is modeless and persistent: closing
+the window hides it rather than destroying the controller or sidecar; explicit
+application shutdown owns teardown.
 
 ### 6.7 `KtmFlowRenderer`
 
@@ -444,12 +496,18 @@ The journal is diagnostic evidence, not a generic resume token.
 2. Validate sidecar and D-PDU prerequisites.
 3. Start the approved sidecar on a private loopback port.
 4. Wait for health readiness.
-5. Establish REST session and verify current-user permissions.
-6. Connect STOMP and initially subscribe only to `/topic/vci/status` and
-   `/topic/login`; later controllers add other approved topics when their
-   workflow becomes active.
+5. On the controller-owned REST client, repeat health, establish its Cookie,
+   then verify current-user permissions.
+6. Connect STOMP with that same REST client and queue `/topic/vci/status`,
+   `/topic/login`, and `/topic/progress`. Do not start lookup until the local
+   Progress `subscriptionSent` event; it proves only that SUBSCRIBE was queued,
+   not that a server receipt was received.
 7. Discover and select VCI2K.
 8. Enable vehicle operations only after `VciReady`.
+
+This controller-specific Progress subscription does not broaden the optional
+foundation probe: `foundationProbeTopics()` remains limited to VCI status and
+login because that probe never performs device lookup or starts a job.
 
 ### 7.2 Vehicle and ECU
 
@@ -579,8 +637,10 @@ creates the CMake file API query
 `CMakeCache.txt` that the exact entry `RX14_KTM_XC2:BOOL=OFF` is present and
 that neither `Qt6Test_DIR` nor `Qt6WebSockets_DIR` is present. It must also prove
 from the returned codemodel-v2 reply that no target name matches `(ktm|xc2)`
-case-insensitively. Each then performs the full build with
-`cmake --build build --parallel` and runs unfiltered CTest with
+case-insensitively. Linux performs the full build with the intentionally
+unbounded `cmake --build build --parallel`. The macOS job has a 45-minute job
+timeout and bounds its full build to three workers with
+`cmake --build build --parallel 3`. Both run unfiltered CTest with
 `ctest --test-dir build --output-on-failure`.
 
 Configuration stores only paths and user preferences. Firmware, XC2 JARs,
