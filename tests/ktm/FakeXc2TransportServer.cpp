@@ -17,6 +17,9 @@
 
 namespace {
 
+constexpr qsizetype kMaxHttpHeaderBytes = 64 * 1024;
+constexpr qint64 kMaxScriptBodyBytes = 64 * 1024;
+
 bool headerEquals(const QByteArray &left, const QByteArray &right)
 {
     return left.compare(right, Qt::CaseInsensitive) == 0;
@@ -100,11 +103,60 @@ bool targetMatchesProfilePath(const QByteArray &target,
     return !value.contains('/');
 }
 
+bool decimalBytes(const QByteArray &value)
+{
+    if (value.isEmpty())
+        return false;
+    for (const char byte : value) {
+        if (byte < '0' || byte > '9')
+            return false;
+    }
+    return true;
+}
+
+bool stompFramesEqual(const ktm::xc2::Xc2StompFrame &left,
+                      const ktm::xc2::Xc2StompFrame &right)
+{
+    return left.command == right.command && left.headers == right.headers
+        && left.body == right.body;
+}
+
+QByteArray scriptedHttpResponse(
+    const FakeXc2TransportServer::Action &action)
+{
+    QByteArray response = QByteArrayLiteral("HTTP/1.1 ")
+        + QByteArray::number(action.status) + ' ' + action.reason
+        + QByteArrayLiteral("\r\n");
+    for (const auto &header : action.headers) {
+        response += header.first + QByteArrayLiteral(": ") + header.second
+            + QByteArrayLiteral("\r\n");
+    }
+    if (action.status != 204) {
+        response += QByteArrayLiteral("Content-Length: ")
+            + QByteArray::number(action.body.size())
+            + QByteArrayLiteral("\r\n");
+    }
+    response += QByteArrayLiteral("Connection: close\r\n\r\n");
+    if (action.status != 204)
+        response += action.body;
+    return response;
+}
+
 } // namespace
 
 struct FakeXc2TransportServer::RawConnection {
     QTcpSocket *socket = nullptr;
     bool decided = false;
+    bool framingViolationRecorded = false;
+    quint64 id = 0;
+};
+
+struct FakeXc2TransportServer::PendingAction {
+    Action action;
+    QTimer *timer = nullptr;
+    QPointer<QTcpSocket> httpSocket;
+    QPointer<QWebSocket> webSocket;
+    quint64 connectionId = 0;
 };
 
 QByteArray FakeXc2HttpRequest::headerValue(const QByteArray &name) const
@@ -167,6 +219,14 @@ FakeXc2TransportServer::FakeXc2TransportServer(QObject *parent)
 
 FakeXc2TransportServer::~FakeXc2TransportServer()
 {
+    for (PendingAction *pending : std::as_const(m_pendingActions)) {
+        if (pending->timer) {
+            pending->timer->stop();
+            delete pending->timer;
+        }
+        delete pending;
+    }
+    m_pendingActions.clear();
     for (RawConnection *connection : std::as_const(m_rawConnections)) {
         if (connection->socket)
             connection->socket->disconnect(this);
@@ -253,6 +313,31 @@ int FakeXc2TransportServer::unexpectedOperationCount() const
     return m_unexpectedOperationCount;
 }
 
+int FakeXc2TransportServer::pendingActionCount() const
+{
+    return m_pendingActions.size();
+}
+
+int FakeXc2TransportServer::canceledActionCount() const
+{
+    return m_canceledActionCount;
+}
+
+int FakeXc2TransportServer::liveSocketObjectCount() const
+{
+    int count = m_rawConnections.size() + m_webSockets.size();
+    for (const QPointer<QObject> &retired : m_retiredSocketObjects) {
+        if (retired)
+            ++count;
+    }
+    return count;
+}
+
+bool FakeXc2TransportServer::scriptExhausted() const
+{
+    return m_scriptEnabled && m_scriptPhaseIndex >= m_script.size();
+}
+
 int FakeXc2TransportServer::terminalBurstExecutionCount() const
 {
     return m_terminalBurstExecutionCount;
@@ -317,15 +402,20 @@ const QList<ktm::xc2::Xc2Error> &FakeXc2TransportServer::decodeErrors() const
     return m_decodeErrors;
 }
 
+const QList<FakeXc2TransportServer::TraceEvent> &
+FakeXc2TransportServer::trace() const
+{
+    return m_trace;
+}
+
 QUrl FakeXc2TransportServer::requestUrl() const
 {
-    return m_webSockets.isEmpty() ? QUrl() : m_webSockets.constLast()->requestUrl();
+    return m_lastRequestUrl;
 }
 
 QString FakeXc2TransportServer::negotiatedSubprotocol() const
 {
-    return m_webSockets.isEmpty()
-        ? QString() : m_webSockets.constLast()->subprotocol();
+    return m_lastNegotiatedSubprotocol;
 }
 
 QWebSocketProtocol::CloseCode
@@ -385,45 +475,119 @@ void FakeXc2TransportServer::setProbeDelayMs(int delayMs)
     m_probeDelayMs = qMax(0, delayMs);
 }
 
+bool FakeXc2TransportServer::setScript(QList<ScriptPhase> phases,
+                                       QString *error)
+{
+    const auto fail = [error](const QString &message) {
+        if (error)
+            *error = message;
+        return false;
+    };
+    if (m_probeScript != ProbeScript::Disabled) {
+        return fail(QStringLiteral(
+            "The general script cannot be combined with ProbeScript"));
+    }
+    if (!m_pendingActions.isEmpty()) {
+        return fail(QStringLiteral(
+            "The script cannot change while actions are pending"));
+    }
+
+    QSet<QString> labels;
+    for (const ScriptPhase &phase : std::as_const(phases)) {
+        if (phase.label.trimmed().isEmpty() || phase.expectations.isEmpty()) {
+            return fail(QStringLiteral(
+                "Every script phase needs a name and expectation"));
+        }
+        QSet<QString> phaseLabels;
+        for (const Expectation &expectation : phase.expectations) {
+            if (expectation.label.trimmed().isEmpty()
+                || labels.contains(expectation.label)) {
+                return fail(QStringLiteral(
+                    "Expectation labels must be nonempty and globally unique"));
+            }
+            labels.insert(expectation.label);
+            phaseLabels.insert(expectation.label);
+            if (expectation.protocol == Expectation::Protocol::Http
+                && (expectation.method.isEmpty()
+                    || expectation.target.isEmpty())) {
+                return fail(QStringLiteral(
+                    "HTTP expectations require method and target"));
+            }
+            if (expectation.protocol == Expectation::Protocol::Stomp
+                && expectation.stompFrame.command.isEmpty()) {
+                return fail(QStringLiteral(
+                    "STOMP expectations require a command"));
+            }
+        }
+        for (const Action &action : phase.completionActions) {
+            if (action.target == Action::Target::ExpectationSocket
+                && !phaseLabels.contains(action.targetExpectation)) {
+                return fail(QStringLiteral(
+                    "Completion action target is outside its phase"));
+            }
+        }
+    }
+
+    m_script = std::move(phases);
+    m_scriptPhaseIndex = 0;
+    m_consumedExpectations.clear();
+    m_phaseHttpSockets.clear();
+    m_phaseWebSockets.clear();
+    m_phaseConnectionIds.clear();
+    m_scriptEnabled = true;
+    if (error)
+        error->clear();
+    return true;
+}
+
+bool FakeXc2TransportServer::performAction(const Action &action)
+{
+    QWebSocket *webSocket = nullptr;
+    QTcpSocket *httpSocket = nullptr;
+    quint64 connectionId = 0;
+    if (action.target == Action::Target::WebSocket) {
+        webSocket = activeWebSocket();
+        connectionId = m_webSocketIds.value(webSocket);
+    } else if (action.target == Action::Target::ExpectationSocket) {
+        httpSocket = m_phaseHttpSockets.value(action.targetExpectation);
+        webSocket = m_phaseWebSockets.value(action.targetExpectation);
+        connectionId = m_phaseConnectionIds.value(action.targetExpectation);
+    }
+    return scheduleAction(action, httpSocket, webSocket, connectionId);
+}
+
 bool FakeXc2TransportServer::sendText(const QByteArray &payload)
 {
-    if (m_webSockets.isEmpty())
+    QWebSocket *const socket = activeWebSocket();
+    if (!socket)
         return false;
     const QString message = QString::fromUtf8(payload);
-    return m_webSockets.constLast()->sendTextMessage(message)
+    return socket->sendTextMessage(message)
         == message.toUtf8().size();
 }
 
 bool FakeXc2TransportServer::sendBinary(const QByteArray &payload)
 {
-    if (m_webSockets.isEmpty())
+    QWebSocket *const socket = activeWebSocket();
+    if (!socket)
         return false;
-    return m_webSockets.constLast()->sendBinaryMessage(payload) == payload.size();
+    return socket->sendBinaryMessage(payload) == payload.size();
 }
 
 bool FakeXc2TransportServer::sendFrame(
     const ktm::xc2::Xc2StompFrame &frame, bool binary)
 {
-    const QByteArray payload = ktm::xc2::Xc2StompCodec::encode(frame);
-    const bool sent = binary ? sendBinary(payload) : sendText(payload);
-    if (sent)
-        m_sentStompFrames.append(frame);
-    return sent;
+    return sendFrameTo(activeWebSocket(), frame, binary);
 }
 
 bool FakeXc2TransportServer::sendFrameAndClose(
     const ktm::xc2::Xc2StompFrame &frame,
     QWebSocketProtocol::CloseCode closeCode)
 {
-    if (m_webSockets.isEmpty())
+    QWebSocket *const socket = activeWebSocket();
+    if (!socket)
         return false;
-    QWebSocket *const socket = m_webSockets.constLast();
-    const QByteArray payload = ktm::xc2::Xc2StompCodec::encode(frame);
-    const QString message = QString::fromUtf8(payload);
-    const bool queued = socket->sendTextMessage(message)
-        == message.toUtf8().size();
-    if (queued)
-        m_sentStompFrames.append(frame);
+    const bool queued = sendFrameTo(socket, frame);
     socket->close(closeCode,
                   QStringLiteral("scripted close"));
     return queued;
@@ -431,13 +595,33 @@ bool FakeXc2TransportServer::sendFrameAndClose(
 
 void FakeXc2TransportServer::closeWebSocket(int delayMs)
 {
-    if (m_webSockets.isEmpty())
+    QWebSocket *socket = activeWebSocket();
+    if (!socket)
         return;
-    QWebSocket *socket = m_webSockets.constLast();
-    QTimer::singleShot(qMax(0, delayMs), socket, [socket] {
-        socket->close(QWebSocketProtocol::CloseCodeNormal,
+    const QPointer<QWebSocket> guarded(socket);
+    QTimer::singleShot(qMax(0, delayMs), socket, [guarded] {
+        if (!guarded)
+            return;
+        guarded->close(QWebSocketProtocol::CloseCodeNormal,
                       QStringLiteral("scripted close"));
     });
+}
+
+bool FakeXc2TransportServer::sendFrameTo(
+    QWebSocket *socket, const ktm::xc2::Xc2StompFrame &frame, bool binary)
+{
+    if (!socket
+        || socket->state() != QAbstractSocket::ConnectedState) {
+        return false;
+    }
+    const QByteArray payload = ktm::xc2::Xc2StompCodec::encode(frame);
+    const bool sent = binary
+        ? socket->sendBinaryMessage(payload) == payload.size()
+        : socket->sendTextMessage(QString::fromUtf8(payload))
+            == QString::fromUtf8(payload).toUtf8().size();
+    if (sent)
+        m_sentStompFrames.append(frame);
+    return sent;
 }
 
 void FakeXc2TransportServer::acceptConnections()
@@ -447,14 +631,28 @@ void FakeXc2TransportServer::acceptConnections()
         if (!m_connectionElapsed.isValid())
             m_connectionElapsed.start();
         ++m_connectionCount;
-        auto *connection = new RawConnection{socket, false};
+        auto *connection = new RawConnection{
+            socket, false, false, m_nextConnectionId++};
         m_rawConnections.append(connection);
         connect(socket, &QTcpSocket::readyRead, this,
                 [this, socket] { inspect(socket); });
         connect(socket, &QTcpSocket::disconnected, this, [this, connection] {
             QTcpSocket *const socket = connection->socket;
+            if (m_scriptEnabled && !connection->decided
+                && !connection->framingViolationRecorded) {
+                connection->framingViolationRecorded = true;
+                ++m_unexpectedOperationCount;
+                TraceEvent event;
+                event.direction = TraceEvent::Direction::Received;
+                event.protocol = Expectation::Protocol::Http;
+                event.connectionId = connection->id;
+                event.label = QStringLiteral("invalid-http-eof");
+                appendTrace(std::move(event));
+            }
+            cancelPendingActions(socket);
             if (m_rawConnections.removeOne(connection)) {
                 delete connection;
+                m_retiredSocketObjects.append(QPointer<QObject>(socket));
                 socket->deleteLater();
             }
             emit connectionClosed();
@@ -475,20 +673,47 @@ void FakeXc2TransportServer::inspect(QTcpSocket *socket)
             break;
         }
     }
-    if (!connection || connection->decided)
+    if (!connection)
         return;
-
-    const QByteArray bytes = socket->peek(64 * 1024 + 1);
-    const qsizetype marker = bytes.indexOf("\r\n\r\n");
-    if (marker < 0) {
-        if (bytes.size() > 64 * 1024) {
-            connection->decided = true;
+    if (connection->decided) {
+        if (m_scriptEnabled && !connection->framingViolationRecorded
+            && socket->bytesAvailable() > 0) {
+            connection->framingViolationRecorded = true;
+            ++m_unexpectedOperationCount;
+            TraceEvent event;
+            event.direction = TraceEvent::Direction::Received;
+            event.protocol = Expectation::Protocol::Http;
+            event.connectionId = connection->id;
+            event.label = QStringLiteral("invalid-http-tail");
+            event.http.body = socket->readAll();
+            appendTrace(std::move(event));
             socket->abort();
         }
         return;
     }
-    if (marker > 64 * 1024) {
+
+    const qsizetype peekLimit = m_scriptEnabled
+        ? kMaxHttpHeaderBytes + kMaxScriptBodyBytes + 1
+        : kMaxHttpHeaderBytes + 1;
+    const QByteArray bytes = socket->peek(peekLimit);
+    const qsizetype marker = bytes.indexOf("\r\n\r\n");
+    if (marker < 0) {
+        if (bytes.size() > kMaxHttpHeaderBytes) {
+            connection->decided = true;
+            if (m_scriptEnabled) {
+                connection->framingViolationRecorded = true;
+                ++m_unexpectedOperationCount;
+            }
+            socket->abort();
+        }
+        return;
+    }
+    if (marker > kMaxHttpHeaderBytes) {
         connection->decided = true;
+        if (m_scriptEnabled) {
+            connection->framingViolationRecorded = true;
+            ++m_unexpectedOperationCount;
+        }
         socket->abort();
         return;
     }
@@ -498,12 +723,30 @@ void FakeXc2TransportServer::inspect(QTcpSocket *socket)
     qint64 contentLength = 0;
     const QList<QByteArray> contentLengths =
         request.headerValues(QByteArrayLiteral("Content-Length"));
+    const bool strictLengthFailure = m_scriptEnabled
+        && (contentLengths.size() > 1
+            || !request.headerValues(
+                    QByteArrayLiteral("Transfer-Encoding")).isEmpty());
+    if (strictLengthFailure) {
+        connection->decided = true;
+        connection->framingViolationRecorded = true;
+        ++m_unexpectedOperationCount;
+        socket->abort();
+        return;
+    }
     if (!contentLengths.isEmpty()) {
         bool lengthOk = false;
         contentLength = contentLengths.constFirst().toLongLong(&lengthOk);
-        if (!lengthOk || contentLength < 0
-            || contentLength > 8 * 1024 * 1024) {
+        const qint64 maximum = m_scriptEnabled
+            ? kMaxScriptBodyBytes : 8 * 1024 * 1024;
+        if (!lengthOk || contentLength < 0 || contentLength > maximum
+            || (m_scriptEnabled
+                && !decimalBytes(contentLengths.constFirst()))) {
             connection->decided = true;
+            if (m_scriptEnabled) {
+                connection->framingViolationRecorded = true;
+                ++m_unexpectedOperationCount;
+            }
             socket->abort();
             return;
         }
@@ -518,12 +761,42 @@ void FakeXc2TransportServer::inspect(QTcpSocket *socket)
                QByteArrayLiteral("websocket"), Qt::CaseInsensitive) == 0;
     const bool isUpgrade = requestsUpgrade
         && request.method == QByteArrayLiteral("GET");
+    if (m_scriptEnabled
+        && (bytes.size() != totalRequestBytes
+            || !validateScriptHttp(request, isUpgrade))) {
+        connection->decided = true;
+        connection->framingViolationRecorded = true;
+        ++m_unexpectedOperationCount;
+        TraceEvent event;
+        event.direction = TraceEvent::Direction::Received;
+        event.protocol = Expectation::Protocol::Http;
+        event.connectionId = connection->id;
+        event.label = QStringLiteral("invalid-http");
+        event.http = request;
+        appendTrace(std::move(event));
+        socket->abort();
+        return;
+    }
     connection->decided = true;
 
     if (!isUpgrade) {
         socket->read(totalRequestBytes);
         m_capturedRestRequests.append(request);
         classifyRestOperation(request);
+        if (m_scriptEnabled) {
+            const QPointer<FakeXc2TransportServer> guard(this);
+            const bool consumed = consumeScriptHttp(
+                socket, request, false, connection->id);
+            if (!guard)
+                return;
+            if (!consumed) {
+                ++m_unexpectedOperationCount;
+                socket->abort();
+            } else {
+                m_restRequests.append(request);
+            }
+            return;
+        }
         const bool healthTarget = request.target
             == QByteArrayLiteral("/xc2/1.0/serviceStatus/status");
         const bool currentUserTarget = request.target
@@ -566,10 +839,23 @@ void FakeXc2TransportServer::inspect(QTcpSocket *socket)
             ++m_unexpectedOperationCount;
     }
     m_upgradeRequests.append(request);
-    const QPointer<FakeXc2TransportServer> guard(this);
-    emit upgradeRequestCaptured();
-    if (guard.isNull())
-        return;
+    if (m_scriptEnabled) {
+        const QPointer<FakeXc2TransportServer> guard(this);
+        const bool consumed = consumeScriptHttp(
+            socket, request, true, connection->id);
+        if (!guard)
+            return;
+        if (!consumed) {
+            ++m_unexpectedOperationCount;
+            socket->abort();
+            return;
+        }
+    } else {
+        const QPointer<FakeXc2TransportServer> guard(this);
+        emit upgradeRequestCaptured();
+        if (guard.isNull())
+            return;
+    }
     if (m_upgradeMode == UpgradeMode::NoResponse)
         return;
     if (m_upgradeMode == UpgradeMode::Redirect) {
@@ -620,8 +906,444 @@ void FakeXc2TransportServer::inspect(QTcpSocket *socket)
 
     socket->disconnect(this);
     m_rawConnections.removeOne(connection);
+    m_pendingUpgradeConnectionIds.append(connection->id);
     delete connection;
     m_webSocketServer->handleConnection(socket);
+}
+
+bool FakeXc2TransportServer::validateScriptHttp(
+    const FakeXc2HttpRequest &request, bool upgrade) const
+{
+    if (request.version != QByteArrayLiteral("HTTP/1.1"))
+        return false;
+    const QByteArray expectedHost = QByteArrayLiteral("127.0.0.1:")
+        + QByteArray::number(port());
+    if (request.headerValues(QByteArrayLiteral("Host"))
+        != QList<QByteArray>{expectedHost}) {
+        return false;
+    }
+    if (request.headerValues(QByteArrayLiteral("Cookie")).size() > 1
+        || request.headerValues(QByteArrayLiteral("Content-Type")).size() > 1
+        || request.headerValues(QByteArrayLiteral("Content-Length")).size() > 1
+        || !request.headerValues(
+                QByteArrayLiteral("Transfer-Encoding")).isEmpty()) {
+        return false;
+    }
+    if (request.method == QByteArrayLiteral("GET")) {
+        return request.body.isEmpty()
+            && request.headerValues(
+                    QByteArrayLiteral("Content-Length")).isEmpty()
+            && request.headerValues(
+                    QByteArrayLiteral("Content-Type")).isEmpty();
+    }
+    if (upgrade || request.method != QByteArrayLiteral("POST"))
+        return false;
+    const QList<QByteArray> contentTypes =
+        request.headerValues(QByteArrayLiteral("Content-Type"));
+    const QList<QByteArray> contentLengths =
+        request.headerValues(QByteArrayLiteral("Content-Length"));
+    return contentTypes
+            == QList<QByteArray>{QByteArrayLiteral("application/json")}
+        && contentLengths
+            == QList<QByteArray>{QByteArray::number(request.body.size())}
+        && request.body.size() <= kMaxScriptBodyBytes;
+}
+
+bool FakeXc2TransportServer::consumeScriptHttp(
+    QTcpSocket *socket, const FakeXc2HttpRequest &request,
+    bool upgrade, quint64 connectionId)
+{
+    if (m_scriptPhaseIndex >= m_script.size()) {
+        TraceEvent event;
+        event.direction = TraceEvent::Direction::Received;
+        event.protocol = Expectation::Protocol::Http;
+        event.connectionId = connectionId;
+        event.label = QStringLiteral("unexpected-http");
+        event.http = request;
+        appendTrace(std::move(event));
+        return false;
+    }
+    const ScriptPhase &phase = m_script.at(m_scriptPhaseIndex);
+    const auto matches = [&request, upgrade](const Expectation &expectation) {
+        if (expectation.protocol != Expectation::Protocol::Http
+            || expectation.webSocketUpgrade != upgrade
+            || expectation.method != request.method
+            || expectation.target != request.target
+            || expectation.body != request.body) {
+            return false;
+        }
+        for (const auto &expected : expectation.headers) {
+            if (request.headerValues(expected.first)
+                != QList<QByteArray>{expected.second}) {
+                return false;
+            }
+        }
+        for (const QByteArray &absent : expectation.absentHeaders) {
+            if (!request.headerValues(absent).isEmpty())
+                return false;
+        }
+        return true;
+    };
+
+    int index = -1;
+    if (phase.unordered) {
+        for (int candidate = 0; candidate < phase.expectations.size();
+             ++candidate) {
+            if (!m_consumedExpectations.contains(candidate)
+                && matches(phase.expectations.at(candidate))) {
+                index = candidate;
+                break;
+            }
+        }
+    } else {
+        for (int candidate = 0; candidate < phase.expectations.size();
+             ++candidate) {
+            if (!m_consumedExpectations.contains(candidate)) {
+                if (matches(phase.expectations.at(candidate)))
+                    index = candidate;
+                break;
+            }
+        }
+    }
+    if (index < 0) {
+        TraceEvent event;
+        event.direction = TraceEvent::Direction::Received;
+        event.protocol = Expectation::Protocol::Http;
+        event.connectionId = connectionId;
+        event.label = QStringLiteral("unexpected-http");
+        event.http = request;
+        appendTrace(std::move(event));
+        return false;
+    }
+    return consumeExpectation(phase.expectations.at(index), index,
+                              socket, nullptr, connectionId,
+                              &request, nullptr);
+}
+
+bool FakeXc2TransportServer::consumeScriptStomp(
+    QWebSocket *socket, const ktm::xc2::Xc2StompFrame &frame,
+    quint64 connectionId)
+{
+    if (m_scriptPhaseIndex >= m_script.size()) {
+        TraceEvent event;
+        event.direction = TraceEvent::Direction::Received;
+        event.protocol = Expectation::Protocol::Stomp;
+        event.connectionId = connectionId;
+        event.label = QStringLiteral("unexpected-stomp");
+        event.stompFrame = frame;
+        appendTrace(std::move(event));
+        return false;
+    }
+    const ScriptPhase &phase = m_script.at(m_scriptPhaseIndex);
+    const auto matches = [&frame](const Expectation &expectation) {
+        return expectation.protocol == Expectation::Protocol::Stomp
+            && stompFramesEqual(expectation.stompFrame, frame);
+    };
+    int index = -1;
+    if (phase.unordered) {
+        for (int candidate = 0; candidate < phase.expectations.size();
+             ++candidate) {
+            if (!m_consumedExpectations.contains(candidate)
+                && matches(phase.expectations.at(candidate))) {
+                index = candidate;
+                break;
+            }
+        }
+    } else {
+        for (int candidate = 0; candidate < phase.expectations.size();
+             ++candidate) {
+            if (!m_consumedExpectations.contains(candidate)) {
+                if (matches(phase.expectations.at(candidate)))
+                    index = candidate;
+                break;
+            }
+        }
+    }
+    if (index < 0) {
+        TraceEvent event;
+        event.direction = TraceEvent::Direction::Received;
+        event.protocol = Expectation::Protocol::Stomp;
+        event.connectionId = connectionId;
+        event.label = QStringLiteral("unexpected-stomp");
+        event.stompFrame = frame;
+        appendTrace(std::move(event));
+        return false;
+    }
+    return consumeExpectation(phase.expectations.at(index), index,
+                              nullptr, socket, connectionId,
+                              nullptr, &frame);
+}
+
+bool FakeXc2TransportServer::consumeExpectation(
+    const Expectation &expectation, int index,
+    QTcpSocket *httpSocket, QWebSocket *webSocket,
+    quint64 connectionId, const FakeXc2HttpRequest *request,
+    const ktm::xc2::Xc2StompFrame *frame)
+{
+    if (m_scriptPhaseIndex >= m_script.size())
+        return false;
+    const qsizetype phaseIndex = m_scriptPhaseIndex;
+    const ScriptPhase &phase = m_script.at(phaseIndex);
+    const QList<Action> expectationActions = expectation.actions;
+    const QPointer<QTcpSocket> guardedHttpSocket(httpSocket);
+    const QPointer<QWebSocket> guardedWebSocket(webSocket);
+    m_consumedExpectations.insert(index);
+    m_phaseHttpSockets.insert(expectation.label, httpSocket);
+    m_phaseWebSockets.insert(expectation.label, webSocket);
+    m_phaseConnectionIds.insert(expectation.label, connectionId);
+
+    TraceEvent event;
+    event.direction = TraceEvent::Direction::Received;
+    event.protocol = expectation.protocol;
+    event.connectionId = connectionId;
+    event.label = expectation.label;
+    if (request)
+        event.http = *request;
+    if (frame)
+        event.stompFrame = *frame;
+    appendTrace(std::move(event));
+
+    const bool complete =
+        m_consumedExpectations.size() == phase.expectations.size();
+    const QList<Action> completionActions = complete
+        ? phase.completionActions : QList<Action>{};
+    QStringList completedLabels;
+    if (complete) {
+        for (const Expectation &member : phase.expectations)
+            completedLabels.append(member.label);
+        ++m_scriptPhaseIndex;
+        m_consumedExpectations.clear();
+    }
+
+    const QPointer<FakeXc2TransportServer> guard(this);
+    if (expectation.protocol == Expectation::Protocol::Http) {
+        if (expectation.webSocketUpgrade)
+            emit upgradeRequestCaptured();
+        else
+            emit restRequestCaptured();
+    } else {
+        emit stompFrameReceived();
+    }
+    if (!guard)
+        return true;
+
+    runActions(expectationActions, guardedHttpSocket.data(),
+               guardedWebSocket.data(), connectionId);
+    if (!guard)
+        return true;
+    runActions(completionActions, guardedHttpSocket.data(),
+               guardedWebSocket.data(), connectionId);
+    if (!guard)
+        return true;
+    for (const QString &label : std::as_const(completedLabels)) {
+        m_phaseHttpSockets.remove(label);
+        m_phaseWebSockets.remove(label);
+        m_phaseConnectionIds.remove(label);
+    }
+    return true;
+}
+
+void FakeXc2TransportServer::runActions(
+    const QList<Action> &actions, QTcpSocket *eventHttpSocket,
+    QWebSocket *eventWebSocket, quint64 eventConnectionId)
+{
+    const QPointer<QTcpSocket> guardedEventHttpSocket(eventHttpSocket);
+    const QPointer<QWebSocket> guardedEventWebSocket(eventWebSocket);
+    for (const Action &action : actions) {
+        QPointer<QTcpSocket> httpSocket;
+        QPointer<QWebSocket> webSocket;
+        quint64 connectionId = eventConnectionId;
+        if (action.target == Action::Target::EventSocket) {
+            httpSocket = guardedEventHttpSocket;
+            webSocket = guardedEventWebSocket;
+        } else if (action.target == Action::Target::WebSocket) {
+            webSocket = guardedEventWebSocket
+                ? guardedEventWebSocket.data() : activeWebSocket();
+            connectionId = m_webSocketIds.value(webSocket.data());
+        } else {
+            httpSocket = m_phaseHttpSockets.value(action.targetExpectation);
+            webSocket = m_phaseWebSockets.value(action.targetExpectation);
+            connectionId =
+                m_phaseConnectionIds.value(action.targetExpectation);
+        }
+        const QPointer<FakeXc2TransportServer> owner(this);
+        const bool scheduled = scheduleAction(
+            action, httpSocket.data(), webSocket.data(), connectionId);
+        if (!owner)
+            return;
+        if (!scheduled)
+            ++m_unexpectedOperationCount;
+    }
+}
+
+bool FakeXc2TransportServer::scheduleAction(
+    const Action &action, QTcpSocket *httpSocket,
+    QWebSocket *webSocket, quint64 connectionId)
+{
+    const bool needsHttp = action.type == Action::Type::HttpResponse
+        || action.type == Action::Type::CloseHttp;
+    const bool needsWebSocket = action.type == Action::Type::SendStompFrame
+        || action.type == Action::Type::CloseWebSocket;
+    if ((needsHttp && !httpSocket) || (needsWebSocket && !webSocket)) {
+        TraceEvent event;
+        event.direction = TraceEvent::Direction::Canceled;
+        event.protocol = needsHttp ? Expectation::Protocol::Http
+                                   : Expectation::Protocol::Stomp;
+        event.connectionId = connectionId;
+        event.label = action.label;
+        event.stompFrame = action.stompFrame;
+        appendTrace(std::move(event));
+        ++m_canceledActionCount;
+        return false;
+    }
+    if (action.delayMs <= 0) {
+        return executeAction(action, httpSocket, webSocket,
+                             connectionId);
+    }
+
+    auto *pending = new PendingAction;
+    pending->action = action;
+    pending->httpSocket = httpSocket;
+    pending->webSocket = webSocket;
+    pending->connectionId = connectionId;
+    pending->timer = new QTimer(this);
+    pending->timer->setSingleShot(true);
+    pending->timer->setTimerType(Qt::PreciseTimer);
+    m_pendingActions.append(pending);
+    connect(pending->timer, &QTimer::timeout, this, [this, pending] {
+        if (!m_pendingActions.removeOne(pending))
+            return;
+        QTimer *const timer = pending->timer;
+        pending->timer = nullptr;
+        executeAction(pending->action, pending->httpSocket,
+                      pending->webSocket, pending->connectionId);
+        timer->deleteLater();
+        delete pending;
+    });
+    pending->timer->start(action.delayMs);
+    return true;
+}
+
+bool FakeXc2TransportServer::executeAction(
+    const Action &action, QTcpSocket *httpSocket,
+    QWebSocket *webSocket, quint64 connectionId)
+{
+    const bool httpConnected = httpSocket
+        && httpSocket->state() != QAbstractSocket::UnconnectedState;
+    const bool webSocketConnected = webSocket
+        && webSocket->state() == QAbstractSocket::ConnectedState;
+    const bool needsHttp = action.type == Action::Type::HttpResponse
+        || action.type == Action::Type::CloseHttp;
+    const bool needsWebSocket = action.type == Action::Type::SendStompFrame
+        || action.type == Action::Type::CloseWebSocket;
+    if ((needsHttp && !httpConnected)
+        || (needsWebSocket && !webSocketConnected)) {
+        TraceEvent canceled;
+        canceled.direction = TraceEvent::Direction::Canceled;
+        canceled.protocol = needsHttp ? Expectation::Protocol::Http
+                                      : Expectation::Protocol::Stomp;
+        canceled.connectionId = connectionId;
+        canceled.label = action.label;
+        canceled.stompFrame = action.stompFrame;
+        appendTrace(std::move(canceled));
+        ++m_canceledActionCount;
+        return false;
+    }
+
+    TraceEvent event;
+    event.direction = TraceEvent::Direction::Sent;
+    event.protocol = needsHttp ? Expectation::Protocol::Http
+                               : Expectation::Protocol::Stomp;
+    event.connectionId = connectionId;
+    event.label = action.label;
+    event.stompFrame = action.stompFrame;
+    appendTrace(std::move(event));
+
+    if (action.type == Action::Type::HttpResponse) {
+        const QByteArray response = scriptedHttpResponse(action);
+        const bool written = httpSocket->write(response) == response.size();
+        if (written)
+            m_restResponses.append(response);
+        httpSocket->disconnectFromHost();
+        return written;
+    }
+    if (action.type == Action::Type::SendStompFrame)
+        return sendFrameTo(webSocket, action.stompFrame, action.binary);
+    if (action.type == Action::Type::CloseHttp) {
+        httpSocket->abort();
+        return true;
+    }
+    webSocket->close(action.closeCode, action.closeReason);
+    return true;
+}
+
+void FakeXc2TransportServer::cancelPendingActions(QTcpSocket *socket)
+{
+    const QList<PendingAction *> pending = m_pendingActions;
+    for (PendingAction *action : pending) {
+        if (action->httpSocket != socket)
+            continue;
+        if (!m_pendingActions.removeOne(action))
+            continue;
+        if (action->timer) {
+            action->timer->stop();
+            action->timer->deleteLater();
+        }
+        TraceEvent event;
+        event.direction = TraceEvent::Direction::Canceled;
+        event.protocol = Expectation::Protocol::Http;
+        event.connectionId = action->connectionId;
+        event.label = action->action.label;
+        appendTrace(std::move(event));
+        ++m_canceledActionCount;
+        delete action;
+    }
+}
+
+void FakeXc2TransportServer::cancelPendingActions(QWebSocket *socket)
+{
+    const QList<PendingAction *> pending = m_pendingActions;
+    for (PendingAction *action : pending) {
+        if (action->webSocket != socket)
+            continue;
+        if (!m_pendingActions.removeOne(action))
+            continue;
+        if (action->timer) {
+            action->timer->stop();
+            action->timer->deleteLater();
+        }
+        TraceEvent event;
+        event.direction = TraceEvent::Direction::Canceled;
+        event.protocol = Expectation::Protocol::Stomp;
+        event.connectionId = action->connectionId;
+        event.label = action->action.label;
+        event.stompFrame = action->action.stompFrame;
+        appendTrace(std::move(event));
+        ++m_canceledActionCount;
+        delete action;
+    }
+}
+
+void FakeXc2TransportServer::appendTrace(TraceEvent event)
+{
+    event.sequence = m_nextTraceSequence++;
+    m_trace.append(std::move(event));
+}
+
+QWebSocket *FakeXc2TransportServer::activeWebSocket() const
+{
+    if (m_activeWebSocket
+        && m_activeWebSocket->state() == QAbstractSocket::ConnectedState) {
+        return m_activeWebSocket;
+    }
+    for (auto iterator = m_webSockets.crbegin();
+         iterator != m_webSockets.crend(); ++iterator) {
+        if (*iterator
+            && (*iterator)->state() == QAbstractSocket::ConnectedState) {
+            return *iterator;
+        }
+    }
+    return nullptr;
 }
 
 void FakeXc2TransportServer::respondToRest(
@@ -849,9 +1571,16 @@ void FakeXc2TransportServer::acceptWebSockets()
     while (m_webSocketServer->hasPendingConnections()) {
         QWebSocket *socket = m_webSocketServer->nextPendingConnection();
         socket->setParent(this);
+        const quint64 connectionId = m_pendingUpgradeConnectionIds.isEmpty()
+            ? m_nextConnectionId++
+            : m_pendingUpgradeConnectionIds.takeFirst();
         ++m_webSocketConnectionCount;
         m_webSockets.append(socket);
         m_codecs.insert(socket, {});
+        m_webSocketIds.insert(socket, connectionId);
+        m_activeWebSocket = socket;
+        m_lastRequestUrl = socket->requestUrl();
+        m_lastNegotiatedSubprotocol = socket->subprotocol();
         if (m_outgoingFrameSize > 0)
             socket->setOutgoingFrameSize(m_outgoingFrameSize);
         connect(socket, &QWebSocket::textMessageReceived, this,
@@ -866,9 +1595,24 @@ void FakeXc2TransportServer::acceptWebSockets()
         });
         connect(socket, &QWebSocket::disconnected, this, [this, socket] {
             m_lastPeerCloseCode = socket->closeCode();
+            if (m_activeWebSocket == socket)
+                m_activeWebSocket = nullptr;
+            cancelPendingActions(socket);
+            m_webSockets.removeOne(socket);
+            m_codecs.remove(socket);
+            m_webSocketIds.remove(socket);
+            socket->disconnect(this);
+            m_retiredSocketObjects.append(QPointer<QObject>(socket));
             ++m_webSocketDisconnectionCount;
+            const QPointer<FakeXc2TransportServer> owner(this);
+            const QPointer<QWebSocket> guarded(socket);
             emit webSocketDisconnected();
+            if (!owner || !guarded)
+                return;
             emit connectionClosed();
+            if (!owner || !guarded)
+                return;
+            guarded->deleteLater();
         });
         const QPointer<FakeXc2TransportServer> guard(this);
         emit webSocketConnected();
@@ -981,8 +1725,8 @@ void FakeXc2TransportServer::runProbeStompScript(
             error.body = QByteArrayLiteral("BOUNDARY_BODY_SENTINEL_d5e1");
             owner->m_attemptedTerminalFrames.append(error);
             owner->m_attemptedTerminalFrames.append(response);
-            owner->sendFrame(error);
-            owner->sendFrame(response);
+            owner->sendFrameTo(guarded, error);
+            owner->sendFrameTo(guarded, response);
             ++owner->m_terminalCloseAttemptCount;
             if (guarded) {
                 guarded->close(
@@ -1002,7 +1746,7 @@ void FakeXc2TransportServer::runProbeStompScript(
                            [owner, guarded, response] {
             if (owner && guarded
                 && guarded->state() == QAbstractSocket::ConnectedState) {
-                owner->sendFrame(response);
+                owner->sendFrameTo(guarded, response);
             }
         });
         return;
@@ -1026,15 +1770,27 @@ void FakeXc2TransportServer::captureMessage(
     for (const auto &frame : decoded.frames) {
         m_stompFrames.append(frame);
         classifyStompOperation(frame);
-        const QPointer<FakeXc2TransportServer> guard(this);
-        emit stompFrameReceived();
-        if (guard.isNull())
-            return;
-        runProbeStompScript(socket, frame);
-        if (guard.isNull())
-            return;
+        if (m_scriptEnabled) {
+            const QPointer<FakeXc2TransportServer> guard(this);
+            if (!consumeScriptStomp(
+                    socket, frame, m_webSocketIds.value(socket))) {
+                ++m_unexpectedOperationCount;
+            }
+            if (!guard)
+                return;
+        } else {
+            const QPointer<FakeXc2TransportServer> guard(this);
+            emit stompFrameReceived();
+            if (guard.isNull())
+                return;
+            runProbeStompScript(socket, frame);
+            if (guard.isNull())
+                return;
+        }
     }
     m_decodeErrors.append(decoded.errors);
+    if (m_scriptEnabled)
+        m_unexpectedOperationCount += decoded.errors.size();
     emit webSocketMessageReceived();
 }
 
@@ -1051,10 +1807,12 @@ FakeXc2HttpRequest FakeXc2TransportServer::parseRequest(
         requestLine.chop(1);
     const qsizetype firstSpace = requestLine.indexOf(' ');
     const qsizetype secondSpace = requestLine.indexOf(' ', firstSpace + 1);
-    if (firstSpace > 0 && secondSpace > firstSpace) {
+    if (firstSpace > 0 && secondSpace > firstSpace
+        && requestLine.indexOf(' ', secondSpace + 1) < 0) {
         request.method = requestLine.left(firstSpace);
         request.target = requestLine.mid(firstSpace + 1,
                                          secondSpace - firstSpace - 1);
+        request.version = requestLine.mid(secondSpace + 1);
     }
     for (qsizetype index = 1; index < lines.size(); ++index) {
         QByteArray line = lines.at(index);

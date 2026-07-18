@@ -1,10 +1,16 @@
+#include "FakeXc2TransportServer.h"
+
 #include "ktm/KtmSessionController.h"
 #include "ktm/xc2/Xc2ContractProfile.h"
+#include "ktm/xc2/Xc2JsonCodec.h"
 
 #include <QPointer>
 #include <QSignalSpy>
+#include <QTcpSocket>
 #include <QtTest>
 
+#include <algorithm>
+#include <memory>
 #include <type_traits>
 #include <utility>
 
@@ -596,6 +602,437 @@ Xc2VciDevice approvedDevice(QString name = QStringLiteral("Candidate"),
             std::move(module)};
 }
 
+using FakeAction = FakeXc2TransportServer::Action;
+using FakeExpectation = FakeXc2TransportServer::Expectation;
+using FakePhase = FakeXc2TransportServer::ScriptPhase;
+
+QByteArray compactDevice(const Xc2VciDevice &device)
+{
+    return QJsonDocument(Xc2JsonCodec::vciDeviceJson(device))
+        .toJson(QJsonDocument::Compact);
+}
+
+QByteArray compactDevices(const QList<Xc2VciDevice> &devices)
+{
+    QJsonArray array;
+    for (const Xc2VciDevice &device : devices)
+        array.append(Xc2JsonCodec::vciDeviceJson(device));
+    return QJsonDocument(array).toJson(QJsonDocument::Compact);
+}
+
+Xc2StompFrame connectedFrame()
+{
+    Xc2StompFrame frame;
+    frame.command = QByteArrayLiteral("CONNECTED");
+    frame.headers.insert(QByteArrayLiteral("version"),
+                         QByteArrayLiteral("1.2"));
+    frame.headers.insert(QByteArrayLiteral("heart-beat"),
+                         QByteArrayLiteral("0,0"));
+    return frame;
+}
+
+Xc2StompFrame expectedConnectFrame()
+{
+    Xc2StompFrame frame;
+    frame.command = QByteArrayLiteral("CONNECT");
+    frame.headers.insert(QByteArrayLiteral("accept-version"),
+                         QByteArrayLiteral("1.2"));
+    frame.headers.insert(QByteArrayLiteral("heart-beat"),
+                         QByteArrayLiteral("10000,10000"));
+    frame.headers.insert(QByteArrayLiteral("host"),
+                         QByteArrayLiteral("127.0.0.1"));
+    return frame;
+}
+
+Xc2StompFrame expectedSubscription(Topic topic, const QByteArray &id)
+{
+    Xc2StompFrame frame;
+    frame.command = QByteArrayLiteral("SUBSCRIBE");
+    frame.headers.insert(QByteArrayLiteral("ack"),
+                         QByteArrayLiteral("auto"));
+    frame.headers.insert(QByteArrayLiteral("destination"),
+                         Xc2ContractProfile::approved().topic(topic).toUtf8());
+    frame.headers.insert(QByteArrayLiteral("id"), id);
+    return frame;
+}
+
+Xc2StompFrame topicMessage(Topic topic, const QByteArray &subscription,
+                           const QByteArray &messageId,
+                           const QByteArray &body)
+{
+    Xc2StompFrame frame;
+    frame.command = QByteArrayLiteral("MESSAGE");
+    frame.headers.insert(QByteArrayLiteral("destination"),
+                         Xc2ContractProfile::approved().topic(topic).toUtf8());
+    frame.headers.insert(QByteArrayLiteral("subscription"), subscription);
+    frame.headers.insert(QByteArrayLiteral("message-id"), messageId);
+    frame.body = body;
+    return frame;
+}
+
+FakeAction httpReply(QString label, int status, QByteArray reason,
+                     QByteArray body = {},
+                     QList<QPair<QByteArray, QByteArray>> headers = {},
+                     QString targetExpectation = {})
+{
+    FakeAction action;
+    action.label = std::move(label);
+    action.type = FakeAction::Type::HttpResponse;
+    action.target = targetExpectation.isEmpty()
+        ? FakeAction::Target::EventSocket
+        : FakeAction::Target::ExpectationSocket;
+    action.targetExpectation = std::move(targetExpectation);
+    action.status = status;
+    action.reason = std::move(reason);
+    action.body = std::move(body);
+    action.headers = std::move(headers);
+    return action;
+}
+
+FakeAction sendTopic(QString label, Xc2StompFrame frame, int delayMs = 0)
+{
+    FakeAction action;
+    action.label = std::move(label);
+    action.type = FakeAction::Type::SendStompFrame;
+    action.target = FakeAction::Target::WebSocket;
+    action.stompFrame = std::move(frame);
+    action.delayMs = delayMs;
+    return action;
+}
+
+FakeExpectation restExpectation(
+    const FakeXc2TransportServer &server, QString label, QByteArray method,
+    QByteArray target, QByteArray body, std::optional<QByteArray> cookie,
+    QList<FakeAction> actions = {})
+{
+    FakeExpectation expectation;
+    expectation.label = std::move(label);
+    expectation.protocol = FakeExpectation::Protocol::Http;
+    expectation.method = std::move(method);
+    expectation.target = std::move(target);
+    expectation.body = std::move(body);
+    expectation.headers = {
+        {QByteArrayLiteral("Host"),
+         QByteArrayLiteral("127.0.0.1:")
+             + QByteArray::number(server.port())},
+        {QByteArrayLiteral("Accept"), QByteArrayLiteral("*/*")},
+        {QByteArrayLiteral("Accept-Encoding"),
+         QByteArrayLiteral("identity")},
+        {QByteArrayLiteral("Connection"), QByteArrayLiteral("close")},
+    };
+    if (cookie) {
+        expectation.headers.append(
+            {QByteArrayLiteral("Cookie"), *cookie});
+    } else {
+        expectation.absentHeaders.append(QByteArrayLiteral("Cookie"));
+    }
+    if (expectation.method == QByteArrayLiteral("POST")) {
+        expectation.headers.append(
+            {QByteArrayLiteral("Content-Type"),
+             QByteArrayLiteral("application/json")});
+        expectation.headers.append(
+            {QByteArrayLiteral("Content-Length"),
+             QByteArray::number(expectation.body.size())});
+    } else {
+        expectation.absentHeaders.append(
+            QByteArrayLiteral("Content-Type"));
+        expectation.absentHeaders.append(
+            QByteArrayLiteral("Content-Length"));
+    }
+    expectation.actions = std::move(actions);
+    return expectation;
+}
+
+FakeExpectation upgradeExpectation(
+    const FakeXc2TransportServer &server, const QByteArray &cookie)
+{
+    FakeExpectation expectation;
+    expectation.label = QStringLiteral("websocket-upgrade");
+    expectation.protocol = FakeExpectation::Protocol::Http;
+    expectation.webSocketUpgrade = true;
+    expectation.method = QByteArrayLiteral("GET");
+    expectation.target = QByteArrayLiteral("/xc2-websocket");
+    expectation.headers = {
+        {QByteArrayLiteral("Host"),
+         QByteArrayLiteral("127.0.0.1:")
+             + QByteArray::number(server.port())},
+        {QByteArrayLiteral("Cookie"), cookie},
+        {QByteArrayLiteral("Upgrade"), QByteArrayLiteral("websocket")},
+        {QByteArrayLiteral("Sec-WebSocket-Protocol"),
+         QByteArrayLiteral("v12.stomp")},
+    };
+    expectation.absentHeaders = {QByteArrayLiteral("Content-Type"),
+                                 QByteArrayLiteral("Content-Length")};
+    return expectation;
+}
+
+FakeExpectation stompExpectation(QString label, Xc2StompFrame frame,
+                                 QList<FakeAction> actions = {})
+{
+    FakeExpectation expectation;
+    expectation.label = std::move(label);
+    expectation.protocol = FakeExpectation::Protocol::Stomp;
+    expectation.stompFrame = std::move(frame);
+    expectation.actions = std::move(actions);
+    return expectation;
+}
+
+FakePhase orderedPhase(QString label, FakeExpectation expectation)
+{
+    FakePhase phase;
+    phase.label = std::move(label);
+    phase.expectations.append(std::move(expectation));
+    return phase;
+}
+
+QList<FakePhase> completeHappyScript(const FakeXc2TransportServer &server,
+                                     const Xc2VciDevice &device)
+{
+    const QByteArray cookie = QByteArrayLiteral("session=task4");
+    const QByteArray currentUser = QByteArrayLiteral(
+        "{\"loginName\":\"task4\",\"name\":\"Task 4 Operator\","
+        "\"permissions\":[\"EcuDiagnosticRead\"]}");
+    const QByteArray lookupId = QByteArrayLiteral("lookup-task4");
+    const Xc2StompFrame progress = topicMessage(
+        Topic::Progress, QByteArrayLiteral("progress-subscription"),
+        QByteArrayLiteral("progress-finished"),
+        progressBody(QString::fromLatin1(lookupId), Xc2JobState::Finished));
+    const Xc2StompFrame status = topicMessage(
+        Topic::VciStatus, QByteArrayLiteral("vci-status-subscription"),
+        QByteArrayLiteral("status-connected"),
+        QByteArrayLiteral("{\"voltage\":12.4,\"connected\":true}"));
+
+    const QList<QPair<QByteArray, QByteArray>> jsonHeader = {
+        {QByteArrayLiteral("Content-Type"),
+         QByteArrayLiteral("application/json")}};
+    QList<FakePhase> phases;
+
+    FakeExpectation health = restExpectation(
+        server, QStringLiteral("health"), QByteArrayLiteral("GET"),
+        QByteArrayLiteral("/xc2/1.0/serviceStatus/status"), {},
+        std::nullopt);
+    health.actions.append(httpReply(
+        QStringLiteral("health-response"), 200, QByteArrayLiteral("OK"),
+        QByteArrayLiteral("alive"),
+        {{QByteArrayLiteral("Content-Type"), QByteArrayLiteral("text/plain")},
+         {QByteArrayLiteral("Set-Cookie"),
+          cookie + QByteArrayLiteral("; Path=/")}}));
+    phases.append(orderedPhase(QStringLiteral("health"), std::move(health)));
+
+    FakeExpectation user = restExpectation(
+        server, QStringLiteral("current-user"), QByteArrayLiteral("GET"),
+        QByteArrayLiteral("/xc2/1.0/auth/currentUser"), {}, cookie);
+    user.actions.append(httpReply(
+        QStringLiteral("current-user-response"), 200,
+        QByteArrayLiteral("OK"), currentUser, jsonHeader));
+    phases.append(
+        orderedPhase(QStringLiteral("current-user"), std::move(user)));
+    phases.append(orderedPhase(QStringLiteral("upgrade"),
+                               upgradeExpectation(server, cookie)));
+
+    FakeExpectation connect = stompExpectation(
+        QStringLiteral("stomp-connect"), expectedConnectFrame());
+    connect.actions.append(sendTopic(QStringLiteral("stomp-connected"),
+                                     connectedFrame()));
+    phases.append(
+        orderedPhase(QStringLiteral("connect"), std::move(connect)));
+    phases.append(orderedPhase(
+        QStringLiteral("subscribe-vci"),
+        stompExpectation(
+            QStringLiteral("subscribe-vci"),
+            expectedSubscription(
+                Topic::VciStatus,
+                QByteArrayLiteral("vci-status-subscription")))));
+    phases.append(orderedPhase(
+        QStringLiteral("subscribe-progress"),
+        stompExpectation(
+            QStringLiteral("subscribe-progress"),
+            expectedSubscription(
+                Topic::Progress,
+                QByteArrayLiteral("progress-subscription")))));
+    phases.append(orderedPhase(
+        QStringLiteral("subscribe-login"),
+        stompExpectation(
+            QStringLiteral("subscribe-login"),
+            expectedSubscription(Topic::Login,
+                                 QByteArrayLiteral("login-subscription")))));
+
+    FakeExpectation lookup = restExpectation(
+        server, QStringLiteral("device-lookup"), QByteArrayLiteral("GET"),
+        QByteArrayLiteral("/xc2/1.0/device/lookup"), {}, cookie);
+    lookup.actions.append(sendTopic(
+        QStringLiteral("progress-before-lookup-response"), progress));
+    lookup.actions.append(httpReply(
+        QStringLiteral("lookup-response"), 200, QByteArrayLiteral("OK"),
+        QByteArrayLiteral("{\"jobID\":\"") + lookupId
+            + QByteArrayLiteral("\"}"),
+        jsonHeader));
+    phases.append(
+        orderedPhase(QStringLiteral("lookup"), std::move(lookup)));
+
+    FakeExpectation devices = restExpectation(
+        server, QStringLiteral("device-get"), QByteArrayLiteral("GET"),
+        QByteArrayLiteral("/xc2/1.0/device/get"), {}, cookie);
+    devices.actions.append(httpReply(
+        QStringLiteral("devices-response"), 200, QByteArrayLiteral("OK"),
+        compactDevices({device}), jsonHeader));
+    phases.append(
+        orderedPhase(QStringLiteral("devices"), std::move(devices)));
+
+    FakePhase apply;
+    apply.label = QStringLiteral("apply-and-selected");
+    apply.unordered = true;
+    apply.expectations = {
+        restExpectation(
+            server, QStringLiteral("device-apply"), QByteArrayLiteral("POST"),
+            QByteArrayLiteral("/xc2/1.0/device/apply"),
+            compactDevice(device), cookie),
+        restExpectation(
+            server, QStringLiteral("device-selected"),
+            QByteArrayLiteral("GET"),
+            QByteArrayLiteral("/xc2/1.0/device/getSelected"), {}, cookie),
+    };
+    apply.completionActions = {
+        httpReply(QStringLiteral("apply-response"), 204,
+                  QByteArrayLiteral("No Content"), {}, {},
+                  QStringLiteral("device-apply")),
+        sendTopic(QStringLiteral("status-before-selected"), status),
+        httpReply(QStringLiteral("selected-response"), 200,
+                  QByteArrayLiteral("OK"), compactDevice(device),
+                  jsonHeader, QStringLiteral("device-selected")),
+    };
+    phases.append(std::move(apply));
+
+    FakeExpectation close = restExpectation(
+        server, QStringLiteral("device-close"), QByteArrayLiteral("POST"),
+        QByteArrayLiteral("/xc2/1.0/device/close"), compactDevice(device),
+        cookie);
+    close.actions.append(httpReply(QStringLiteral("close-response"), 204,
+                                   QByteArrayLiteral("No Content")));
+    phases.append(orderedPhase(QStringLiteral("close"), std::move(close)));
+    return phases;
+}
+
+QList<FakePhase> canceledLookupScript(
+    const FakeXc2TransportServer &server, const Xc2VciDevice &device)
+{
+    QList<FakePhase> phases = completeHappyScript(server, device);
+    phases.removeLast();
+    phases.removeLast();
+    phases[7].expectations[0].actions[0].stompFrame.body =
+        progressBody(QStringLiteral("lookup-task4"), Xc2JobState::Canceled);
+    return phases;
+}
+
+QList<FakePhase> selectionVariantScript(
+    const FakeXc2TransportServer &server, const Xc2VciDevice &device,
+    bool selectedBeforeStatus, double voltage)
+{
+    QList<FakePhase> phases = completeHappyScript(server, device);
+    phases.removeLast();
+    phases[9].completionActions[1].stompFrame.body =
+        QJsonDocument(QJsonObject{
+            {QStringLiteral("voltage"), voltage},
+            {QStringLiteral("connected"), true},
+        }).toJson(QJsonDocument::Compact);
+    if (selectedBeforeStatus)
+        phases[9].completionActions.swapItemsAt(1, 2);
+    return phases;
+}
+
+QList<FakePhase> bootstrapOnlyScript(
+    const FakeXc2TransportServer &server, const Xc2VciDevice &device)
+{
+    QList<FakePhase> phases = completeHappyScript(server, device);
+    phases.resize(7);
+    return phases;
+}
+
+QList<FakePhase> strictHealthOnlyScript(
+    const FakeXc2TransportServer &server, bool respond)
+{
+    QList<FakePhase> phases = completeHappyScript(
+        server, approvedDevice());
+    phases.resize(1);
+    if (!respond)
+        phases[0].expectations[0].actions.clear();
+    return phases;
+}
+
+FakeAction transportFailureAction(bool visibilityLoss)
+{
+    if (visibilityLoss) {
+        FakeAction action;
+        action.label = QStringLiteral("visibility-loss");
+        action.type = FakeAction::Type::CloseWebSocket;
+        action.target = FakeAction::Target::WebSocket;
+        action.closeReason = QStringLiteral("visibility lost");
+        return action;
+    }
+    return sendTopic(
+        QStringLiteral("malformed-status"),
+        topicMessage(
+            Topic::VciStatus,
+            QByteArrayLiteral("vci-status-subscription"),
+            QByteArrayLiteral("malformed-status"),
+            QByteArrayLiteral("{\"voltage\":12.5}")));
+}
+
+void installOwnedTransportBackendSeam(
+    KtmSessionController &controller, Xc2BackendState &backendState,
+    int &backendStartCount, int &backendStopCount)
+{
+    KtmSessionControllerTestAccess::Ops ops;
+    ops.backendState = [&backendState] { return backendState; };
+    ops.startBackend = [&backendStartCount](const QString &, Xc2Error *) {
+        ++backendStartCount;
+        return true;
+    };
+    ops.stopBackend = [&controller, &backendState, &backendStopCount] {
+        ++backendStopCount;
+        backendState = Xc2BackendState::Stopped;
+        KtmSessionControllerTestAccess::emitBackendStateChanged(
+            controller, Xc2BackendState::Stopped);
+    };
+    KtmSessionControllerTestAccess::installOps(controller, std::move(ops));
+}
+
+void publishOwnedTransportReady(KtmSessionController &controller,
+                                Xc2BackendState &backendState,
+                                const FakeXc2TransportServer &server)
+{
+    backendState = Xc2BackendState::Ready;
+    KtmSessionControllerTestAccess::emitBackendStateChanged(
+        controller, Xc2BackendState::Ready);
+    KtmSessionControllerTestAccess::emitBackendReady(
+        controller,
+        {QUrl::fromEncoded(server.encodedRestBase()),
+         QUrl(QStringLiteral("ws://127.0.0.1:%1/xc2-websocket")
+                  .arg(server.port()))});
+}
+
+qsizetype traceIndex(const FakeXc2TransportServer &server,
+                     const QString &label)
+{
+    for (qsizetype index = 0; index < server.trace().size(); ++index) {
+        if (server.trace().at(index).label == label)
+            return index;
+    }
+    return -1;
+}
+
+int traceCount(const FakeXc2TransportServer &server,
+               const QString &label,
+               FakeXc2TransportServer::TraceEvent::Direction direction)
+{
+    return int(std::count_if(
+        server.trace().cbegin(), server.trace().cend(),
+        [&label, direction](
+            const FakeXc2TransportServer::TraceEvent &event) {
+            return event.label == label && event.direction == direction;
+        }));
+}
+
 void completeReadyApply(
     BootstrapHarness &harness,
     Xc2VciDevice confirmed = approvedDevice())
@@ -618,6 +1055,761 @@ class KtmSessionControllerTest final : public QObject {
     Q_OBJECT
 
 private slots:
+    void sameAuthorityCanceledLookupStillFetchesDevicesOnce()
+    {
+        FakeXc2TransportServer server;
+        const Xc2VciDevice device = approvedDevice();
+        QString scriptError;
+        QVERIFY2(server.setScript(canceledLookupScript(server, device),
+                                  &scriptError),
+                 qPrintable(scriptError));
+        KtmSessionController controller;
+        Xc2BackendState backendState = Xc2BackendState::Stopped;
+        int starts = 0;
+        int stops = 0;
+        installOwnedTransportBackendSeam(controller, backendState,
+                                         starts, stops);
+        QSignalSpy lookupFinished(
+            &controller, &KtmSessionController::vciLookupFinished);
+        QVERIFY(controller.startProduction(QStringLiteral("C:/XC2")));
+        publishOwnedTransportReady(controller, backendState, server);
+        QTRY_COMPARE_WITH_TIMEOUT(
+            KtmSessionControllerTestAccess::state(controller),
+            KtmSessionState::SessionReady, 3000);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            traceIndex(server, QStringLiteral("subscribe-login")) >= 0,
+            3000);
+        QVERIFY(controller.lookupVci());
+        QTRY_COMPARE_WITH_TIMEOUT(lookupFinished.count(), 1, 3000);
+        int deviceGetCount = 0;
+        for (const auto &event : server.trace()) {
+            if (event.label == QStringLiteral("device-get"))
+                ++deviceGetCount;
+        }
+        QCOMPARE(deviceGetCount, 1);
+        const qsizetype progress = traceIndex(
+            server, QStringLiteral("progress-before-lookup-response"));
+        QVERIFY(progress >= 0);
+        QVERIFY(server.trace().at(progress).stompFrame.body.contains(
+            QByteArrayLiteral("\"status\":\"CANCELED\"")));
+        QVERIFY(server.scriptExhausted());
+        QCOMPARE(server.unexpectedOperationCount(), 0);
+        controller.stop();
+        QCOMPARE(stops, 1);
+    }
+
+    void sameAuthoritySelectionOrderingAndVoltage_data()
+    {
+        QTest::addColumn<bool>("selectedBeforeStatus");
+        QTest::addColumn<double>("voltage");
+        QTest::newRow("selected-before-status") << true << 12.4;
+        QTest::newRow("zero-voltage-status-before-selected")
+            << false << 0.0;
+    }
+
+    void sameAuthoritySelectionOrderingAndVoltage()
+    {
+        QFETCH(bool, selectedBeforeStatus);
+        QFETCH(double, voltage);
+        FakeXc2TransportServer server;
+        const Xc2VciDevice device = approvedDevice();
+        QString scriptError;
+        QVERIFY2(server.setScript(selectionVariantScript(
+                     server, device, selectedBeforeStatus, voltage),
+                                  &scriptError),
+                 qPrintable(scriptError));
+        KtmSessionController controller;
+        Xc2BackendState backendState = Xc2BackendState::Stopped;
+        int starts = 0;
+        int stops = 0;
+        installOwnedTransportBackendSeam(controller, backendState,
+                                         starts, stops);
+        QSignalSpy lookupFinished(
+            &controller, &KtmSessionController::vciLookupFinished);
+        QSignalSpy ready(&controller, &KtmSessionController::vciReady);
+        QVERIFY(controller.startProduction(QStringLiteral("C:/XC2")));
+        publishOwnedTransportReady(controller, backendState, server);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            traceIndex(server, QStringLiteral("subscribe-login")) >= 0,
+            3000);
+        QVERIFY(controller.lookupVci());
+        QTRY_COMPARE_WITH_TIMEOUT(lookupFinished.count(), 1, 3000);
+        QVERIFY(controller.applyVci(device));
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 3000);
+        QCOMPARE(KtmSessionControllerTestAccess::state(controller),
+                 KtmSessionState::VciReady);
+        const Xc2VciStatus status = qvariant_cast<Xc2VciStatus>(
+            ready.constFirst().at(1));
+        QVERIFY(status.connected);
+        QCOMPARE(status.voltage, voltage);
+        const qsizetype statusEvent =
+            traceIndex(server, QStringLiteral("status-before-selected"));
+        const qsizetype selectedEvent =
+            traceIndex(server, QStringLiteral("selected-response"));
+        QVERIFY(statusEvent >= 0);
+        QVERIFY(selectedEvent >= 0);
+        QCOMPARE(selectedEvent < statusEvent, selectedBeforeStatus);
+        QVERIFY(server.scriptExhausted());
+        QCOMPARE(server.unexpectedOperationCount(), 0);
+        controller.stop();
+        QCOMPARE(stops, 1);
+    }
+
+    void sameAuthorityInvalidIdentityWritesNoPost_data()
+    {
+        QTest::addColumn<QString>("id");
+        QTest::addColumn<QString>("provider");
+        QTest::newRow("blank-id")
+            << QStringLiteral("   ")
+            << QStringLiteral("AVL Ditest VCI2K_DPDU_API");
+        QTest::newRow("wrong-provider")
+            << QStringLiteral("vci-1")
+            << QStringLiteral("AVL Ditest VCI2K_dpdu_api");
+    }
+
+    void sameAuthorityInvalidIdentityWritesNoPost()
+    {
+        QFETCH(QString, id);
+        QFETCH(QString, provider);
+        FakeXc2TransportServer server;
+        Xc2VciDevice device = approvedDevice();
+        QString scriptError;
+        QVERIFY2(server.setScript(bootstrapOnlyScript(server, device),
+                                  &scriptError),
+                 qPrintable(scriptError));
+        KtmSessionController controller;
+        Xc2BackendState backendState = Xc2BackendState::Stopped;
+        int starts = 0;
+        int stops = 0;
+        installOwnedTransportBackendSeam(controller, backendState,
+                                         starts, stops);
+        QVERIFY(controller.startProduction(QStringLiteral("C:/XC2")));
+        publishOwnedTransportReady(controller, backendState, server);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            traceIndex(server, QStringLiteral("subscribe-login")) >= 0,
+            3000);
+        device.id = id;
+        device.internalName = provider;
+        QVERIFY(!controller.applyVci(device));
+        QCOMPARE(KtmSessionControllerTestAccess::state(controller),
+                 KtmSessionState::SessionReady);
+        QCOMPARE(server.stateChangingRestRequestCount(), 0);
+        QCOMPARE(traceIndex(server, QStringLiteral("device-apply")),
+                 qsizetype(-1));
+        QVERIFY(server.scriptExhausted());
+        QCOMPARE(server.unexpectedOperationCount(), 0);
+        controller.stop();
+        QCOMPARE(stops, 1);
+    }
+
+    void sameAuthorityTransportFailureDoesNotRetry_data()
+    {
+        QTest::addColumn<bool>("visibilityLoss");
+        QTest::newRow("malformed-status") << false;
+        QTest::newRow("visibility-loss") << true;
+    }
+
+    void sameAuthorityTransportFailureDoesNotRetry()
+    {
+        QFETCH(bool, visibilityLoss);
+        FakeXc2TransportServer server;
+        const Xc2VciDevice device = approvedDevice();
+        QString scriptError;
+        QVERIFY2(server.setScript(selectionVariantScript(
+                     server, device, false, 12.4),
+                                  &scriptError),
+                 qPrintable(scriptError));
+        KtmSessionController controller;
+        Xc2BackendState backendState = Xc2BackendState::Stopped;
+        int starts = 0;
+        int stops = 0;
+        installOwnedTransportBackendSeam(controller, backendState,
+                                         starts, stops);
+        QSignalSpy lookupFinished(
+            &controller, &KtmSessionController::vciLookupFinished);
+        QSignalSpy ready(&controller, &KtmSessionController::vciReady);
+        QVERIFY(controller.startProduction(QStringLiteral("C:/XC2")));
+        publishOwnedTransportReady(controller, backendState, server);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            traceIndex(server, QStringLiteral("subscribe-login")) >= 0,
+            3000);
+        QVERIFY(controller.lookupVci());
+        QTRY_COMPARE_WITH_TIMEOUT(lookupFinished.count(), 1, 3000);
+        QVERIFY(controller.applyVci(device));
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 3000);
+        QCOMPARE(KtmSessionControllerTestAccess::state(controller),
+                 KtmSessionState::VciReady);
+        QVERIFY(server.scriptExhausted());
+        const int restBaseline = server.restRequestCount();
+        const int upgradeBaseline = server.upgradeRequestCount();
+        QVERIFY(server.performAction(transportFailureAction(visibilityLoss)));
+        QTRY_COMPARE_WITH_TIMEOUT(
+            KtmSessionControllerTestAccess::state(controller),
+            KtmSessionState::Failed, 3000);
+        QTest::qWait(250);
+        QCOMPARE(server.restRequestCount(), restBaseline);
+        QCOMPARE(server.upgradeRequestCount(), upgradeBaseline);
+        QCOMPARE(server.webSocketConnectionCount(), 1);
+        QCOMPARE(server.unexpectedOperationCount(), 0);
+        controller.stop();
+        QCOMPARE(stops, 1);
+        QTRY_COMPARE_WITH_TIMEOUT(server.openConnectionCount(), 0, 3000);
+    }
+
+    void sameAuthorityConnectedFalseRevokesWithoutRetry()
+    {
+        FakeXc2TransportServer server;
+        const Xc2VciDevice device = approvedDevice();
+        QString scriptError;
+        QVERIFY2(server.setScript(selectionVariantScript(
+                     server, device, false, 12.4), &scriptError),
+                 qPrintable(scriptError));
+        KtmSessionController controller;
+        Xc2BackendState backendState = Xc2BackendState::Stopped;
+        int starts = 0;
+        int stops = 0;
+        installOwnedTransportBackendSeam(controller, backendState,
+                                         starts, stops);
+        QSignalSpy lookupFinished(
+            &controller, &KtmSessionController::vciLookupFinished);
+        QSignalSpy ready(&controller, &KtmSessionController::vciReady);
+        QSignalSpy revoked(
+            &controller, &KtmSessionController::vciReadinessRevoked);
+        QSignalSpy statusChanged(
+            &controller, &KtmSessionController::vciStatusChanged);
+        QVERIFY(controller.startProduction(QStringLiteral("C:/XC2")));
+        publishOwnedTransportReady(controller, backendState, server);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            traceIndex(server, QStringLiteral("subscribe-login")) >= 0,
+            3000);
+        QVERIFY(controller.lookupVci());
+        QTRY_COMPARE_WITH_TIMEOUT(lookupFinished.count(), 1, 3000);
+        QVERIFY(controller.applyVci(device));
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 3000);
+        QCOMPARE(KtmSessionControllerTestAccess::state(controller),
+                 KtmSessionState::VciReady);
+
+        const int restBaseline = server.restRequestCount();
+        const int upgradeBaseline = server.upgradeRequestCount();
+        const int stateChangingBaseline =
+            server.stateChangingRestRequestCount();
+        QVERIFY(server.performAction(sendTopic(
+            QStringLiteral("current-connected-false"),
+            topicMessage(
+                Topic::VciStatus,
+                QByteArrayLiteral("vci-status-subscription"),
+                QByteArrayLiteral("status-current-disconnected"),
+                QByteArrayLiteral(
+                    "{\"voltage\":0.0,\"connected\":false}")))));
+        QTRY_COMPARE_WITH_TIMEOUT(revoked.count(), 1, 3000);
+        QTRY_COMPARE_WITH_TIMEOUT(statusChanged.count(), 2, 3000);
+        QCOMPARE(KtmSessionControllerTestAccess::state(controller),
+                 KtmSessionState::SessionReady);
+        QVERIFY(!controller.closeVci());
+        QTest::qWait(250);
+        QCOMPARE(server.restRequestCount(), restBaseline);
+        QCOMPARE(server.upgradeRequestCount(), upgradeBaseline);
+        QCOMPARE(server.webSocketConnectionCount(), 1);
+        QCOMPARE(server.stateChangingRestRequestCount(),
+                 stateChangingBaseline);
+        QVERIFY(server.scriptExhausted());
+        QCOMPARE(server.unexpectedOperationCount(), 0);
+        controller.stop();
+        QCOMPARE(stops, 1);
+        QTRY_COMPARE_WITH_TIMEOUT(server.liveSocketObjectCount(), 0, 3000);
+        QCOMPARE(server.unexpectedOperationCount(), 0);
+    }
+
+    void sameAuthorityOldSocketDelayedActionIsCanceledAcrossRestart()
+    {
+        FakeXc2TransportServer server;
+        const Xc2VciDevice device = approvedDevice();
+        QString scriptError;
+        QVERIFY2(server.setScript(bootstrapOnlyScript(server, device),
+                                  &scriptError),
+                 qPrintable(scriptError));
+        KtmSessionController controller;
+        Xc2BackendState backendState = Xc2BackendState::Stopped;
+        int starts = 0;
+        int stops = 0;
+        installOwnedTransportBackendSeam(controller, backendState,
+                                         starts, stops);
+        QVERIFY(controller.startProduction(QStringLiteral("C:/XC2")));
+        publishOwnedTransportReady(controller, backendState, server);
+        QTRY_COMPARE_WITH_TIMEOUT(
+            KtmSessionControllerTestAccess::state(controller),
+            KtmSessionState::SessionReady, 3000);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            traceIndex(server, QStringLiteral("subscribe-login")) >= 0,
+            3000);
+        const quint64 oldEpoch =
+            KtmSessionControllerTestAccess::sessionEpoch(controller);
+        QPointer<Xc2StompClient> oldStomp =
+            KtmSessionControllerTestAccess::stompGuard(controller);
+        QVERIFY(oldStomp);
+        quint64 oldConnectionId = 0;
+        for (const auto &event : server.trace()) {
+            if (event.label == QStringLiteral("stomp-connect")) {
+                oldConnectionId = event.connectionId;
+                break;
+            }
+        }
+        QVERIFY(oldConnectionId != 0);
+
+        QVERIFY(server.performAction(sendTopic(
+            QStringLiteral("old-generation-delayed-status"),
+            topicMessage(
+                Topic::VciStatus,
+                QByteArrayLiteral("vci-status-subscription"),
+                QByteArrayLiteral("old-generation-message"),
+                QByteArrayLiteral(
+                    "{\"voltage\":99.9,\"connected\":true}")),
+            500)));
+        QCOMPARE(server.pendingActionCount(), 1);
+        controller.stop();
+        QTRY_COMPARE_WITH_TIMEOUT(
+            KtmSessionControllerTestAccess::state(controller),
+            KtmSessionState::Stopped, 3000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.pendingActionCount(), 0, 3000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.canceledActionCount(), 1, 3000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.liveSocketObjectCount(), 0, 3000);
+        QVERIFY(oldStomp.isNull());
+        QCOMPARE(traceCount(
+                     server,
+                     QStringLiteral("old-generation-delayed-status"),
+                     FakeXc2TransportServer::TraceEvent::Direction::Canceled),
+                 1);
+        QCOMPARE(traceCount(
+                     server,
+                     QStringLiteral("old-generation-delayed-status"),
+                     FakeXc2TransportServer::TraceEvent::Direction::Sent),
+                 0);
+        const auto canceled = std::find_if(
+            server.trace().cbegin(), server.trace().cend(),
+            [](const FakeXc2TransportServer::TraceEvent &event) {
+                return event.label
+                        == QStringLiteral(
+                            "old-generation-delayed-status")
+                    && event.direction
+                        == FakeXc2TransportServer::TraceEvent::Direction::Canceled;
+            });
+        QVERIFY(canceled != server.trace().cend());
+        QCOMPARE(canceled->connectionId, oldConnectionId);
+
+        QVERIFY2(server.setScript(bootstrapOnlyScript(server, device),
+                                  &scriptError),
+                 qPrintable(scriptError));
+        QVERIFY(controller.startProduction(QStringLiteral("C:/XC2")));
+        publishOwnedTransportReady(controller, backendState, server);
+        QTRY_COMPARE_WITH_TIMEOUT(
+            KtmSessionControllerTestAccess::state(controller),
+            KtmSessionState::SessionReady, 3000);
+        QTRY_COMPARE_WITH_TIMEOUT(
+            traceCount(
+                server, QStringLiteral("subscribe-login"),
+                FakeXc2TransportServer::TraceEvent::Direction::Received),
+            2, 3000);
+        QVERIFY(KtmSessionControllerTestAccess::sessionEpoch(controller)
+                > oldEpoch);
+        QVERIFY(KtmSessionControllerTestAccess::stompGuard(controller));
+        quint64 newConnectionId = 0;
+        for (auto it = server.trace().crbegin();
+             it != server.trace().crend(); ++it) {
+            if (it->label == QStringLiteral("stomp-connect")) {
+                newConnectionId = it->connectionId;
+                break;
+            }
+        }
+        QVERIFY(newConnectionId != 0);
+        QVERIFY(newConnectionId != oldConnectionId);
+        QTest::qWait(600);
+        QCOMPARE(traceCount(
+                     server,
+                     QStringLiteral("old-generation-delayed-status"),
+                     FakeXc2TransportServer::TraceEvent::Direction::Sent),
+                 0);
+        QCOMPARE(server.pendingActionCount(), 0);
+        QCOMPARE(server.canceledActionCount(), 1);
+        QCOMPARE(server.unexpectedOperationCount(), 0);
+        QVERIFY(server.scriptExhausted());
+        controller.stop();
+        QCOMPARE(starts, 2);
+        QCOMPARE(stops, 2);
+        QTRY_COMPARE_WITH_TIMEOUT(server.liveSocketObjectCount(), 0, 3000);
+        QCOMPARE(server.unexpectedOperationCount(), 0);
+    }
+
+    void sameAuthorityStrictHttpFraming_data()
+    {
+        QTest::addColumn<QString>("fault");
+        QTest::newRow("duplicate-content-length")
+            << QStringLiteral("duplicate-content-length");
+        QTest::newRow("conflicting-content-length")
+            << QStringLiteral("conflicting-content-length");
+        QTest::newRow("transfer-encoding")
+            << QStringLiteral("transfer-encoding");
+        QTest::newRow("http-1.0") << QStringLiteral("http-1.0");
+        QTest::newRow("get-body") << QStringLiteral("get-body");
+        QTest::newRow("duplicate-host")
+            << QStringLiteral("duplicate-host");
+        QTest::newRow("duplicate-cookie")
+            << QStringLiteral("duplicate-cookie");
+        QTest::newRow("duplicate-content-type")
+            << QStringLiteral("duplicate-content-type");
+        QTest::newRow("wrong-content-type")
+            << QStringLiteral("wrong-content-type");
+        QTest::newRow("initial-tail")
+            << QStringLiteral("initial-tail");
+    }
+
+    void sameAuthorityStrictHttpFraming()
+    {
+        QFETCH(QString, fault);
+        FakeXc2TransportServer server;
+        QString scriptError;
+        QVERIFY2(server.setScript(strictHealthOnlyScript(server, false),
+                                  &scriptError),
+                 qPrintable(scriptError));
+
+        const QByteArray version = fault == QStringLiteral("http-1.0")
+            ? QByteArrayLiteral("HTTP/1.0")
+            : QByteArrayLiteral("HTTP/1.1");
+        QByteArray request = QByteArrayLiteral(
+            "GET /xc2/1.0/serviceStatus/status ") + version
+            + QByteArrayLiteral("\r\nHost: 127.0.0.1:")
+            + QByteArray::number(server.port())
+            + QByteArrayLiteral("\r\n");
+        if (fault == QStringLiteral("duplicate-host")) {
+            request += QByteArrayLiteral("Host: 127.0.0.1:")
+                + QByteArray::number(server.port())
+                + QByteArrayLiteral("\r\n");
+        } else if (fault == QStringLiteral("duplicate-cookie")) {
+            request += QByteArrayLiteral(
+                "Cookie: session=one\r\nCookie: session=two\r\n");
+        } else if (fault == QStringLiteral("duplicate-content-type")) {
+            request += QByteArrayLiteral(
+                "Content-Type: application/json\r\n"
+                "Content-Type: application/json\r\n");
+        } else if (fault == QStringLiteral("wrong-content-type")) {
+            request += QByteArrayLiteral("Content-Type: text/plain\r\n");
+        } else if (fault == QStringLiteral("duplicate-content-length")) {
+            request += QByteArrayLiteral(
+                "Content-Length: 0\r\nContent-Length: 0\r\n");
+        } else if (fault
+                   == QStringLiteral("conflicting-content-length")) {
+            request += QByteArrayLiteral(
+                "Content-Length: 0\r\nContent-Length: 1\r\n");
+        } else if (fault == QStringLiteral("transfer-encoding")) {
+            request += QByteArrayLiteral("Transfer-Encoding: chunked\r\n");
+        } else if (fault == QStringLiteral("get-body")) {
+            request += QByteArrayLiteral("Content-Length: 1\r\n");
+        }
+        request += QByteArrayLiteral(
+            "Accept: */*\r\nAccept-Encoding: identity\r\n"
+            "Connection: close\r\n\r\n");
+        if (fault == QStringLiteral("get-body"))
+            request += 'x';
+        if (fault == QStringLiteral("initial-tail"))
+            request += QByteArrayLiteral("GET /pipelined HTTP/1.1\r\n\r\n");
+
+        QTcpSocket socket;
+        socket.connectToHost(QHostAddress::LocalHost, server.port());
+        QVERIFY(socket.waitForConnected(1000));
+        QCOMPARE(socket.write(request), qint64(request.size()));
+        socket.flush();
+        QTRY_COMPARE_WITH_TIMEOUT(server.unexpectedOperationCount(), 1,
+                                  3000);
+        QTest::qWait(25);
+        QCOMPARE(server.unexpectedOperationCount(), 1);
+        socket.abort();
+        QTRY_COMPARE_WITH_TIMEOUT(server.liveSocketObjectCount(), 0, 3000);
+        QVERIFY(!server.scriptExhausted());
+    }
+
+    void sameAuthorityStrictHttpRejectsPrematureEof()
+    {
+        FakeXc2TransportServer server;
+        QString scriptError;
+        QVERIFY2(server.setScript(strictHealthOnlyScript(server, false),
+                                  &scriptError),
+                 qPrintable(scriptError));
+        const QByteArray request = QByteArrayLiteral(
+            "GET /xc2/1.0/serviceStatus/status HTTP/1.1\r\n"
+            "Host: 127.0.0.1:") + QByteArray::number(server.port())
+            + QByteArrayLiteral(
+                "\r\nContent-Length: 5\r\nAccept: */*\r\n"
+                "Accept-Encoding: identity\r\nConnection: close\r\n\r\nx");
+        QTcpSocket socket;
+        socket.connectToHost(QHostAddress::LocalHost, server.port());
+        QVERIFY(socket.waitForConnected(1000));
+        QCOMPARE(socket.write(request), qint64(request.size()));
+        QVERIFY(socket.waitForBytesWritten(1000));
+        socket.disconnectFromHost();
+        if (socket.state() != QAbstractSocket::UnconnectedState)
+            QVERIFY(socket.waitForDisconnected(1000));
+        QTRY_COMPARE_WITH_TIMEOUT(server.unexpectedOperationCount(), 1,
+                                  3000);
+        QCOMPARE(traceCount(
+                     server, QStringLiteral("invalid-http-eof"),
+                     FakeXc2TransportServer::TraceEvent::Direction::Received),
+                 1);
+        QTRY_COMPARE_WITH_TIMEOUT(server.liveSocketObjectCount(), 0, 3000);
+        QVERIFY(!server.scriptExhausted());
+    }
+
+    void sameAuthorityStrictHttpRejectsLateTail()
+    {
+        FakeXc2TransportServer server;
+        QString scriptError;
+        QVERIFY2(server.setScript(strictHealthOnlyScript(server, false),
+                                  &scriptError),
+                 qPrintable(scriptError));
+        const QByteArray request = QByteArrayLiteral(
+            "GET /xc2/1.0/serviceStatus/status HTTP/1.1\r\n"
+            "Host: 127.0.0.1:") + QByteArray::number(server.port())
+            + QByteArrayLiteral(
+                "\r\nAccept: */*\r\nAccept-Encoding: identity\r\n"
+                "Connection: close\r\n\r\n");
+        QTcpSocket socket;
+        socket.connectToHost(QHostAddress::LocalHost, server.port());
+        QVERIFY(socket.waitForConnected(1000));
+        QCOMPARE(socket.write(request), qint64(request.size()));
+        socket.flush();
+        QTRY_VERIFY_WITH_TIMEOUT(server.scriptExhausted(), 3000);
+        QCOMPARE(server.unexpectedOperationCount(), 0);
+        QCOMPARE(socket.write(QByteArrayLiteral("late-tail")), qint64(9));
+        socket.flush();
+        QTRY_COMPARE_WITH_TIMEOUT(server.unexpectedOperationCount(), 1,
+                                  3000);
+        QCOMPARE(traceCount(
+                     server, QStringLiteral("invalid-http-tail"),
+                     FakeXc2TransportServer::TraceEvent::Direction::Received),
+                 1);
+        socket.abort();
+        QTRY_COMPARE_WITH_TIMEOUT(server.liveSocketObjectCount(), 0, 3000);
+    }
+
+    void sameAuthorityCaptureSignalMayCloseExactSocket()
+    {
+        FakeXc2TransportServer server;
+        QString scriptError;
+        QVERIFY2(server.setScript(strictHealthOnlyScript(server, false),
+                                  &scriptError),
+                 qPrintable(scriptError));
+        bool closeScheduled = false;
+        connect(&server, &FakeXc2TransportServer::restRequestCaptured,
+                &server, [&server, &closeScheduled] {
+            FakeAction close;
+            close.label = QStringLiteral("capture-close-exact-http");
+            close.type = FakeAction::Type::CloseHttp;
+            close.target = FakeAction::Target::ExpectationSocket;
+            close.targetExpectation = QStringLiteral("health");
+            closeScheduled = server.performAction(close);
+        });
+        const QByteArray request = QByteArrayLiteral(
+            "GET /xc2/1.0/serviceStatus/status HTTP/1.1\r\n"
+            "Host: 127.0.0.1:") + QByteArray::number(server.port())
+            + QByteArrayLiteral(
+                "\r\nAccept: */*\r\nAccept-Encoding: identity\r\n"
+                "Connection: close\r\n\r\n");
+        QTcpSocket socket;
+        socket.connectToHost(QHostAddress::LocalHost, server.port());
+        QVERIFY(socket.waitForConnected(1000));
+        QCOMPARE(socket.write(request), qint64(request.size()));
+        socket.flush();
+        QTRY_VERIFY_WITH_TIMEOUT(closeScheduled, 3000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.liveSocketObjectCount(), 0, 3000);
+        const qsizetype captured = traceIndex(
+            server, QStringLiteral("health"));
+        const qsizetype closed = traceIndex(
+            server, QStringLiteral("capture-close-exact-http"));
+        QVERIFY(captured >= 0);
+        QVERIFY(closed > captured);
+        QVERIFY(server.scriptExhausted());
+        QCOMPARE(server.pendingActionCount(), 0);
+        QCOMPARE(server.canceledActionCount(), 0);
+        QCOMPARE(server.unexpectedOperationCount(), 0);
+    }
+
+    void sameAuthorityFakeDrivesOwnedHappyFlow()
+    {
+        FakeXc2TransportServer server;
+        QVERIFY(server.isListening());
+        const Xc2VciDevice device = approvedDevice(
+            QStringLiteral("Task 4 VCI"), QStringLiteral("module-task4"));
+        QString scriptError;
+        QVERIFY2(server.setScript(completeHappyScript(server, device),
+                                  &scriptError),
+                 qPrintable(scriptError));
+
+        auto controllerOwner = std::make_unique<KtmSessionController>();
+        KtmSessionController &controller = *controllerOwner;
+        QPointer<KtmSessionController> controllerGuard(
+            controllerOwner.get());
+        Xc2BackendState backendState = Xc2BackendState::Stopped;
+        int backendStartCount = 0;
+        int backendStopCount = 0;
+        KtmSessionControllerTestAccess::Ops ops;
+        ops.backendState = [&backendState] { return backendState; };
+        ops.startBackend = [&backendStartCount](const QString &, Xc2Error *) {
+            ++backendStartCount;
+            return true;
+        };
+        ops.stopBackend = [&controller, &backendState, &backendStopCount] {
+            ++backendStopCount;
+            backendState = Xc2BackendState::Stopped;
+            KtmSessionControllerTestAccess::emitBackendStateChanged(
+                controller, Xc2BackendState::Stopped);
+        };
+        KtmSessionControllerTestAccess::installOps(controller,
+                                                   std::move(ops));
+
+        QSignalSpy lookupFinished(&controller,
+                                  &KtmSessionController::vciLookupFinished);
+        QSignalSpy ready(&controller, &KtmSessionController::vciReady);
+        QSignalSpy closed(&controller, &KtmSessionController::vciClosed);
+        QSignalSpy statusChanged(
+            &controller, &KtmSessionController::vciStatusChanged);
+        QVERIFY(controller.startProduction(QStringLiteral("C:/XC2")));
+        QCOMPARE(backendStartCount, 1);
+        backendState = Xc2BackendState::Ready;
+        KtmSessionControllerTestAccess::emitBackendStateChanged(
+            controller, Xc2BackendState::Ready);
+        KtmSessionControllerTestAccess::emitBackendReady(
+            controller,
+            {QUrl::fromEncoded(server.encodedRestBase()),
+             QUrl(QStringLiteral("ws://127.0.0.1:%1/xc2-websocket")
+                      .arg(server.port()))});
+
+        QTRY_COMPARE_WITH_TIMEOUT(
+            KtmSessionControllerTestAccess::state(controller),
+            KtmSessionState::SessionReady, 3000);
+        QTRY_VERIFY_WITH_TIMEOUT(
+            std::any_of(server.trace().cbegin(), server.trace().cend(),
+                        [](const FakeXc2TransportServer::TraceEvent &event) {
+                return event.label == QStringLiteral("subscribe-login");
+            }),
+            3000);
+        QVERIFY(controller.lookupVci());
+        QTRY_COMPARE_WITH_TIMEOUT(lookupFinished.count(), 1, 3000);
+        const QList<Xc2VciDevice> devices =
+            qvariant_cast<QList<Xc2VciDevice>>(
+                lookupFinished.constFirst().constFirst());
+        QCOMPARE(devices.size(), 1);
+        QCOMPARE(devices.constFirst().id, device.id);
+
+        QVERIFY(controller.applyVci(device));
+        QTRY_COMPARE_WITH_TIMEOUT(ready.count(), 1, 3000);
+        QCOMPARE(KtmSessionControllerTestAccess::state(controller),
+                 KtmSessionState::VciReady);
+        const Xc2VciStatus readyStatus = qvariant_cast<Xc2VciStatus>(
+            ready.constFirst().at(1));
+        QCOMPARE(readyStatus.voltage, 12.4);
+        QVERIFY(readyStatus.connected);
+
+        QVERIFY(controller.closeVci());
+        QTRY_COMPARE_WITH_TIMEOUT(closed.count(), 1, 3000);
+        QCOMPARE(KtmSessionControllerTestAccess::state(controller),
+                 KtmSessionState::SessionReady);
+        QVERIFY(!controller.closeVci());
+        const auto closeRequest = std::find_if(
+            server.capturedRestRequests().cbegin(),
+            server.capturedRestRequests().cend(),
+            [](const FakeXc2HttpRequest &request) {
+                return request.target
+                    == QByteArrayLiteral("/xc2/1.0/device/close");
+            });
+        QVERIFY(closeRequest != server.capturedRestRequests().cend());
+        QCOMPARE(closeRequest->body, compactDevice(device));
+        QCOMPARE(closeRequest->headerValues(QByteArrayLiteral("Cookie")),
+                 QList<QByteArray>{QByteArrayLiteral("session=task4")});
+        QCOMPARE(
+            closeRequest->headerValues(QByteArrayLiteral("Content-Type")),
+            QList<QByteArray>{QByteArrayLiteral("application/json")});
+        QJsonParseError closeParseError;
+        const QJsonObject closeObject = QJsonDocument::fromJson(
+            closeRequest->body, &closeParseError).object();
+        QCOMPARE(closeParseError.error, QJsonParseError::NoError);
+        QCOMPARE(closeObject.size(), 4);
+        QCOMPARE(closeObject.value(QStringLiteral("id")).toString(),
+                 device.id);
+        QCOMPARE(closeObject.value(QStringLiteral("name")).toString(),
+                 device.name);
+        QCOMPARE(closeObject.value(QStringLiteral("internalName")).toString(),
+                 device.internalName);
+        QCOMPARE(closeObject.value(
+                     QStringLiteral("additionalModuleInformation"))
+                     .toString(),
+                 *device.additionalModuleInformation);
+
+        const int statusBaseline = statusChanged.count();
+        QVERIFY(server.performAction(sendTopic(
+            QStringLiteral("current-disconnected"),
+            topicMessage(
+                Topic::VciStatus,
+                QByteArrayLiteral("vci-status-subscription"),
+                QByteArrayLiteral("status-disconnected"),
+                QByteArrayLiteral("{\"voltage\":0.0,\"connected\":false}")))));
+        QTRY_COMPARE_WITH_TIMEOUT(statusChanged.count(), statusBaseline + 1,
+                                  3000);
+        const Xc2VciStatus disconnected = qvariant_cast<Xc2VciStatus>(
+            statusChanged.constLast().constFirst());
+        QCOMPARE(disconnected.voltage, 0.0);
+        QVERIFY(!disconnected.connected);
+        QCOMPARE(KtmSessionControllerTestAccess::state(controller),
+                 KtmSessionState::SessionReady);
+
+        const auto traceIndex = [&server](const QString &label) {
+            for (qsizetype index = 0; index < server.trace().size(); ++index) {
+                if (server.trace().at(index).label == label)
+                    return index;
+            }
+            return qsizetype(-1);
+        };
+        const qsizetype progressSubscription =
+            traceIndex(QStringLiteral("subscribe-progress"));
+        const qsizetype lookup = traceIndex(QStringLiteral("device-lookup"));
+        const qsizetype progress =
+            traceIndex(QStringLiteral("progress-before-lookup-response"));
+        const qsizetype lookupResponse =
+            traceIndex(QStringLiteral("lookup-response"));
+        QVERIFY(progressSubscription >= 0);
+        QVERIFY(lookup > progressSubscription);
+        QVERIFY(progress > lookup);
+        QVERIFY(lookupResponse > progress);
+        QVERIFY(server.scriptExhausted());
+        QCOMPARE(server.unexpectedOperationCount(), 0);
+        QCOMPARE(server.pendingActionCount(), 0);
+        QCOMPARE(server.canceledActionCount(), 0);
+        QCOMPARE(server.upgradeRequestCount(), 1);
+        QCOMPARE(server.webSocketConnectionCount(), 1);
+        QCOMPARE(server.stateChangingRestRequestCount(), 3);
+
+        QPointer<Xc2RestClient> oldRest =
+            KtmSessionControllerTestAccess::restGuard(controller);
+        QPointer<Xc2StompClient> oldStomp =
+            KtmSessionControllerTestAccess::stompGuard(controller);
+        QPointer<Xc2JobRegistry> oldRegistry =
+            KtmSessionControllerTestAccess::registryGuard(controller);
+        QVERIFY(oldRest && oldStomp && oldRegistry);
+        controller.stop();
+        QTRY_COMPARE_WITH_TIMEOUT(
+            KtmSessionControllerTestAccess::state(controller),
+            KtmSessionState::Stopped, 3000);
+        QCOMPARE(backendStopCount, 1);
+        QVERIFY(oldRest.isNull());
+        QVERIFY(oldStomp.isNull());
+        QVERIFY(oldRegistry.isNull());
+        QTRY_COMPARE_WITH_TIMEOUT(server.openConnectionCount(), 0, 3000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.liveSocketObjectCount(), 0, 3000);
+        controllerOwner.reset();
+        QVERIFY(controllerGuard.isNull());
+        QCOMPARE(server.unexpectedOperationCount(), 0);
+        QCOMPARE(server.pendingActionCount(), 0);
+        QCOMPARE(server.canceledActionCount(), 0);
+        QVERIFY(server.scriptExhausted());
+    }
+
     void publicSurfaceUsesOnlyOperatorDomainArguments()
     {
         using Start = bool (KtmSessionController::*)(const QString &,

@@ -9,6 +9,8 @@
 #include <QList>
 #include <QObject>
 #include <QPair>
+#include <QPointer>
+#include <QSet>
 #include <QStringList>
 #include <QUrl>
 #include <QWebSocketProtocol>
@@ -21,6 +23,7 @@ class QWebSocketServer;
 struct FakeXc2HttpRequest {
     QByteArray method;
     QByteArray target;
+    QByteArray version;
     QList<QPair<QByteArray, QByteArray>> headers;
     QByteArray rawHeaderBlock;
     QByteArray body;
@@ -42,6 +45,70 @@ class FakeXc2TransportServer final : public QObject {
     Q_OBJECT
 
 public:
+    struct Action {
+        enum class Type {
+            HttpResponse,
+            SendStompFrame,
+            CloseHttp,
+            CloseWebSocket
+        };
+
+        enum class Target {
+            EventSocket,
+            WebSocket,
+            ExpectationSocket
+        };
+
+        QString label;
+        Type type = Type::HttpResponse;
+        Target target = Target::EventSocket;
+        QString targetExpectation;
+        int delayMs = 0;
+        int status = 200;
+        QByteArray reason = QByteArrayLiteral("OK");
+        QByteArray body;
+        QList<QPair<QByteArray, QByteArray>> headers;
+        ktm::xc2::Xc2StompFrame stompFrame;
+        bool binary = false;
+        QWebSocketProtocol::CloseCode closeCode =
+            QWebSocketProtocol::CloseCodeNormal;
+        QString closeReason = QStringLiteral("scripted close");
+    };
+
+    struct Expectation {
+        enum class Protocol { Http, Stomp };
+
+        QString label;
+        Protocol protocol = Protocol::Http;
+        bool webSocketUpgrade = false;
+        QByteArray method;
+        QByteArray target;
+        QByteArray body;
+        QList<QPair<QByteArray, QByteArray>> headers;
+        QList<QByteArray> absentHeaders;
+        ktm::xc2::Xc2StompFrame stompFrame;
+        QList<Action> actions;
+    };
+
+    struct ScriptPhase {
+        QString label;
+        bool unordered = false;
+        QList<Expectation> expectations;
+        QList<Action> completionActions;
+    };
+
+    struct TraceEvent {
+        enum class Direction { Received, Sent, Canceled };
+
+        quint64 sequence = 0;
+        Direction direction = Direction::Received;
+        Expectation::Protocol protocol = Expectation::Protocol::Http;
+        quint64 connectionId = 0;
+        QString label;
+        FakeXc2HttpRequest http;
+        ktm::xc2::Xc2StompFrame stompFrame;
+    };
+
     enum class UpgradeMode {
         WebSocket,
         NoResponse,
@@ -104,6 +171,10 @@ public:
     int openConnectionCount() const;
     int stateChangingRestRequestCount() const;
     int unexpectedOperationCount() const;
+    int pendingActionCount() const;
+    int canceledActionCount() const;
+    int liveSocketObjectCount() const;
+    bool scriptExhausted() const;
     int terminalBurstExecutionCount() const;
     int terminalCloseAttemptCount() const;
     const QList<FakeXc2HttpRequest> &restRequests() const;
@@ -117,6 +188,7 @@ public:
     const QList<ktm::xc2::Xc2StompFrame> &
     attemptedTerminalFrames() const;
     const QList<ktm::xc2::Xc2Error> &decodeErrors() const;
+    const QList<TraceEvent> &trace() const;
     QUrl requestUrl() const;
     QString negotiatedSubprotocol() const;
     QWebSocketProtocol::CloseCode lastPeerCloseCode() const;
@@ -128,6 +200,8 @@ public:
     void setOutgoingFrameSize(quint64 bytes);
     void setProbeScript(ProbeScript script);
     void setProbeDelayMs(int delayMs);
+    bool setScript(QList<ScriptPhase> phases, QString *error = nullptr);
+    bool performAction(const Action &action);
 
     bool sendText(const QByteArray &payload);
     bool sendBinary(const QByteArray &payload);
@@ -151,6 +225,7 @@ signals:
 
 private:
     struct RawConnection;
+    struct PendingAction;
 
     void acceptConnections();
     void inspect(QTcpSocket *socket);
@@ -164,6 +239,39 @@ private:
     void captureMessage(QWebSocket *socket,
                         FakeXc2WebSocketMessageKind kind,
                         const QByteArray &payload);
+    bool validateScriptHttp(const FakeXc2HttpRequest &request,
+                            bool upgrade) const;
+    bool consumeScriptHttp(QTcpSocket *socket,
+                           const FakeXc2HttpRequest &request,
+                           bool upgrade, quint64 connectionId);
+    bool consumeScriptStomp(QWebSocket *socket,
+                            const ktm::xc2::Xc2StompFrame &frame,
+                            quint64 connectionId);
+    bool consumeExpectation(const Expectation &expectation, int index,
+                            QTcpSocket *httpSocket,
+                            QWebSocket *webSocket,
+                            quint64 connectionId,
+                            const FakeXc2HttpRequest *request,
+                            const ktm::xc2::Xc2StompFrame *frame);
+    void runActions(const QList<Action> &actions,
+                    QTcpSocket *eventHttpSocket,
+                    QWebSocket *eventWebSocket,
+                    quint64 eventConnectionId);
+    bool scheduleAction(const Action &action,
+                        QTcpSocket *httpSocket,
+                        QWebSocket *webSocket,
+                        quint64 connectionId);
+    bool executeAction(const Action &action,
+                       QTcpSocket *httpSocket,
+                       QWebSocket *webSocket,
+                       quint64 connectionId);
+    bool sendFrameTo(QWebSocket *socket,
+                     const ktm::xc2::Xc2StompFrame &frame,
+                     bool binary = false);
+    void cancelPendingActions(QTcpSocket *socket);
+    void cancelPendingActions(QWebSocket *socket);
+    void appendTrace(TraceEvent event);
+    QWebSocket *activeWebSocket() const;
     static FakeXc2HttpRequest parseRequest(const QByteArray &headerBlock);
 
     QTcpServer *m_tcpServer = nullptr;
@@ -181,6 +289,21 @@ private:
     QList<ktm::xc2::Xc2StompFrame> m_attemptedTerminalFrames;
     QList<ktm::xc2::Xc2Error> m_decodeErrors;
     QHash<QWebSocket *, ktm::xc2::Xc2StompCodec> m_codecs;
+    QHash<QWebSocket *, quint64> m_webSocketIds;
+    QList<quint64> m_pendingUpgradeConnectionIds;
+    QPointer<QWebSocket> m_activeWebSocket;
+    QList<QPointer<QObject>> m_retiredSocketObjects;
+    QList<ScriptPhase> m_script;
+    qsizetype m_scriptPhaseIndex = 0;
+    QSet<int> m_consumedExpectations;
+    QHash<QString, QPointer<QTcpSocket>> m_phaseHttpSockets;
+    QHash<QString, QPointer<QWebSocket>> m_phaseWebSockets;
+    QHash<QString, quint64> m_phaseConnectionIds;
+    QList<PendingAction *> m_pendingActions;
+    QList<TraceEvent> m_trace;
+    quint64 m_nextTraceSequence = 1;
+    quint64 m_nextConnectionId = 1;
+    bool m_scriptEnabled = false;
     QByteArray m_restCookie = QByteArrayLiteral("session=synthetic");
     UpgradeMode m_upgradeMode = UpgradeMode::WebSocket;
     QUrl m_redirectTarget;
@@ -192,11 +315,14 @@ private:
     int m_webSocketDisconnectionCount = 0;
     int m_stateChangingRestRequestCount = 0;
     int m_unexpectedOperationCount = 0;
+    int m_canceledActionCount = 0;
     int m_terminalBurstExecutionCount = 0;
     int m_terminalCloseAttemptCount = 0;
     QElapsedTimer m_connectionElapsed;
     QWebSocketProtocol::CloseCode m_lastPeerCloseCode =
         QWebSocketProtocol::CloseCodeNormal;
+    QUrl m_lastRequestUrl;
+    QString m_lastNegotiatedSubprotocol;
 };
 
 Q_DECLARE_METATYPE(FakeXc2WebSocketMessageKind)

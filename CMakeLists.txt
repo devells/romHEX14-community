@@ -577,6 +577,8 @@ endif()
 
 if(BUILD_TESTING AND RX14_KTM_XC2)
     add_executable(test_KtmSessionController
+        tests/ktm/FakeXc2TransportServer.cpp
+        tests/ktm/FakeXc2TransportServer.h
         tests/ktm/test_KtmSessionController.cpp
     )
     target_link_libraries(test_KtmSessionController PRIVATE
