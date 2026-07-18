@@ -37,9 +37,28 @@ public:
     }
 
     static void setDisconnectOp(KtmSessionController &controller,
-                                std::function<void()> disconnect)
+                                 std::function<void()> disconnect)
     {
         controller.m_testOps.disconnectStomp = std::move(disconnect);
+    }
+
+    static void setAbortRestOp(
+        KtmSessionController &controller,
+        std::function<void(xc2::Xc2RequestId)> abortRest)
+    {
+        controller.m_testOps.abortRest = std::move(abortRest);
+    }
+
+    static void setAbortStompOp(KtmSessionController &controller,
+                                std::function<void()> abortStomp)
+    {
+        controller.m_testOps.abortStomp = std::move(abortStomp);
+    }
+
+    static void setStopBackendOp(KtmSessionController &controller,
+                                 std::function<void()> stopBackend)
+    {
+        controller.m_testOps.stopBackend = std::move(stopBackend);
     }
 
     static KtmSessionState state(const KtmSessionController &controller)
@@ -51,6 +70,12 @@ public:
         const KtmSessionController &controller)
     {
         return controller.m_operation;
+    }
+
+    static void setOperation(KtmSessionController &controller,
+                             KtmSessionOperation operation)
+    {
+        controller.m_operation = operation;
     }
 
     static quint64 sessionEpoch(const KtmSessionController &controller)
@@ -81,17 +106,17 @@ public:
 
     static quintptr restIdentity(const KtmSessionController &controller)
     {
-        return reinterpret_cast<quintptr>(controller.m_restClient);
+        return reinterpret_cast<quintptr>(controller.m_restClient.data());
     }
 
     static quintptr stompIdentity(const KtmSessionController &controller)
     {
-        return reinterpret_cast<quintptr>(controller.m_stompClient);
+        return reinterpret_cast<quintptr>(controller.m_stompClient.data());
     }
 
     static quintptr registryIdentity(const KtmSessionController &controller)
     {
-        return reinterpret_cast<quintptr>(controller.m_jobRegistry);
+        return reinterpret_cast<quintptr>(controller.m_jobRegistry.data());
     }
 
     static QPointer<xc2::Xc2RestClient> restGuard(
@@ -120,22 +145,26 @@ public:
 
     static void destroyBackendChild(KtmSessionController &controller)
     {
-        auto *backend = std::exchange(controller.m_backend, nullptr);
-        delete backend;
+        QPointer<xc2::Xc2BackendManager> backend = controller.m_backend;
+        controller.m_backend = nullptr;
+        delete backend.data();
     }
 
     static void destroyRestChild(KtmSessionController &controller)
     {
-        auto *rest = std::exchange(controller.m_restClient, nullptr);
-        delete rest;
+        QPointer<xc2::Xc2RestClient> rest = controller.m_restClient;
+        controller.m_restClient = nullptr;
+        delete rest.data();
     }
 
     static void destroyTransportChildren(KtmSessionController &controller)
     {
-        auto *rest = std::exchange(controller.m_restClient, nullptr);
-        auto *stomp = std::exchange(controller.m_stompClient, nullptr);
-        delete rest;
-        delete stomp;
+        QPointer<xc2::Xc2RestClient> rest = controller.m_restClient;
+        QPointer<xc2::Xc2StompClient> stomp = controller.m_stompClient;
+        controller.m_restClient = nullptr;
+        controller.m_stompClient = nullptr;
+        delete rest.data();
+        delete stomp.data();
     }
 
     static void backendStateChanged(KtmSessionController &controller,
@@ -791,11 +820,16 @@ private slots:
                 KtmSessionControllerTestAccess::destroyTransportChildren(
                     harness.controller);
             }, Qt::DirectConnection);
+        harness.backendState = Xc2BackendState::Stopped;
 
         harness.controller.stop();
 
         QVERIFY(destroyed);
-        QVERIFY(harness.trace.isEmpty());
+        QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
+                 KtmSessionState::Stopped);
+        QVERIFY(!KtmSessionControllerTestAccess::stopping(
+            harness.controller));
+        QVERIFY(harness.start());
     }
 
     void failureProjectionRevalidatesTransportBeforeTeardownCall()
@@ -823,7 +857,121 @@ private slots:
                                                     failure);
 
         QVERIFY(destroyed);
-        QVERIFY(harness.trace.isEmpty());
+        QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
+                 KtmSessionState::Failed);
+        harness.backendState = Xc2BackendState::Stopped;
+        harness.controller.stop();
+        QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
+                 KtmSessionState::Stopped);
+        QVERIFY(harness.start());
+    }
+
+    void teardownSiblingMutationRecoversTransaction_data()
+    {
+        QTest::addColumn<bool>("failureTransaction");
+        QTest::addColumn<bool>("mutateStompAfterRestAbort");
+        QTest::newRow("stop-rest-to-stomp") << false << true;
+        QTest::newRow("stop-stomp-to-rest") << false << false;
+        QTest::newRow("fail-rest-to-stomp") << true << true;
+        QTest::newRow("fail-stomp-to-rest") << true << false;
+    }
+
+    void teardownSiblingMutationRecoversTransaction()
+    {
+        QFETCH(bool, failureTransaction);
+        QFETCH(bool, mutateStompAfterRestAbort);
+        BootstrapHarness harness;
+        harness.completeBootstrap();
+        QVERIFY(harness.controller.lookupVci());
+        KtmSessionControllerTestAccess::subscriptionSent(
+            harness.controller, Topic::Progress);
+        QPointer<Xc2RestClient> rest =
+            KtmSessionControllerTestAccess::restGuard(harness.controller);
+        QPointer<Xc2StompClient> stomp =
+            KtmSessionControllerTestAccess::stompGuard(harness.controller);
+        QVERIFY(rest);
+        QVERIFY(stomp);
+        bool mutated = false;
+        quint64 mutationEpoch = 0;
+        int sameEpochSiblingCalls = 0;
+        KtmSessionControllerTestAccess::setAbortRestOp(
+            harness.controller,
+            [&harness, &stomp, &mutated, &mutationEpoch,
+             mutateStompAfterRestAbort](Xc2RequestId id) {
+                harness.trace.append(
+                    QStringLiteral("abort-rest:%1").arg(id));
+                if (!mutateStompAfterRestAbort || mutated)
+                    return;
+                mutated = true;
+                mutationEpoch = KtmSessionControllerTestAccess::sessionEpoch(
+                    harness.controller);
+                delete stomp.data();
+            });
+        KtmSessionControllerTestAccess::setDisconnectOp(
+            harness.controller,
+            [&harness, &mutated, &mutationEpoch, &sameEpochSiblingCalls,
+             mutateStompAfterRestAbort] {
+                harness.trace.append(QStringLiteral("disconnect-stomp"));
+                const quint64 epoch =
+                    KtmSessionControllerTestAccess::sessionEpoch(
+                        harness.controller);
+                if (mutateStompAfterRestAbort) {
+                    if (mutated && epoch == mutationEpoch)
+                        ++sameEpochSiblingCalls;
+                    return;
+                }
+                if (mutated)
+                    return;
+                mutated = true;
+                mutationEpoch = epoch;
+                KtmSessionControllerTestAccess::destroyRestChild(
+                    harness.controller);
+            });
+        KtmSessionControllerTestAccess::setAbortStompOp(
+            harness.controller,
+            [&harness, &mutated, &mutationEpoch, &sameEpochSiblingCalls,
+             mutateStompAfterRestAbort] {
+                harness.trace.append(QStringLiteral("abort-stomp"));
+                if (!mutateStompAfterRestAbort && mutated
+                    && KtmSessionControllerTestAccess::sessionEpoch(
+                           harness.controller) == mutationEpoch) {
+                    ++sameEpochSiblingCalls;
+                }
+            });
+        KtmSessionControllerTestAccess::setStopBackendOp(
+            harness.controller, [&harness] {
+                harness.trace.append(QStringLiteral("stop-backend"));
+                harness.backendState = Xc2BackendState::Stopped;
+                KtmSessionControllerTestAccess::emitBackendStateChanged(
+                    harness.controller, Xc2BackendState::Stopped);
+            });
+        harness.trace.clear();
+
+        if (failureTransaction) {
+            Xc2Error failure;
+            failure.category = Xc2ErrorCategory::Transport;
+            failure.message = QStringLiteral("sibling mutation");
+            KtmSessionControllerTestAccess::failSession(harness.controller,
+                                                        failure);
+        } else {
+            harness.controller.stop();
+        }
+
+        QVERIFY(mutated);
+        QCOMPARE(sameEpochSiblingCalls, 0);
+        if (failureTransaction) {
+            QCOMPARE(KtmSessionControllerTestAccess::state(
+                         harness.controller), KtmSessionState::Failed);
+            harness.controller.stop();
+        }
+        QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
+                 KtmSessionState::Stopped);
+        QVERIFY(!KtmSessionControllerTestAccess::stopping(
+            harness.controller));
+        harness.trace.clear();
+        QVERIFY(harness.start());
+        QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
+                 KtmSessionState::BackendStarting);
     }
 
     void lookupOperationProjectionCannotOverwriteBackendStop()
@@ -930,6 +1078,207 @@ private slots:
         QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
                  KtmSessionState::Stopped);
         QCOMPARE(failed.count(), 0);
+    }
+
+    void directlyDestroyedOwnedChildRecoversThroughStopAndFreshStart_data()
+    {
+        QTest::addColumn<int>("childKind");
+        QTest::newRow("backend") << 0;
+        QTest::newRow("rest") << 1;
+        QTest::newRow("stomp") << 2;
+        QTest::newRow("registry") << 3;
+    }
+
+    void directlyDestroyedOwnedChildRecoversThroughStopAndFreshStart()
+    {
+        QFETCH(int, childKind);
+        BootstrapHarness harness;
+        harness.completeBootstrap();
+        QObject *child = nullptr;
+        switch (childKind) {
+        case 0:
+            child = KtmSessionControllerTestAccess::backendGuard(
+                        harness.controller).data();
+            break;
+        case 1:
+            child = KtmSessionControllerTestAccess::restGuard(
+                        harness.controller).data();
+            break;
+        case 2:
+            child = KtmSessionControllerTestAccess::stompGuard(
+                        harness.controller).data();
+            break;
+        default:
+            child = KtmSessionControllerTestAccess::registryGuard(
+                        harness.controller).data();
+            break;
+        }
+        QPointer<QObject> destroyedGuard = child;
+
+        delete child;
+
+        QVERIFY(destroyedGuard.isNull());
+        harness.backendState = Xc2BackendState::Stopped;
+        harness.trace.clear();
+        harness.controller.stop();
+        QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
+                 KtmSessionState::Stopped);
+        QVERIFY(!KtmSessionControllerTestAccess::stopping(
+            harness.controller));
+
+        harness.trace.clear();
+        QVERIFY(harness.start());
+        QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
+                 KtmSessionState::BackendStarting);
+        QCOMPARE(harness.trace,
+                 QStringList({QStringLiteral("start:C:/XC2")}));
+    }
+
+    void directlyDestroyedRegistryThenSiblingSignalFailsSafely()
+    {
+        BootstrapHarness harness;
+        harness.completeBootstrap();
+        QPointer<Xc2JobRegistry> registry =
+            KtmSessionControllerTestAccess::registryGuard(
+                harness.controller);
+        QVERIFY(registry);
+        QSignalSpy failed(&harness.controller,
+                          &KtmSessionController::failed);
+
+        delete registry.data();
+
+        QVERIFY(registry.isNull());
+        Xc2Error error;
+        error.category = Xc2ErrorCategory::Transport;
+        error.message = QStringLiteral("registry sibling callback");
+        KtmSessionControllerTestAccess::stompErrorThenVisibility(
+            harness.controller, harness.generation, error);
+
+        QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
+                 KtmSessionState::Failed);
+        QCOMPARE(failed.count(), 1);
+        QVERIFY(KtmSessionControllerTestAccess::registryGuard(
+            harness.controller));
+    }
+
+    void pendingStopCompletesWhenBackendChildIsDestroyed()
+    {
+        BootstrapHarness harness;
+        harness.completeBootstrap();
+        QPointer<Xc2BackendManager> backend =
+            KtmSessionControllerTestAccess::backendGuard(
+                harness.controller);
+        QVERIFY(backend);
+
+        harness.controller.stop();
+
+        QVERIFY(KtmSessionControllerTestAccess::stopping(
+            harness.controller));
+        delete backend.data();
+        QVERIFY(backend.isNull());
+        harness.controller.stop();
+
+        QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
+                 KtmSessionState::Stopped);
+        QVERIFY(!KtmSessionControllerTestAccess::stopping(
+            harness.controller));
+        harness.backendState = Xc2BackendState::Stopped;
+        harness.trace.clear();
+        QVERIFY(harness.start());
+        QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
+                 KtmSessionState::BackendStarting);
+    }
+
+    void backendTerminalDuringStopProjectionFinishesSessionTeardown_data()
+    {
+        QTest::addColumn<bool>("destroyBackend");
+        QTest::newRow("destroyed") << true;
+        QTest::newRow("stopped-signal") << false;
+    }
+
+    void backendTerminalDuringStopProjectionFinishesSessionTeardown()
+    {
+        QFETCH(bool, destroyBackend);
+        BootstrapHarness harness;
+        harness.completeBootstrap();
+        QVERIFY(harness.controller.lookupVci());
+        KtmSessionControllerTestAccess::subscriptionSent(
+            harness.controller, Topic::Progress);
+        QPointer<Xc2BackendManager> backend =
+            KtmSessionControllerTestAccess::backendGuard(
+                harness.controller);
+        QPointer<Xc2RestClient> rest =
+            KtmSessionControllerTestAccess::restGuard(harness.controller);
+        QPointer<Xc2StompClient> stomp =
+            KtmSessionControllerTestAccess::stompGuard(harness.controller);
+        QPointer<Xc2JobRegistry> registry =
+            KtmSessionControllerTestAccess::registryGuard(
+                harness.controller);
+        harness.trace.clear();
+        QObject::connect(
+            &harness.controller, &KtmSessionController::operationChanged,
+            &harness.controller,
+            [&harness, &backend, destroyBackend](KtmSessionOperation operation) {
+                if (operation != KtmSessionOperation::None || !backend)
+                    return;
+                if (destroyBackend)
+                    delete backend.data();
+                else
+                    KtmSessionControllerTestAccess::emitBackendStateChanged(
+                        harness.controller, Xc2BackendState::Stopped);
+                harness.controller.stop();
+            }, Qt::DirectConnection);
+
+        harness.controller.stop();
+
+        QCOMPARE(backend.isNull(), destroyBackend);
+        QVERIFY(rest.isNull());
+        QVERIFY(stomp.isNull());
+        QVERIFY(registry.isNull());
+        QVERIFY(harness.trace.contains(QStringLiteral("abort-rest:21")));
+        QVERIFY(harness.trace.contains(QStringLiteral("disconnect-stomp")));
+        QVERIFY(harness.trace.contains(QStringLiteral("abort-stomp")));
+        QVERIFY(harness.trace.contains(QStringLiteral("reset-session")));
+        QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
+                 KtmSessionState::Stopped);
+        QVERIFY(!KtmSessionControllerTestAccess::stopping(
+            harness.controller));
+    }
+
+    void startNormalizationCannotLeakBackendTerminalIntoNextStop()
+    {
+        BootstrapHarness harness;
+        KtmSessionControllerTestAccess::setOperation(
+            harness.controller, KtmSessionOperation::Lookup);
+        bool injected = false;
+        QObject::connect(
+            &harness.controller, &KtmSessionController::operationChanged,
+            &harness.controller,
+            [&harness, &injected](KtmSessionOperation operation) {
+                if (operation != KtmSessionOperation::None || injected)
+                    return;
+                injected = true;
+                KtmSessionControllerTestAccess::emitBackendStateChanged(
+                    harness.controller, Xc2BackendState::Stopped);
+            }, Qt::DirectConnection);
+
+        QVERIFY(harness.start());
+        QVERIFY(injected);
+        harness.backendState = Xc2BackendState::Ready;
+        harness.trace.clear();
+
+        harness.controller.stop();
+
+        QVERIFY(harness.trace.contains(QStringLiteral("stop-backend")));
+        QVERIFY(KtmSessionControllerTestAccess::stopping(
+            harness.controller));
+        QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
+                 KtmSessionState::BackendStarting);
+        harness.backendState = Xc2BackendState::Stopped;
+        KtmSessionControllerTestAccess::emitBackendStateChanged(
+            harness.controller, Xc2BackendState::Stopped);
+        QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
+                 KtmSessionState::Stopped);
     }
 
     void rejectsPublishedWebSocketAuthorityMismatch()
@@ -1630,6 +1979,105 @@ private slots:
             harness.controller));
     }
 
+    void nestedTransportFailureSupersedesTerminalProjection_data()
+    {
+        QTest::addColumn<int>("projectionKind");
+        QTest::newRow("vci-ready") << 0;
+        QTest::newRow("lookup-ready") << 1;
+        QTest::newRow("close-ready") << 2;
+    }
+
+    void nestedTransportFailureSupersedesTerminalProjection()
+    {
+        QFETCH(int, projectionKind);
+        BootstrapHarness harness;
+        harness.completeBootstrap();
+        if (projectionKind == 0) {
+            QVERIFY(harness.controller.applyVci(approvedDevice()));
+            KtmSessionControllerTestAccess::applyDeviceFinished(
+                harness.controller, harness.applyId);
+            KtmSessionControllerTestAccess::selectedDeviceFinished(
+                harness.controller, harness.selectedId,
+                Xc2Result<Xc2SelectedVci>::success({approvedDevice()}));
+        } else if (projectionKind == 1) {
+            QVERIFY(harness.controller.lookupVci());
+            KtmSessionControllerTestAccess::subscriptionSent(
+                harness.controller, Topic::Progress);
+            KtmSessionControllerTestAccess::deviceLookupFinished(
+                harness.controller, harness.lookupId,
+                Xc2Result<Xc2JobAccepted>::success(
+                    {QStringLiteral("job-nested-failure")}));
+            KtmSessionControllerTestAccess::stompMessage(
+                harness.controller,
+                progressMessage(harness.generation,
+                                QStringLiteral("job-nested-failure"),
+                                Xc2JobState::Finished));
+        } else {
+            completeReadyApply(harness);
+            QVERIFY(harness.controller.closeVci());
+        }
+        QPointer<Xc2RestClient> oldRest =
+            KtmSessionControllerTestAccess::restGuard(harness.controller);
+        QPointer<Xc2StompClient> oldStomp =
+            KtmSessionControllerTestAccess::stompGuard(harness.controller);
+        QPointer<Xc2JobRegistry> oldRegistry =
+            KtmSessionControllerTestAccess::registryGuard(
+                harness.controller);
+        QSignalSpy ready(&harness.controller,
+                         &KtmSessionController::vciReady);
+        QSignalSpy lookupFinished(
+            &harness.controller,
+            &KtmSessionController::vciLookupFinished);
+        QSignalSpy closed(&harness.controller,
+                          &KtmSessionController::vciClosed);
+        QSignalSpy failed(&harness.controller,
+                          &KtmSessionController::failed);
+        const KtmSessionState targetState = projectionKind == 0
+            ? KtmSessionState::VciReady : KtmSessionState::SessionReady;
+        bool nestedFailureDelivered = false;
+        QObject::connect(
+            &harness.controller, &KtmSessionController::stateChanged,
+            &harness.controller,
+            [&harness, targetState, &nestedFailureDelivered](
+                KtmSessionState state) {
+                if (state != targetState || nestedFailureDelivered)
+                    return;
+                nestedFailureDelivered = true;
+                Xc2Error error;
+                error.category = Xc2ErrorCategory::Transport;
+                error.message = QStringLiteral("nested transport failure");
+                KtmSessionControllerTestAccess::stompErrorThenVisibility(
+                    harness.controller, harness.generation, error);
+            }, Qt::DirectConnection);
+
+        if (projectionKind == 0) {
+            KtmSessionControllerTestAccess::stompMessage(
+                harness.controller,
+                vciStatusMessage(harness.generation, true, 12.4));
+        } else if (projectionKind == 1) {
+            KtmSessionControllerTestAccess::devicesFinished(
+                harness.controller, harness.devicesId,
+                Xc2Result<QList<Xc2VciDevice>>::success(
+                    {approvedDevice()}));
+        } else {
+            KtmSessionControllerTestAccess::closeDeviceFinished(
+                harness.controller, harness.closeId);
+        }
+
+        QVERIFY(nestedFailureDelivered);
+        QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
+                 KtmSessionState::Failed);
+        QCOMPARE(KtmSessionControllerTestAccess::operation(
+                     harness.controller), KtmSessionOperation::None);
+        QCOMPARE(failed.count(), 1);
+        QCOMPARE(ready.count(), 0);
+        QCOMPARE(lookupFinished.count(), 0);
+        QCOMPARE(closed.count(), 0);
+        QVERIFY(oldRest.isNull());
+        QVERIFY(oldStomp.isNull());
+        QVERIFY(oldRegistry.isNull());
+    }
+
     void staleRequestEpochAndGenerationCallbacksAreIgnored()
     {
         BootstrapHarness harness;
@@ -2002,26 +2450,32 @@ private slots:
 
     void destroyedSessionChildCannotReenterResetTransaction()
     {
-        auto *controller = new KtmSessionController;
-        QPointer<KtmSessionController> controllerGuard(controller);
+        BootstrapHarness harness;
         QPointer<Xc2RestClient> oldRest =
-            KtmSessionControllerTestAccess::restGuard(*controller);
+            KtmSessionControllerTestAccess::restGuard(harness.controller);
         QVERIFY(oldRest);
         int destroyedReentryCount = 0;
         QObject::connect(
-            oldRest, &QObject::destroyed, controller,
-            [controller, &destroyedReentryCount] {
+            oldRest, &QObject::destroyed, &harness.controller,
+            [&harness, &destroyedReentryCount] {
                 ++destroyedReentryCount;
-                controller->stop();
+                harness.controller.stop();
             }, Qt::DirectConnection);
+        harness.trace.clear();
 
-        Xc2Error ignored;
-        controller->startProduction(QStringLiteral("Z:/missing-xc2"),
-                                    &ignored);
+        QVERIFY(!harness.start());
 
-        QVERIFY(controllerGuard);
         QCOMPARE(destroyedReentryCount, 1);
-        delete controller;
+        QVERIFY(!harness.trace.contains(QStringLiteral("start:C:/XC2")));
+        QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
+                 KtmSessionState::Stopped);
+        QVERIFY(!KtmSessionControllerTestAccess::stopping(
+            harness.controller));
+
+        harness.trace.clear();
+        QVERIFY(harness.start());
+        QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
+                 KtmSessionState::BackendStarting);
     }
 
     void deletingControllerInsideStateAndFailureSignalsIsSafe_data()

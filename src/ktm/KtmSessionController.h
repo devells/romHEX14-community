@@ -6,6 +6,7 @@
 #include "xc2/Xc2StompClient.h"
 
 #include <QObject>
+#include <QPointer>
 #include <QUrl>
 
 #include <functional>
@@ -83,9 +84,19 @@ private:
         std::function<void()> stopBackend;
     };
 
+    struct PendingFailure {
+        xc2::Xc2Error error;
+        quint64 sessionEpoch = 0;
+        QPointer<xc2::Xc2StompClient> stompClient;
+        quintptr stompIdentity = 0;
+        xc2::Xc2StompGeneration generation = 0;
+    };
+
+    void ensureBackendManager();
     bool publishState(KtmSessionState state);
     bool publishOperation(KtmSessionOperation operation);
     bool failSession(const xc2::Xc2Error &error);
+    bool drainPendingFailure();
     bool failLocal(xc2::Xc2ErrorCategory category, const QString &message);
     bool resetSessionObjects(bool notifyTest = false);
     bool callbackMatches(quint64 epoch, quintptr identity,
@@ -163,10 +174,10 @@ private:
     void revokeReadinessToSession(const xc2::Xc2Error &error);
 
     PrivateTestOps m_testOps;
-    xc2::Xc2BackendManager *m_backend = nullptr;
-    xc2::Xc2RestClient *m_restClient = nullptr;
-    xc2::Xc2StompClient *m_stompClient = nullptr;
-    xc2::Xc2JobRegistry *m_jobRegistry = nullptr;
+    QPointer<xc2::Xc2BackendManager> m_backend;
+    QPointer<xc2::Xc2RestClient> m_restClient;
+    QPointer<xc2::Xc2StompClient> m_stompClient;
+    QPointer<xc2::Xc2JobRegistry> m_jobRegistry;
     KtmSessionState m_state = KtmSessionState::Stopped;
     KtmSessionOperation m_operation = KtmSessionOperation::None;
     quint64 m_sessionEpoch = 0;
@@ -193,6 +204,11 @@ private:
     bool m_resetting = false;
     bool m_projectingPayload = false;
     bool m_failing = false;
+    bool m_stopRequestedDuringReset = false;
+    bool m_stopTeardownActive = false;
+    bool m_awaitingBackendStop = false;
+    bool m_backendStoppedDuringTeardown = false;
+    std::optional<PendingFailure> m_pendingFailure;
 };
 
 } // namespace ktm

@@ -28,24 +28,42 @@ bool sameEncodedUrl(const QUrl &left, const QUrl &right)
 } // namespace
 
 KtmSessionController::KtmSessionController(QObject *parent)
-    : QObject(parent), m_backend(new xc2::Xc2BackendManager(this))
+    : QObject(parent)
 {
     qRegisterMetaType<KtmSessionState>();
     qRegisterMetaType<KtmSessionOperation>();
 
-    connect(m_backend, &xc2::Xc2BackendManager::stateChanged,
+    ensureBackendManager();
+    resetSessionObjects();
+}
+
+void KtmSessionController::ensureBackendManager()
+{
+    if (m_backend)
+        return;
+    auto *backend = new xc2::Xc2BackendManager(this);
+    m_backend = backend;
+    connect(backend, &xc2::Xc2BackendManager::stateChanged,
             this, [this](xc2::Xc2BackendState state) {
         handleBackendStateChanged(state);
     });
-    connect(m_backend, &xc2::Xc2BackendManager::ready,
+    connect(backend, &xc2::Xc2BackendManager::ready,
             this, [this](const xc2::Xc2BackendEndpoints &endpoints) {
         handleBackendReady(endpoints);
     });
-    connect(m_backend, &xc2::Xc2BackendManager::failed,
+    connect(backend, &xc2::Xc2BackendManager::failed,
             this, [this](const xc2::Xc2Error &error) {
         handleBackendFailed(error);
     });
-    resetSessionObjects();
+    connect(backend, &QObject::destroyed, this, [this] {
+        if (m_backend || !m_stopTeardownActive || !m_stopping)
+            return;
+        if (m_resetting || !m_awaitingBackendStop) {
+            m_backendStoppedDuringTeardown = true;
+            return;
+        }
+        handleBackendStateChanged(xc2::Xc2BackendState::Stopped);
+    });
 }
 
 bool KtmSessionController::startProduction(const QString &installRoot,
@@ -53,6 +71,11 @@ bool KtmSessionController::startProduction(const QString &installRoot,
 {
     if (m_resetting || m_stopping || m_projectingPayload || m_failing)
         return false;
+    m_pendingFailure.reset();
+    m_stopTeardownActive = false;
+    m_awaitingBackendStop = false;
+    m_backendStoppedDuringTeardown = false;
+    ensureBackendManager();
     const quint64 entryEpoch = m_sessionEpoch;
     const KtmSessionState entryState = m_state;
     const KtmSessionOperation entryOperation = m_operation;
@@ -315,9 +338,30 @@ bool KtmSessionController::closeVci(xc2::Xc2Error *error)
 
 void KtmSessionController::stop()
 {
-    if (m_stopping || m_resetting || m_projectingPayload)
+    if (m_resetting) {
+        if (!m_stopping)
+            m_stopRequestedDuringReset = true;
         return;
+    }
+    if (m_stopping || m_projectingPayload)
+        return;
+    if (m_state == KtmSessionState::Stopped
+        && m_operation == KtmSessionOperation::None) {
+        m_pendingFailure.reset();
+        m_stopRequestedDuringReset = false;
+        m_failing = false;
+        m_stopTeardownActive = false;
+        m_awaitingBackendStop = false;
+        m_backendStoppedDuringTeardown = false;
+        return;
+    }
+    m_pendingFailure.reset();
+    m_stopRequestedDuringReset = false;
     m_failing = false;
+    if (!m_stopTeardownActive)
+        m_backendStoppedDuringTeardown = false;
+    m_stopTeardownActive = true;
+    m_awaitingBackendStop = false;
     m_stopping = true;
     ++m_sessionEpoch;
     ++m_selectionEpoch;
@@ -344,64 +388,92 @@ void KtmSessionController::stop()
     const quint64 stopEpoch = m_sessionEpoch;
     QPointer<xc2::Xc2RestClient> restGuard = m_restClient;
     QPointer<xc2::Xc2StompClient> stompComponentGuard = m_stompClient;
+    const quintptr restIdentity =
+        reinterpret_cast<quintptr>(m_restClient.data());
+    const quintptr stompIdentity =
+        reinterpret_cast<quintptr>(m_stompClient.data());
     QPointer<KtmSessionController> stopGuard(this);
     const KtmSessionState stopState = m_state;
-    if (!publishOperation(KtmSessionOperation::None) || !stopGuard
-        || stopEpoch != m_sessionEpoch || !restGuard
-        || restGuard != m_restClient || !stompComponentGuard
-        || stompComponentGuard != m_stompClient
-        || m_operation != KtmSessionOperation::None
-        || !m_stopping || m_state != stopState) {
+    const auto coreValid = [&]() {
+        return stopGuard && stopEpoch == m_sessionEpoch && m_stopping
+            && m_state == stopState
+            && m_operation == KtmSessionOperation::None;
+    };
+    const auto componentsValid = [&]() {
+        return coreValid()
+            && restIdentity
+                == reinterpret_cast<quintptr>(m_restClient.data())
+            && stompIdentity
+                == reinterpret_cast<quintptr>(m_stompClient.data())
+            && (restIdentity == 0 || restGuard)
+            && (stompIdentity == 0 || stompComponentGuard);
+    };
+    const auto recoverInterruptedStop = [&]() {
+        if (!stopGuard || !m_stopping || stopEpoch != m_sessionEpoch)
+            return;
+        m_awaitingBackendStop = false;
+        m_stopping = false;
+        stop();
+    };
+    if (!publishOperation(KtmSessionOperation::None)
+        || !componentsValid()) {
+        recoverInterruptedStop();
         return;
     }
 
     QList<xc2::Xc2RequestId> aborted;
     for (xc2::Xc2RequestId id : pendingIds) {
-        if (id != 0 && !aborted.contains(id)) {
+        if (restGuard && id != 0 && !aborted.contains(id)) {
             aborted.append(id);
             abortRest(id);
-            if (!stopGuard || stopEpoch != m_sessionEpoch
-                || !restGuard || restGuard != m_restClient
-                || m_operation != KtmSessionOperation::None
-                || !m_stopping || m_state != stopState) {
+            if (!componentsValid()) {
+                recoverInterruptedStop();
                 return;
             }
         }
     }
-    disconnectStomp();
-    if (!stopGuard || stopEpoch != m_sessionEpoch
-        || !stompComponentGuard || stompComponentGuard != m_stompClient
-        || m_operation != KtmSessionOperation::None
-        || !m_stopping || m_state != stopState) {
-        return;
+    if (stompComponentGuard) {
+        disconnectStomp();
+        if (!componentsValid()) {
+            recoverInterruptedStop();
+            return;
+        }
+        abortStomp();
+        if (!componentsValid()) {
+            recoverInterruptedStop();
+            return;
+        }
     }
-    abortStomp();
-    if (!stopGuard || stopEpoch != m_sessionEpoch
-        || !stompComponentGuard || stompComponentGuard != m_stompClient
-        || m_operation != KtmSessionOperation::None
-        || !m_stopping || m_state != stopState) {
-        return;
-    }
-    if (!resetSessionObjects(true) || !stopGuard
-        || stopEpoch != m_sessionEpoch
-        || m_operation != KtmSessionOperation::None
-        || !m_stopping || m_state != stopState) {
+    if (!resetSessionObjects(true) || !coreValid()) {
+        recoverInterruptedStop();
         return;
     }
     QPointer<xc2::Xc2BackendManager> backendGuard = m_backend;
+    const quintptr backendIdentity =
+        reinterpret_cast<quintptr>(m_backend.data());
     const xc2::Xc2BackendState observedBackendState = backendState();
-    if (!stopGuard || stopEpoch != m_sessionEpoch
-        || !backendGuard || backendGuard != m_backend
-        || !m_stopping || m_operation != KtmSessionOperation::None
-        || m_state != stopState) {
+    if (!coreValid()
+        || backendIdentity
+            != reinterpret_cast<quintptr>(m_backend.data())
+        || (backendIdentity != 0 && !backendGuard)) {
+        recoverInterruptedStop();
         return;
     }
-    if (observedBackendState == xc2::Xc2BackendState::Stopped) {
-        m_stopping = false;
-        publishState(KtmSessionState::Stopped);
+    m_awaitingBackendStop = true;
+    if (m_backendStoppedDuringTeardown || !m_backend
+        || observedBackendState == xc2::Xc2BackendState::Stopped) {
+        handleBackendStateChanged(xc2::Xc2BackendState::Stopped);
         return;
     }
     stopBackend();
+    if (!stopGuard)
+        return;
+    if (!coreValid()
+        || backendIdentity
+            != reinterpret_cast<quintptr>(m_backend.data())
+        || (backendIdentity != 0 && !backendGuard)) {
+        recoverInterruptedStop();
+    }
 }
 
 bool KtmSessionController::publishState(KtmSessionState state)
@@ -426,8 +498,25 @@ bool KtmSessionController::publishOperation(KtmSessionOperation operation)
 
 bool KtmSessionController::failSession(const xc2::Xc2Error &error)
 {
-    if (m_resetting || m_stopping || m_projectingPayload || m_failing)
+    if (m_projectingPayload) {
+        if (!m_resetting && !m_stopping && !m_failing) {
+            PendingFailure pending;
+            pending.error = error;
+            pending.sessionEpoch = m_sessionEpoch;
+            pending.stompClient = m_stompClient;
+            pending.stompIdentity =
+                reinterpret_cast<quintptr>(m_stompClient.data());
+            pending.generation = m_stompGeneration;
+            m_pendingFailure = std::move(pending);
+        }
         return false;
+    }
+    if (m_resetting || m_stopping || m_failing)
+        return false;
+    m_pendingFailure.reset();
+    m_stopTeardownActive = false;
+    m_awaitingBackendStop = false;
+    m_backendStoppedDuringTeardown = false;
     const xc2::Xc2Error stableError = error;
     m_failing = true;
     ++m_selectionEpoch;
@@ -436,6 +525,10 @@ bool KtmSessionController::failSession(const xc2::Xc2Error &error)
     const KtmSessionState failureState = m_state;
     QPointer<xc2::Xc2RestClient> restGuard = m_restClient;
     QPointer<xc2::Xc2StompClient> stompGuard = m_stompClient;
+    const quintptr restIdentity =
+        reinterpret_cast<quintptr>(m_restClient.data());
+    const quintptr stompIdentity =
+        reinterpret_cast<quintptr>(m_stompClient.data());
     const xc2::Xc2RequestId pendingIds[] = {
         m_requestId, m_applyRequestId, m_selectedRequestId, m_closeRequestId};
     m_stompGeneration = 0;
@@ -449,19 +542,43 @@ bool KtmSessionController::failSession(const xc2::Xc2Error &error)
     m_selectedConfirmed = false;
     m_connectedForSelectionEpoch = false;
     QPointer<KtmSessionController> guard(this);
-    const auto abandonFailure = [&guard]() {
-        if (guard)
+    const auto coreValid = [&]() {
+        return guard && sessionEpoch == m_sessionEpoch
+            && failureSelectionEpoch == m_selectionEpoch && m_failing
+            && m_state == failureState
+            && m_operation == KtmSessionOperation::None;
+    };
+    const auto componentsValid = [&]() {
+        return coreValid()
+            && restIdentity
+                == reinterpret_cast<quintptr>(m_restClient.data())
+            && stompIdentity
+                == reinterpret_cast<quintptr>(m_stompClient.data())
+            && (restIdentity == 0 || restGuard)
+            && (stompIdentity == 0 || stompGuard);
+    };
+    const auto abandonFailure = [&guard, sessionEpoch]() {
+        if (guard && guard->m_sessionEpoch == sessionEpoch)
             guard->m_failing = false;
         return false;
     };
-    if (!publishOperation(KtmSessionOperation::None) || !guard
-        || sessionEpoch != m_sessionEpoch
-        || !restGuard || restGuard != m_restClient
-        || !stompGuard || stompGuard != m_stompClient
-        || failureSelectionEpoch != m_selectionEpoch
-        || m_state != failureState
-        || m_operation != KtmSessionOperation::None)
-        return abandonFailure();
+    const auto recoverInterruptedFailure = [&]() {
+        if (!guard || sessionEpoch != m_sessionEpoch || !m_failing
+            || failureSelectionEpoch != m_selectionEpoch
+            || m_operation != KtmSessionOperation::None
+            || (m_state != failureState
+                && m_state != KtmSessionState::Failed)) {
+            return abandonFailure();
+        }
+        m_projectingPayload = false;
+        ++m_sessionEpoch;
+        m_failing = false;
+        return failSession(stableError);
+    };
+    if (!publishOperation(KtmSessionOperation::None)
+        || !componentsValid()) {
+        return recoverInterruptedFailure();
+    }
 
     m_requestId = 0;
     m_applyRequestId = 0;
@@ -472,40 +589,23 @@ bool KtmSessionController::failSession(const xc2::Xc2Error &error)
     m_closeRequestSelectionEpoch = 0;
     QList<xc2::Xc2RequestId> aborted;
     for (xc2::Xc2RequestId id : pendingIds) {
-        if (id == 0 || aborted.contains(id))
+        if (!restGuard || id == 0 || aborted.contains(id))
             continue;
         aborted.append(id);
         abortRest(id);
-        if (!guard || sessionEpoch != m_sessionEpoch
-            || !restGuard || restGuard != m_restClient
-            || m_operation != KtmSessionOperation::None
-            || failureSelectionEpoch != m_selectionEpoch
-            || m_state != failureState)
-            return abandonFailure();
+        if (!componentsValid())
+            return recoverInterruptedFailure();
     }
-    disconnectStomp();
-    if (!guard || sessionEpoch != m_sessionEpoch
-        || !stompGuard || stompGuard != m_stompClient
-        || m_operation != KtmSessionOperation::None
-        || failureSelectionEpoch != m_selectionEpoch
-        || m_state != failureState) {
-        return abandonFailure();
+    if (stompGuard) {
+        disconnectStomp();
+        if (!componentsValid())
+            return recoverInterruptedFailure();
+        abortStomp();
+        if (!componentsValid())
+            return recoverInterruptedFailure();
     }
-    abortStomp();
-    if (!guard || sessionEpoch != m_sessionEpoch
-        || !stompGuard || stompGuard != m_stompClient
-        || m_operation != KtmSessionOperation::None
-        || failureSelectionEpoch != m_selectionEpoch
-        || m_state != failureState) {
-        return abandonFailure();
-    }
-    if (!resetSessionObjects(true) || !guard
-        || sessionEpoch != m_sessionEpoch
-        || m_operation != KtmSessionOperation::None
-        || failureSelectionEpoch != m_selectionEpoch
-        || m_state != failureState) {
-        return abandonFailure();
-    }
+    if (!resetSessionObjects(true) || !coreValid())
+        return recoverInterruptedFailure();
     QPointer<xc2::Xc2RestClient> failedRestGuard = m_restClient;
     QPointer<xc2::Xc2StompClient> failedStompGuard = m_stompClient;
     m_projectingPayload = true;
@@ -518,7 +618,7 @@ bool KtmSessionController::failSession(const xc2::Xc2Error &error)
         || m_state != KtmSessionState::Failed
         || m_operation != KtmSessionOperation::None) {
         m_projectingPayload = false;
-        return abandonFailure();
+        return recoverInterruptedFailure();
     }
     emit failed(stableError);
     if (!guard)
@@ -526,6 +626,22 @@ bool KtmSessionController::failSession(const xc2::Xc2Error &error)
     m_projectingPayload = false;
     m_failing = false;
     return true;
+}
+
+bool KtmSessionController::drainPendingFailure()
+{
+    if (!m_pendingFailure)
+        return false;
+    const PendingFailure pending = std::move(*m_pendingFailure);
+    m_pendingFailure.reset();
+    if (pending.sessionEpoch != m_sessionEpoch
+        || pending.stompIdentity
+            != reinterpret_cast<quintptr>(m_stompClient.data())
+        || (pending.stompIdentity != 0 && !pending.stompClient)
+        || pending.generation != m_stompGeneration) {
+        return false;
+    }
+    return failSession(pending.error);
 }
 
 bool KtmSessionController::failLocal(xc2::Xc2ErrorCategory category,
@@ -538,6 +654,7 @@ bool KtmSessionController::resetSessionObjects(bool notifyTest)
 {
     if (m_resetting)
         return false;
+    m_pendingFailure.reset();
     m_resetting = true;
     const quint64 resetEpoch = m_sessionEpoch;
     QPointer<KtmSessionController> guard(this);
@@ -547,21 +664,21 @@ bool KtmSessionController::resetSessionObjects(bool notifyTest)
     m_jobRegistry = nullptr;
     m_stompClient = nullptr;
     m_restClient = nullptr;
-    delete oldRegistry;
+    delete oldRegistry.data();
     if (!guard)
         return false;
     if (resetEpoch != m_sessionEpoch) {
         m_resetting = false;
         return false;
     }
-    delete oldStomp;
+    delete oldStomp.data();
     if (!guard)
         return false;
     if (resetEpoch != m_sessionEpoch) {
         m_resetting = false;
         return false;
     }
-    delete oldRest;
+    delete oldRest.data();
     if (!guard)
         return false;
     if (resetEpoch != m_sessionEpoch) {
@@ -574,38 +691,40 @@ bool KtmSessionController::resetSessionObjects(bool notifyTest)
     m_restClient = new xc2::Xc2RestClient({}, this);
 
     const quint64 epoch = m_sessionEpoch;
-    const quintptr restIdentity = reinterpret_cast<quintptr>(m_restClient);
-    const quintptr stompIdentity = reinterpret_cast<quintptr>(m_stompClient);
+    const quintptr restIdentity =
+        reinterpret_cast<quintptr>(m_restClient.data());
+    const quintptr stompIdentity =
+        reinterpret_cast<quintptr>(m_stompClient.data());
     const quintptr registryIdentity =
-        reinterpret_cast<quintptr>(m_jobRegistry);
+        reinterpret_cast<quintptr>(m_jobRegistry.data());
     QPointer<xc2::Xc2RestClient> resetRestGuard = m_restClient;
     QPointer<xc2::Xc2StompClient> resetStompGuard = m_stompClient;
     QPointer<xc2::Xc2JobRegistry> resetRegistryGuard = m_jobRegistry;
-    connect(m_restClient, &xc2::Xc2RestClient::serviceStatusFinished,
+    connect(m_restClient.data(), &xc2::Xc2RestClient::serviceStatusFinished,
             this, [this, epoch, restIdentity](
                       xc2::Xc2RequestId id,
                       const xc2::Xc2Result<xc2::Xc2ServiceStatus> &result) {
         handleServiceStatusFinished(epoch, restIdentity, id, result);
     });
-    connect(m_restClient, &xc2::Xc2RestClient::currentUserFinished,
+    connect(m_restClient.data(), &xc2::Xc2RestClient::currentUserFinished,
             this, [this, epoch, restIdentity](
                       xc2::Xc2RequestId id,
                       const xc2::Xc2Result<xc2::Xc2CurrentUser> &result) {
         handleCurrentUserFinished(epoch, restIdentity, id, result);
     });
-    connect(m_restClient, &xc2::Xc2RestClient::deviceLookupFinished,
+    connect(m_restClient.data(), &xc2::Xc2RestClient::deviceLookupFinished,
             this, [this, epoch, restIdentity](
                       xc2::Xc2RequestId id,
                       const xc2::Xc2Result<xc2::Xc2JobAccepted> &result) {
         handleDeviceLookupFinished(epoch, restIdentity, id, result);
     });
-    connect(m_restClient, &xc2::Xc2RestClient::devicesFinished,
+    connect(m_restClient.data(), &xc2::Xc2RestClient::devicesFinished,
             this, [this, epoch, restIdentity](
                       xc2::Xc2RequestId id,
                       const xc2::Xc2Result<QList<xc2::Xc2VciDevice>> &result) {
         handleDevicesFinished(epoch, restIdentity, id, result);
     });
-    connect(m_restClient, &xc2::Xc2RestClient::applyDeviceFinished,
+    connect(m_restClient.data(), &xc2::Xc2RestClient::applyDeviceFinished,
             this, [this, epoch, restIdentity](xc2::Xc2RequestId id,
                                                const xc2::Xc2Error &error) {
         const quint64 requestSelectionEpoch = id == m_applyRequestId
@@ -613,7 +732,7 @@ bool KtmSessionController::resetSessionObjects(bool notifyTest)
         handleApplyDeviceFinished(epoch, requestSelectionEpoch,
                                   restIdentity, id, error);
     });
-    connect(m_restClient, &xc2::Xc2RestClient::selectedDeviceFinished,
+    connect(m_restClient.data(), &xc2::Xc2RestClient::selectedDeviceFinished,
             this, [this, epoch, restIdentity](
                       xc2::Xc2RequestId id,
                       const xc2::Xc2Result<xc2::Xc2SelectedVci> &result) {
@@ -622,7 +741,7 @@ bool KtmSessionController::resetSessionObjects(bool notifyTest)
         handleSelectedDeviceFinished(epoch, requestSelectionEpoch,
                                      restIdentity, id, result);
     });
-    connect(m_restClient, &xc2::Xc2RestClient::closeDeviceFinished,
+    connect(m_restClient.data(), &xc2::Xc2RestClient::closeDeviceFinished,
             this, [this, epoch, restIdentity](xc2::Xc2RequestId id,
                                                const xc2::Xc2Error &error) {
         const quint64 requestSelectionEpoch = id == m_closeRequestId
@@ -630,34 +749,34 @@ bool KtmSessionController::resetSessionObjects(bool notifyTest)
         handleCloseDeviceFinished(epoch, requestSelectionEpoch,
                                   restIdentity, id, error);
     });
-    connect(m_stompClient, &xc2::Xc2StompClient::connected,
+    connect(m_stompClient.data(), &xc2::Xc2StompClient::connected,
             this, [this, epoch, stompIdentity](
                       const xc2::Xc2StompSession &session) {
         handleStompConnected(epoch, stompIdentity, session);
     });
-    connect(m_stompClient, &xc2::Xc2StompClient::subscriptionSent,
+    connect(m_stompClient.data(), &xc2::Xc2StompClient::subscriptionSent,
             this, [this, epoch, stompIdentity](xc2::Topic topic,
                                                const QString &) {
         handleSubscriptionSent(epoch, stompIdentity, topic);
     });
-    connect(m_stompClient, &xc2::Xc2StompClient::messageReceived,
+    connect(m_stompClient.data(), &xc2::Xc2StompClient::messageReceived,
             this, [this, epoch, stompIdentity](
                       const xc2::Xc2StompMessage &message) {
         handleStompMessage(epoch, stompIdentity, message);
     });
-    connect(m_stompClient, &xc2::Xc2StompClient::errorOccurred,
+    connect(m_stompClient.data(), &xc2::Xc2StompClient::errorOccurred,
             this, [this, epoch, stompIdentity](
                       xc2::Xc2StompGeneration generation,
                       const xc2::Xc2Error &error) {
         handleStompError(epoch, stompIdentity, generation, error);
     });
-    connect(m_stompClient, &xc2::Xc2StompClient::visibilityLost,
+    connect(m_stompClient.data(), &xc2::Xc2StompClient::visibilityLost,
             this, [this, epoch, stompIdentity](
                       xc2::Xc2StompGeneration generation,
                       const xc2::Xc2Error &error) {
         handleVisibilityLost(epoch, stompIdentity, generation, error);
     });
-    connect(m_jobRegistry, &xc2::Xc2JobRegistry::jobTerminal,
+    connect(m_jobRegistry.data(), &xc2::Xc2JobRegistry::jobTerminal,
             this, [this, epoch, registryIdentity](
                       const xc2::Xc2JobRecord &record) {
         handleJobTerminal(epoch, registryIdentity, record);
@@ -680,6 +799,11 @@ bool KtmSessionController::resetSessionObjects(bool notifyTest)
     m_selectedConfirmed = false;
     m_connectedForSelectionEpoch = false;
     m_resetting = false;
+    if (m_stopRequestedDuringReset && !m_stopping) {
+        m_stopRequestedDuringReset = false;
+        stop();
+        return false;
+    }
     const auto resetObserved = m_testOps.sessionObjectsReset;
     if (notifyTest && resetObserved) {
         resetObserved();
@@ -698,23 +822,31 @@ bool KtmSessionController::callbackMatches(
     quint64 epoch, quintptr identity, xc2::Xc2RequestId id) const
 {
     return epoch == m_sessionEpoch
-        && identity == reinterpret_cast<quintptr>(m_restClient)
+        && identity == reinterpret_cast<quintptr>(m_restClient.data())
         && id != 0 && id == m_requestId;
 }
 
 xc2::Xc2BackendState KtmSessionController::backendState() const
 {
     const auto operation = m_testOps.backendState;
-    return operation ? operation() : m_backend->state();
+    return operation ? operation()
+                     : m_backend ? m_backend->state()
+                                 : xc2::Xc2BackendState::Stopped;
 }
 
 bool KtmSessionController::startBackend(const QString &installRoot,
                                         xc2::Xc2Error *error)
 {
     const auto operation = m_testOps.startBackend;
-    return operation
-        ? operation(installRoot, error)
-        : m_backend->startProduction(installRoot, error);
+    if (operation)
+        return operation(installRoot, error);
+    if (m_backend)
+        return m_backend->startProduction(installRoot, error);
+    if (error) {
+        *error = localError(xc2::Xc2ErrorCategory::Backend,
+                            QStringLiteral("XC2 backend manager is unavailable"));
+    }
+    return false;
 }
 
 bool KtmSessionController::setRestBaseUrl(const QByteArray &encodedBase,
@@ -821,7 +953,7 @@ void KtmSessionController::stopBackend()
     const auto operation = m_testOps.stopBackend;
     if (operation)
         operation();
-    else
+    else if (m_backend)
         m_backend->stop();
 }
 
@@ -831,7 +963,7 @@ bool KtmSessionController::connectStomp(xc2::Xc2Error *error)
     return operation
         ? operation(error)
         : m_stompClient && m_restClient
-            && m_stompClient->connectToBackend(*m_restClient, error);
+            && m_stompClient->connectToBackend(*m_restClient.data(), error);
 }
 
 bool KtmSessionController::subscribeStomp(xc2::Topic topic,
@@ -857,6 +989,11 @@ void KtmSessionController::handleBackendStateChanged(
         && m_state == KtmSessionState::BackendStarting) {
         publishState(KtmSessionState::BackendReady);
     } else if (state == xc2::Xc2BackendState::Stopped) {
+        if (m_stopTeardownActive && m_stopping
+            && (m_resetting || !m_awaitingBackendStop)) {
+            m_backendStoppedDuringTeardown = true;
+            return;
+        }
         if (m_resetting)
             return;
         const quint64 sessionEpoch = m_sessionEpoch;
@@ -873,6 +1010,11 @@ void KtmSessionController::handleBackendStateChanged(
         m_stopping = false;
         m_failing = false;
         m_projectingPayload = false;
+        m_stopRequestedDuringReset = false;
+        m_stopTeardownActive = false;
+        m_awaitingBackendStop = false;
+        m_backendStoppedDuringTeardown = false;
+        m_pendingFailure.reset();
         publishState(KtmSessionState::Stopped);
     }
 }
@@ -1042,7 +1184,7 @@ void KtmSessionController::handleStompConnected(
     quint64 epoch, quintptr identity, const xc2::Xc2StompSession &session)
 {
     if (epoch != m_sessionEpoch
-        || identity != reinterpret_cast<quintptr>(m_stompClient)
+        || identity != reinterpret_cast<quintptr>(m_stompClient.data())
         || m_state != KtmSessionState::SessionStarting
         || session.generation == 0
         || session.generation != m_stompGeneration) {
@@ -1088,7 +1230,7 @@ void KtmSessionController::handleSubscriptionSent(
     quint64 epoch, quintptr identity, xc2::Topic topic)
 {
     if (epoch != m_sessionEpoch
-        || identity != reinterpret_cast<quintptr>(m_stompClient)
+        || identity != reinterpret_cast<quintptr>(m_stompClient.data())
         || topic != xc2::Topic::Progress || m_stompGeneration == 0) {
         return;
     }
@@ -1115,7 +1257,7 @@ void KtmSessionController::handleStompMessage(
     quint64 epoch, quintptr identity, const xc2::Xc2StompMessage &message)
 {
     if (epoch != m_sessionEpoch
-        || identity != reinterpret_cast<quintptr>(m_stompClient)
+        || identity != reinterpret_cast<quintptr>(m_stompClient.data())
         || message.generation == 0
         || message.generation != m_stompGeneration) {
         return;
@@ -1129,6 +1271,11 @@ void KtmSessionController::handleStompMessage(
     QPointer<KtmSessionController> guard(this);
     QPointer<xc2::Xc2StompClient> stompGuard = m_stompClient;
     QPointer<xc2::Xc2JobRegistry> registryGuard = m_jobRegistry;
+    if (!registryGuard) {
+        failLocal(xc2::Xc2ErrorCategory::Session,
+                  QStringLiteral("XC2 job registry is unavailable"));
+        return;
+    }
     const xc2::Xc2StompGeneration generation = stompGeneration();
     if (!guard || epoch != m_sessionEpoch
         || identity != reinterpret_cast<quintptr>(stompGuard.data())
@@ -1164,7 +1311,7 @@ void KtmSessionController::handleVciStatus(
     const xc2::Xc2StompMessage &message)
 {
     if (epoch != m_sessionEpoch || selectionEpoch != m_selectionEpoch
-        || identity != reinterpret_cast<quintptr>(m_stompClient)
+        || identity != reinterpret_cast<quintptr>(m_stompClient.data())
         || message.generation != m_stompGeneration) {
         return;
     }
@@ -1213,7 +1360,7 @@ void KtmSessionController::handleStompError(
     xc2::Xc2StompGeneration generation, const xc2::Xc2Error &error)
 {
     if (epoch != m_sessionEpoch
-        || identity != reinterpret_cast<quintptr>(m_stompClient)
+        || identity != reinterpret_cast<quintptr>(m_stompClient.data())
         || generation != m_stompGeneration) {
         return;
     }
@@ -1222,6 +1369,10 @@ void KtmSessionController::handleStompError(
     QPointer<KtmSessionController> guard(this);
     QPointer<xc2::Xc2StompClient> stompGuard = m_stompClient;
     QPointer<xc2::Xc2JobRegistry> registryGuard = m_jobRegistry;
+    if (!registryGuard) {
+        failWithReadinessRevoked(error);
+        return;
+    }
     m_jobRegistry->markVisibilityLost(generation);
     if (!guard || epoch != m_sessionEpoch || !stompGuard
         || stompGuard != m_stompClient || !registryGuard
@@ -1238,7 +1389,7 @@ void KtmSessionController::handleVisibilityLost(
     xc2::Xc2StompGeneration generation, const xc2::Xc2Error &error)
 {
     if (epoch != m_sessionEpoch
-        || identity != reinterpret_cast<quintptr>(m_stompClient)
+        || identity != reinterpret_cast<quintptr>(m_stompClient.data())
         || generation == 0 || generation != m_stompGeneration) {
         return;
     }
@@ -1247,6 +1398,10 @@ void KtmSessionController::handleVisibilityLost(
     QPointer<KtmSessionController> guard(this);
     QPointer<xc2::Xc2StompClient> stompGuard = m_stompClient;
     QPointer<xc2::Xc2JobRegistry> registryGuard = m_jobRegistry;
+    if (!registryGuard) {
+        failWithReadinessRevoked(error);
+        return;
+    }
     const xc2::Xc2StompGeneration activeGeneration = stompGeneration();
     if (!guard || epoch != m_sessionEpoch
         || identity != reinterpret_cast<quintptr>(stompGuard.data())
@@ -1285,6 +1440,11 @@ void KtmSessionController::handleDeviceLookupFinished(
     QPointer<KtmSessionController> guard(this);
     QPointer<xc2::Xc2RestClient> restGuard = m_restClient;
     QPointer<xc2::Xc2JobRegistry> registryGuard = m_jobRegistry;
+    if (!registryGuard) {
+        failLocal(xc2::Xc2ErrorCategory::Session,
+                  QStringLiteral("XC2 job registry is unavailable"));
+        return;
+    }
     xc2::Xc2Error error;
     const bool accepted = m_jobRegistry->accept(*result.value, &error);
     if (!guard || epoch != m_sessionEpoch
@@ -1325,6 +1485,11 @@ void KtmSessionController::handleDevicesFinished(
     QPointer<KtmSessionController> guard(this);
     QPointer<xc2::Xc2RestClient> restGuard = m_restClient;
     QPointer<xc2::Xc2JobRegistry> registryGuard = m_jobRegistry;
+    if (!registryGuard) {
+        failLocal(xc2::Xc2ErrorCategory::Session,
+                  QStringLiteral("XC2 job registry is unavailable"));
+        return;
+    }
     if (!m_lookupJobId.isEmpty()) {
         xc2::Xc2Error ignored;
         m_jobRegistry->clearTerminal(m_lookupJobId, &ignored);
@@ -1355,6 +1520,11 @@ void KtmSessionController::handleDevicesFinished(
     m_projectingPayload = true;
     if (!publishState(KtmSessionState::SessionReady) || !guard)
         return;
+    if (m_pendingFailure) {
+        m_projectingPayload = false;
+        drainPendingFailure();
+        return;
+    }
     if (currentEpoch != m_sessionEpoch
         || currentSelectionEpoch != m_selectionEpoch
         || !restGuard || restGuard != m_restClient
@@ -1365,8 +1535,10 @@ void KtmSessionController::handleDevicesFinished(
         return;
     }
     emit vciLookupFinished(devices);
-    if (guard)
-        m_projectingPayload = false;
+    if (!guard)
+        return;
+    m_projectingPayload = false;
+    drainPendingFailure();
 }
 
 void KtmSessionController::handleApplyDeviceFinished(
@@ -1374,7 +1546,7 @@ void KtmSessionController::handleApplyDeviceFinished(
     xc2::Xc2RequestId id, const xc2::Xc2Error &error)
 {
     if (epoch != m_sessionEpoch || selectionEpoch != m_selectionEpoch
-        || identity != reinterpret_cast<quintptr>(m_restClient)
+        || identity != reinterpret_cast<quintptr>(m_restClient.data())
         || m_operation != KtmSessionOperation::Apply
         || m_state != KtmSessionState::VciApplying || id == 0
         || id != m_applyRequestId) {
@@ -1396,7 +1568,7 @@ void KtmSessionController::handleSelectedDeviceFinished(
     const xc2::Xc2Result<xc2::Xc2SelectedVci> &result)
 {
     if (epoch != m_sessionEpoch || selectionEpoch != m_selectionEpoch
-        || identity != reinterpret_cast<quintptr>(m_restClient)
+        || identity != reinterpret_cast<quintptr>(m_restClient.data())
         || m_operation != KtmSessionOperation::Apply
         || m_state != KtmSessionState::VciApplying || id == 0
         || id != m_selectedRequestId) {
@@ -1427,7 +1599,7 @@ void KtmSessionController::handleCloseDeviceFinished(
     xc2::Xc2RequestId id, const xc2::Xc2Error &error)
 {
     if (epoch != m_sessionEpoch || selectionEpoch != m_selectionEpoch
-        || identity != reinterpret_cast<quintptr>(m_restClient)
+        || identity != reinterpret_cast<quintptr>(m_restClient.data())
         || m_operation != KtmSessionOperation::Close
         || m_state != KtmSessionState::VciClosing || id == 0
         || id != m_closeRequestId) {
@@ -1462,6 +1634,11 @@ void KtmSessionController::handleCloseDeviceFinished(
     m_projectingPayload = true;
     if (!publishState(KtmSessionState::SessionReady) || !guard)
         return;
+    if (m_pendingFailure) {
+        m_projectingPayload = false;
+        drainPendingFailure();
+        return;
+    }
     if (currentSessionEpoch != m_sessionEpoch
         || currentSelectionEpoch != m_selectionEpoch
         || !restGuard || restGuard != m_restClient
@@ -1471,15 +1648,17 @@ void KtmSessionController::handleCloseDeviceFinished(
         return;
     }
     emit vciClosed();
-    if (guard)
-        m_projectingPayload = false;
+    if (!guard)
+        return;
+    m_projectingPayload = false;
+    drainPendingFailure();
 }
 
 void KtmSessionController::handleJobTerminal(
     quint64 epoch, quintptr identity, const xc2::Xc2JobRecord &record)
 {
     if (epoch != m_sessionEpoch
-        || identity != reinterpret_cast<quintptr>(m_jobRegistry)
+        || identity != reinterpret_cast<quintptr>(m_jobRegistry.data())
         || m_operation != KtmSessionOperation::Lookup
         || record.jobId != m_lookupJobId) {
         return;
@@ -1586,6 +1765,11 @@ void KtmSessionController::tryPublishVciReady()
     m_projectingPayload = true;
     if (!publishState(KtmSessionState::VciReady) || !guard)
         return;
+    if (m_pendingFailure) {
+        m_projectingPayload = false;
+        drainPendingFailure();
+        return;
+    }
     if (sessionEpoch != m_sessionEpoch
         || selectionEpoch != m_selectionEpoch
         || !restGuard || restGuard != m_restClient
@@ -1596,8 +1780,10 @@ void KtmSessionController::tryPublishVciReady()
         return;
     }
     emit vciReady(device, status);
-    if (guard)
-        m_projectingPayload = false;
+    if (!guard)
+        return;
+    m_projectingPayload = false;
+    drainPendingFailure();
 }
 
 bool KtmSessionController::failWithReadinessRevoked(
