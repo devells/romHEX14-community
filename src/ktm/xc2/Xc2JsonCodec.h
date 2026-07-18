@@ -9,6 +9,8 @@ public:
     static Xc2Result<Xc2ServiceStatus> serviceStatus(const QByteArray &body);
     static Xc2Result<Xc2CurrentUser> currentUser(const QByteArray &body);
     static Xc2Result<QList<Xc2VciDevice>> vciDevices(const QByteArray &body);
+    static Xc2Result<Xc2SelectedVci> selectedVci(const QByteArray &body);
+    static Xc2Result<Xc2VciStatus> vciStatus(const QByteArray &body);
     static QJsonObject vciDeviceJson(const Xc2VciDevice &device);
     static Xc2Result<Xc2JobAccepted> jobAccepted(const QByteArray &body);
     static Xc2Result<Xc2JobProgress> jobProgress(const QByteArray &body);

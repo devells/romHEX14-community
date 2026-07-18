@@ -4,6 +4,7 @@
 #include <QJsonDocument>
 #include <QJsonParseError>
 
+#include <cmath>
 #include <limits>
 
 namespace ktm::xc2 {
@@ -276,6 +277,21 @@ bool optionalNullableString(const QJsonObject &object,
     return true;
 }
 
+bool decodeVciDevice(const QJsonObject &object,
+                     Xc2VciDevice &device,
+                     QString &failureMessage)
+{
+    return requireString(object, QStringLiteral("id"), device.id,
+                         failureMessage)
+        && requireString(object, QStringLiteral("name"), device.name,
+                         failureMessage)
+        && requireString(object, QStringLiteral("internalName"),
+                         device.internalName, failureMessage)
+        && optionalNullableString(
+            object, QStringLiteral("additionalModuleInformation"),
+            device.additionalModuleInformation, failureMessage);
+}
+
 bool requireStringList(const QJsonObject &object,
                        const QString &field,
                        QStringList &value,
@@ -534,15 +550,7 @@ Xc2Result<QList<Xc2VciDevice>> Xc2JsonCodec::vciDevices(
 
         const QJsonObject object = array.at(i).toObject();
         Xc2VciDevice device;
-        if (!requireString(object, QStringLiteral("id"), device.id,
-                           failureMessage)
-            || !requireString(object, QStringLiteral("name"), device.name,
-                              failureMessage)
-            || !requireString(object, QStringLiteral("internalName"),
-                              device.internalName, failureMessage)
-            || !optionalNullableString(
-                object, QStringLiteral("additionalModuleInformation"),
-                device.additionalModuleInformation, failureMessage)) {
+        if (!decodeVciDevice(object, device, failureMessage)) {
             return contractFailure<QList<Xc2VciDevice>>(
                 body,
                 QStringLiteral("VCI device at index %1: %2")
@@ -552,6 +560,68 @@ Xc2Result<QList<Xc2VciDevice>> Xc2JsonCodec::vciDevices(
         devices.append(std::move(device));
     }
     return Xc2Result<QList<Xc2VciDevice>>::success(std::move(devices));
+}
+
+Xc2Result<Xc2SelectedVci> Xc2JsonCodec::selectedVci(
+    const QByteArray &body)
+{
+    if (body.trimmed() == QByteArrayLiteral("null"))
+        return Xc2Result<Xc2SelectedVci>::success({std::nullopt});
+
+    QJsonDocument document;
+    QString failureMessage;
+    if (!parseDocument(body, document, failureMessage)) {
+        return contractFailure<Xc2SelectedVci>(
+            body, std::move(failureMessage));
+    }
+    if (!document.isObject()) {
+        return contractFailure<Xc2SelectedVci>(
+            body,
+            QStringLiteral(
+                "Selected VCI payload must be a JSON object or null"));
+    }
+
+    Xc2VciDevice device;
+    if (!decodeVciDevice(document.object(), device, failureMessage)) {
+        return contractFailure<Xc2SelectedVci>(
+            body, QStringLiteral("Selected VCI: %1").arg(failureMessage));
+    }
+    return Xc2Result<Xc2SelectedVci>::success({std::move(device)});
+}
+
+Xc2Result<Xc2VciStatus> Xc2JsonCodec::vciStatus(const QByteArray &body)
+{
+    QJsonDocument document;
+    QString failureMessage;
+    if (!parseDocument(body, document, failureMessage))
+        return contractFailure<Xc2VciStatus>(body, std::move(failureMessage));
+    if (!document.isObject()) {
+        return contractFailure<Xc2VciStatus>(
+            body, QStringLiteral("VCI status payload must be a JSON object"));
+    }
+
+    const QJsonObject object = document.object();
+    if (!object.contains(QStringLiteral("voltage"))) {
+        return contractFailure<Xc2VciStatus>(
+            body, QStringLiteral("Missing required field 'voltage'"));
+    }
+    const QJsonValue voltage = object.value(QStringLiteral("voltage"));
+    if (!voltage.isDouble() || !std::isfinite(voltage.toDouble())) {
+        return contractFailure<Xc2VciStatus>(
+            body, QStringLiteral("Field 'voltage' must be a finite number"));
+    }
+    if (!object.contains(QStringLiteral("connected"))) {
+        return contractFailure<Xc2VciStatus>(
+            body, QStringLiteral("Missing required field 'connected'"));
+    }
+    const QJsonValue connected = object.value(QStringLiteral("connected"));
+    if (!connected.isBool()) {
+        return contractFailure<Xc2VciStatus>(
+            body, QStringLiteral("Field 'connected' must be a boolean"));
+    }
+
+    return Xc2Result<Xc2VciStatus>::success(
+        {voltage.toDouble(), connected.toBool(), object});
 }
 
 QJsonObject Xc2JsonCodec::vciDeviceJson(const Xc2VciDevice &device)

@@ -1,6 +1,6 @@
 {
   "backendProfileId": "xc2-approved-2026-07-16",
-  "manifestRevisionDate": "2026-07-16",
+  "manifestRevisionDate": "2026-07-18",
   "sanitization": {
     "vinIdentifiersReplaced": true,
     "dealerIdentifiersReplaced": true,
@@ -44,6 +44,27 @@
     {
       "path": "rest/device-get.json",
       "route": "device/get"
+    },
+    {
+      "path": "vci_selected.json",
+      "route": "device/getSelected",
+      "provenance": "synthetic-contract-fixture",
+      "schemaAuthority": "served-app+patched-backend-jar",
+      "liveCapture": false
+    },
+    {
+      "path": "vci_selected_null.json",
+      "route": "device/getSelected",
+      "provenance": "synthetic-contract-fixture",
+      "schemaAuthority": "served-app+patched-backend-jar",
+      "liveCapture": false
+    },
+    {
+      "path": "vci_status_connected.json",
+      "topic": "/topic/vci/status",
+      "provenance": "synthetic-contract-fixture",
+      "schemaAuthority": "served-app+patched-backend-jar",
+      "liveCapture": false
     },
     {
       "path": "rest/error.json",

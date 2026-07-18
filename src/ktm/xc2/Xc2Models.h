@@ -84,6 +84,16 @@ struct Xc2VciDevice {
     std::optional<QString> additionalModuleInformation;
 };
 
+struct Xc2SelectedVci {
+    std::optional<Xc2VciDevice> device;
+};
+
+struct Xc2VciStatus {
+    double voltage = 0.0;
+    bool connected = false;
+    QJsonObject raw;
+};
+
 enum class Xc2JobState {
     Created,
     InProgress,
@@ -115,10 +125,14 @@ Q_DECLARE_METATYPE(ktm::xc2::Xc2ServiceStatus)
 Q_DECLARE_METATYPE(ktm::xc2::Xc2CurrentUser)
 Q_DECLARE_METATYPE(ktm::xc2::Xc2JobAccepted)
 Q_DECLARE_METATYPE(ktm::xc2::Xc2VciDevice)
+Q_DECLARE_METATYPE(ktm::xc2::Xc2SelectedVci)
+Q_DECLARE_METATYPE(ktm::xc2::Xc2VciStatus)
 Q_DECLARE_METATYPE(ktm::xc2::Xc2LocalizedText)
 Q_DECLARE_METATYPE(ktm::xc2::Xc2JobProgress)
 Q_DECLARE_METATYPE(ktm::xc2::Xc2Result<ktm::xc2::Xc2ServiceStatus>)
 Q_DECLARE_METATYPE(ktm::xc2::Xc2Result<ktm::xc2::Xc2CurrentUser>)
 Q_DECLARE_METATYPE(ktm::xc2::Xc2Result<QList<ktm::xc2::Xc2VciDevice>>)
+Q_DECLARE_METATYPE(ktm::xc2::Xc2Result<ktm::xc2::Xc2SelectedVci>)
+Q_DECLARE_METATYPE(ktm::xc2::Xc2Result<ktm::xc2::Xc2VciStatus>)
 Q_DECLARE_METATYPE(ktm::xc2::Xc2Result<ktm::xc2::Xc2JobAccepted>)
 Q_DECLARE_METATYPE(ktm::xc2::Xc2Result<ktm::xc2::Xc2JobProgress>)

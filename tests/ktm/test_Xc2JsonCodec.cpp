@@ -13,6 +13,15 @@ static_assert(std::is_same_v<decltype(Xc2JobProgress::ticks), qint32>);
 static_assert(std::is_same_v<decltype(Xc2JobProgress::totalTicks), qint32>);
 static_assert(std::is_same_v<decltype(Xc2JobProgress::message),
                              std::optional<Xc2LocalizedText>>);
+static_assert(std::is_same_v<decltype(Xc2SelectedVci::device),
+                             std::optional<Xc2VciDevice>>);
+static_assert(std::is_same_v<decltype(Xc2VciStatus::voltage), double>);
+static_assert(std::is_same_v<decltype(Xc2VciStatus::connected), bool>);
+static_assert(std::is_same_v<decltype(Xc2VciStatus::raw), QJsonObject>);
+static_assert(QMetaTypeId2<Xc2SelectedVci>::Defined);
+static_assert(QMetaTypeId2<Xc2VciStatus>::Defined);
+static_assert(QMetaTypeId2<Xc2Result<Xc2SelectedVci>>::Defined);
+static_assert(QMetaTypeId2<Xc2Result<Xc2VciStatus>>::Defined);
 
 namespace {
 
@@ -105,6 +114,7 @@ private slots:
         QCOMPARE(device.internalName,
                  QStringLiteral("AVL Ditest VCI2K_DPDU_API"));
         const QJsonObject body = Xc2JsonCodec::vciDeviceJson(device);
+        QCOMPARE(body.size(), 4);
         QCOMPARE(body.value(QStringLiteral("id")).toString(), device.id);
         QCOMPARE(body.value(QStringLiteral("name")).toString(), device.name);
         QCOMPARE(body.value(QStringLiteral("internalName")).toString(),
@@ -123,13 +133,264 @@ private slots:
             R"([{"id":"a","name":"A","internalName":"AVL Ditest VCI2K_DPDU_API","additionalModuleInformation":7}])").ok());
     }
 
+    void selectedVciDecodesObjectFixtureFieldByField()
+    {
+        const QByteArray payload =
+            loadFixture(QStringLiteral("vci_selected.json"));
+        QVERIFY(!payload.isEmpty());
+
+        const auto selected = Xc2JsonCodec::selectedVci(payload);
+
+        QVERIFY2(selected.ok(), qPrintable(selected.error.message));
+        QVERIFY(selected.value->device.has_value());
+        const Xc2VciDevice &device = *selected.value->device;
+        QCOMPARE(device.id, QStringLiteral("vci-redacted-1"));
+        QCOMPARE(device.name, QStringLiteral("Synthetic VCI"));
+        QCOMPARE(device.internalName,
+                 QStringLiteral("AVL Ditest VCI2K_DPDU_API"));
+        QVERIFY(!device.additionalModuleInformation.has_value());
+    }
+
+    void selectedVciAcceptsLiteralNullFixture()
+    {
+        const QByteArray payload =
+            loadFixture(QStringLiteral("vci_selected_null.json"));
+        QVERIFY(!payload.isEmpty());
+
+        const auto selected = Xc2JsonCodec::selectedVci(payload);
+
+        QVERIFY2(selected.ok(), qPrintable(selected.error.message));
+        QVERIFY(!selected.value->device.has_value());
+    }
+
+    void selectedVciRejectsInvalidTopLevelKinds_data()
+    {
+        QTest::addColumn<QByteArray>("payload");
+
+        QTest::newRow("empty body") << QByteArray{};
+        QTest::newRow("malformed JSON") << QByteArrayLiteral("{");
+        QTest::newRow("array") << QByteArrayLiteral("[]");
+        QTest::newRow("string") << QByteArrayLiteral(R"("vci")");
+        QTest::newRow("number") << QByteArrayLiteral("7");
+        QTest::newRow("boolean") << QByteArrayLiteral("true");
+    }
+
+    void selectedVciRejectsInvalidTopLevelKinds()
+    {
+        QFETCH(QByteArray, payload);
+
+        const auto selected = Xc2JsonCodec::selectedVci(payload);
+
+        QVERIFY(!selected.ok());
+        QCOMPARE(selected.error.category, Xc2ErrorCategory::Contract);
+        QCOMPARE(selected.error.rawPayload, payload);
+    }
+
+    void selectedVciRequiresStrictDeviceFields_data()
+    {
+        QTest::addColumn<QByteArray>("payload");
+        QTest::addColumn<QString>("field");
+
+        QTest::newRow("missing id")
+            << QByteArrayLiteral(
+                   R"({"name":"Synthetic VCI","internalName":"AVL Ditest VCI2K_DPDU_API","additionalModuleInformation":null})")
+            << QStringLiteral("id");
+        QTest::newRow("name wrong type")
+            << QByteArrayLiteral(
+                   R"({"id":"vci-redacted-1","name":7,"internalName":"AVL Ditest VCI2K_DPDU_API","additionalModuleInformation":null})")
+            << QStringLiteral("name");
+        QTest::newRow("internal name wrong type")
+            << QByteArrayLiteral(
+                   R"({"id":"vci-redacted-1","name":"Synthetic VCI","internalName":false,"additionalModuleInformation":null})")
+            << QStringLiteral("internalName");
+        QTest::newRow("additional information wrong type")
+            << QByteArrayLiteral(
+                   R"({"id":"vci-redacted-1","name":"Synthetic VCI","internalName":"AVL Ditest VCI2K_DPDU_API","additionalModuleInformation":{}})")
+            << QStringLiteral("additionalModuleInformation");
+    }
+
+    void selectedVciRequiresStrictDeviceFields()
+    {
+        QFETCH(QByteArray, payload);
+        QFETCH(QString, field);
+
+        const auto selected = Xc2JsonCodec::selectedVci(payload);
+
+        QVERIFY(!selected.ok());
+        QCOMPARE(selected.error.category, Xc2ErrorCategory::Contract);
+        QVERIFY2(selected.error.message.contains(field),
+                 qPrintable(selected.error.message));
+        QCOMPARE(selected.error.rawPayload, payload);
+    }
+
+    void vciStatusDecodesConnectedFixtureWithoutScaling()
+    {
+        const QByteArray payload =
+            loadFixture(QStringLiteral("vci_status_connected.json"));
+        QVERIFY(!payload.isEmpty());
+
+        const auto status = Xc2JsonCodec::vciStatus(payload);
+
+        QVERIFY2(status.ok(), qPrintable(status.error.message));
+        QCOMPARE(status.value->voltage, 12.6);
+        QCOMPARE(status.value->connected, true);
+        QCOMPARE(status.value->raw.value(QStringLiteral("voltage")).toDouble(),
+                 12.6);
+        QCOMPARE(status.value->raw.value(QStringLiteral("connected")).toBool(),
+                 true);
+    }
+
+    void vciStatusAcceptsZeroVoltage()
+    {
+        const QByteArray zeroPayload = QByteArrayLiteral(
+            R"({"voltage":0.0,"connected":false})");
+        const auto zero = Xc2JsonCodec::vciStatus(zeroPayload);
+        QVERIFY2(zero.ok(), qPrintable(zero.error.message));
+        QCOMPARE(zero.value->voltage, 0.0);
+        QCOMPARE(zero.value->connected, false);
+    }
+
+    void vciStatusDoesNotScaleVoltageAndRetainsRawExtensions()
+    {
+        const QByteArray unscaledPayload = QByteArrayLiteral(
+            R"({"voltage":12345.0,"connected":true,"future":{"nested":true}})");
+        const auto unscaled = Xc2JsonCodec::vciStatus(unscaledPayload);
+        QVERIFY2(unscaled.ok(), qPrintable(unscaled.error.message));
+        QCOMPARE(unscaled.value->voltage, 12345.0);
+        QCOMPARE(unscaled.value->connected, true);
+        QVERIFY(unscaled.value->raw.value(QStringLiteral("future")).isObject());
+        QCOMPARE(unscaled.value->raw.value(QStringLiteral("future"))
+                     .toObject()
+                     .value(QStringLiteral("nested"))
+                     .toBool(),
+                 true);
+    }
+
+    void vciStatusRejectsInvalidTopLevelKinds_data()
+    {
+        QTest::addColumn<QByteArray>("payload");
+
+        QTest::newRow("empty body") << QByteArray{};
+        QTest::newRow("array") << QByteArrayLiteral("[]");
+        QTest::newRow("null") << QByteArrayLiteral("null");
+        QTest::newRow("string") << QByteArrayLiteral(R"("status")");
+        QTest::newRow("number") << QByteArrayLiteral("7");
+        QTest::newRow("boolean") << QByteArrayLiteral("false");
+    }
+
+    void vciStatusRejectsInvalidTopLevelKinds()
+    {
+        QFETCH(QByteArray, payload);
+
+        const auto status = Xc2JsonCodec::vciStatus(payload);
+
+        QVERIFY(!status.ok());
+        QCOMPARE(status.error.category, Xc2ErrorCategory::Contract);
+        QCOMPARE(status.error.rawPayload, payload);
+    }
+
+    void vciStatusRequiresExactFieldNamesAndTypes_data()
+    {
+        QTest::addColumn<QByteArray>("payload");
+        QTest::addColumn<QString>("field");
+
+        QTest::newRow("missing voltage")
+            << QByteArrayLiteral(R"({"connected":true})")
+            << QStringLiteral("voltage");
+        QTest::newRow("voltage alias")
+            << QByteArrayLiteral(R"({"Voltage":12.6,"connected":true})")
+            << QStringLiteral("voltage");
+        QTest::newRow("missing connected")
+            << QByteArrayLiteral(R"({"voltage":12.6})")
+            << QStringLiteral("connected");
+        QTest::newRow("connected alias")
+            << QByteArrayLiteral(R"({"voltage":12.6,"Connected":true})")
+            << QStringLiteral("connected");
+        QTest::newRow("voltage string")
+            << QByteArrayLiteral(
+                   R"({"voltage":"12.6","connected":true})")
+            << QStringLiteral("voltage");
+        QTest::newRow("voltage boolean")
+            << QByteArrayLiteral(R"({"voltage":true,"connected":true})")
+            << QStringLiteral("voltage");
+        QTest::newRow("voltage null")
+            << QByteArrayLiteral(R"({"voltage":null,"connected":true})")
+            << QStringLiteral("voltage");
+        QTest::newRow("voltage object")
+            << QByteArrayLiteral(R"({"voltage":{},"connected":true})")
+            << QStringLiteral("voltage");
+        QTest::newRow("voltage array")
+            << QByteArrayLiteral(R"({"voltage":[],"connected":true})")
+            << QStringLiteral("voltage");
+        QTest::newRow("connected string")
+            << QByteArrayLiteral(
+                   R"({"voltage":12.6,"connected":"true"})")
+            << QStringLiteral("connected");
+        QTest::newRow("connected number")
+            << QByteArrayLiteral(R"({"voltage":12.6,"connected":1})")
+            << QStringLiteral("connected");
+        QTest::newRow("connected null")
+            << QByteArrayLiteral(R"({"voltage":12.6,"connected":null})")
+            << QStringLiteral("connected");
+        QTest::newRow("connected object")
+            << QByteArrayLiteral(R"({"voltage":12.6,"connected":{}})")
+            << QStringLiteral("connected");
+        QTest::newRow("connected array")
+            << QByteArrayLiteral(R"({"voltage":12.6,"connected":[]})")
+            << QStringLiteral("connected");
+    }
+
+    void vciStatusRequiresExactFieldNamesAndTypes()
+    {
+        QFETCH(QByteArray, payload);
+        QFETCH(QString, field);
+
+        const auto status = Xc2JsonCodec::vciStatus(payload);
+
+        QVERIFY(!status.ok());
+        QCOMPARE(status.error.category, Xc2ErrorCategory::Contract);
+        QVERIFY2(status.error.message.contains(field),
+                 qPrintable(status.error.message));
+        QCOMPARE(status.error.rawPayload, payload);
+    }
+
+    void vciStatusRejectsNonFiniteVoltage_data()
+    {
+        QTest::addColumn<QByteArray>("voltage");
+
+        QTest::newRow("positive overflow") << QByteArrayLiteral("1e9999");
+        QTest::newRow("negative overflow") << QByteArrayLiteral("-1e9999");
+        QTest::newRow("nan token") << QByteArrayLiteral("NaN");
+        QTest::newRow("positive infinity token")
+            << QByteArrayLiteral("Infinity");
+        QTest::newRow("negative infinity token")
+            << QByteArrayLiteral("-Infinity");
+    }
+
+    void vciStatusRejectsNonFiniteVoltage()
+    {
+        QFETCH(QByteArray, voltage);
+        const QByteArray payload = QByteArrayLiteral(R"({"voltage":)")
+            + voltage + QByteArrayLiteral(R"(,"connected":true})");
+
+        const auto status = Xc2JsonCodec::vciStatus(payload);
+
+        QVERIFY(!status.ok());
+        QCOMPARE(status.error.category, Xc2ErrorCategory::Contract);
+        QCOMPARE(status.error.rawPayload, payload);
+    }
+
     void jobAcceptanceUsesExactWireFieldName()
     {
         const auto accepted = Xc2JsonCodec::jobAccepted(
             loadFixture(QStringLiteral("rest/job-accepted.json")));
         QVERIFY(accepted.ok());
-        QVERIFY(!Xc2JsonCodec::jobAccepted(
-            R"({"jobId":"synthetic"})").ok());
+        const QByteArray alias = QByteArrayLiteral(
+            R"({"jobId":"synthetic"})");
+        const auto rejected = Xc2JsonCodec::jobAccepted(alias);
+        QVERIFY(!rejected.ok());
+        QVERIFY(rejected.error.message.contains(QStringLiteral("jobID")));
+        QCOMPARE(rejected.error.rawPayload, alias);
     }
 
     void jobProgressFixtureUsesLocalizedTextObject()
