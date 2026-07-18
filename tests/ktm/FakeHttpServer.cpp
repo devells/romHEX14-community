@@ -300,6 +300,8 @@ void FakeHttpServer::consume(QTcpSocket *socket)
         return;
 
     FakeHttpRequest request;
+    request.rawBytes = state.bytes.left(
+        state.headerEnd + static_cast<qsizetype>(state.contentLength));
     request.method = requestLine.left(firstSpace);
     request.target = requestLine.mid(firstSpace + 1,
                                      secondSpace - firstSpace - 1);

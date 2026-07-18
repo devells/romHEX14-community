@@ -13,6 +13,7 @@ class QTcpServer;
 class QTcpSocket;
 
 struct FakeHttpRequest {
+    QByteArray rawBytes;
     QByteArray method;
     QByteArray target;
     QList<QPair<QByteArray, QByteArray>> headers;

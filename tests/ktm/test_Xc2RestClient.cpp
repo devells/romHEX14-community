@@ -423,8 +423,49 @@ private slots:
         };
         const QByteArray expectedHost = QByteArrayLiteral("127.0.0.1:")
             + QByteArray::number(origin.port());
+        const QList<Xc2VciDevice> postedDevices{applyDevice, closeDevice};
+        QList<QByteArray> expectedBodies;
+        for (const Xc2VciDevice &device : postedDevices) {
+            QJsonObject expectedObject{
+                {QStringLiteral("id"), device.id},
+                {QStringLiteral("name"), device.name},
+                {QStringLiteral("internalName"), device.internalName},
+                {QStringLiteral("additionalModuleInformation"),
+                 device.additionalModuleInformation.has_value()
+                     ? QJsonValue(*device.additionalModuleInformation)
+                     : QJsonValue(QJsonValue::Null)},
+            };
+            expectedBodies.append(
+                QJsonDocument(expectedObject).toJson(QJsonDocument::Compact));
+        }
+        const QByteArray commonHeaders = QByteArrayLiteral("\r\nHost: ")
+            + expectedHost
+            + QByteArrayLiteral(
+                "\r\nAccept: */*\r\nAccept-Encoding: identity\r\n"
+                "Connection: close\r\n");
+        const QList<QByteArray> expectedWires{
+            QByteArrayLiteral("GET /xc2/1.0/device/lookup HTTP/1.1")
+                + commonHeaders + QByteArrayLiteral("\r\n"),
+            QByteArrayLiteral("GET /xc2/1.0/device/get HTTP/1.1")
+                + commonHeaders + QByteArrayLiteral("\r\n"),
+            QByteArrayLiteral("GET /xc2/1.0/device/getSelected HTTP/1.1")
+                + commonHeaders + QByteArrayLiteral("\r\n"),
+            QByteArrayLiteral("POST /xc2/1.0/device/apply HTTP/1.1")
+                + commonHeaders
+                + QByteArrayLiteral(
+                    "Content-Type: application/json\r\nContent-Length: ")
+                + QByteArray::number(expectedBodies.at(0).size())
+                + QByteArrayLiteral("\r\n\r\n") + expectedBodies.at(0),
+            QByteArrayLiteral("POST /xc2/1.0/device/close HTTP/1.1")
+                + commonHeaders
+                + QByteArrayLiteral(
+                    "Content-Type: application/json\r\nContent-Length: ")
+                + QByteArray::number(expectedBodies.at(1).size())
+                + QByteArrayLiteral("\r\n\r\n") + expectedBodies.at(1),
+        };
         for (qsizetype i = 0; i < origin.requests().size(); ++i) {
             const FakeHttpRequest &request = origin.requests().at(i);
+            QCOMPARE(request.rawBytes, expectedWires.at(i));
             QCOMPARE(request.method, methods.at(i));
             QCOMPARE(request.target, targets.at(i));
             QCOMPARE(request.headerValues("Host"),
@@ -443,7 +484,6 @@ private slots:
             QVERIFY(origin.requests().at(i).body.isEmpty());
         }
 
-        const QList<Xc2VciDevice> postedDevices{applyDevice, closeDevice};
         for (qsizetype i = 0; i < postedDevices.size(); ++i) {
             const FakeHttpRequest &request = origin.requests().at(i + 3);
             QCOMPARE(request.headerValues("Content-Type"),
@@ -452,19 +492,7 @@ private slots:
             QCOMPARE(request.headerValues("Content-Length"),
                      QList<QByteArray>{
                          QByteArray::number(request.body.size())});
-            QJsonObject expectedObject{
-                {QStringLiteral("id"), postedDevices.at(i).id},
-                {QStringLiteral("name"), postedDevices.at(i).name},
-                {QStringLiteral("internalName"),
-                 postedDevices.at(i).internalName},
-                {QStringLiteral("additionalModuleInformation"),
-                 postedDevices.at(i).additionalModuleInformation.has_value()
-                     ? QJsonValue(
-                           *postedDevices.at(i).additionalModuleInformation)
-                     : QJsonValue(QJsonValue::Null)},
-            };
-            const QByteArray expectedBody =
-                QJsonDocument(expectedObject).toJson(QJsonDocument::Compact);
+            const QByteArray expectedBody = expectedBodies.at(i);
             QCOMPARE(request.body, expectedBody);
             QCOMPARE(QJsonDocument::fromJson(request.body).object().size(), 4);
             QVERIFY(!request.body.contains('\n'));
