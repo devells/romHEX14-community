@@ -136,7 +136,7 @@ jobs:
   macos:
     name: macOS / KTM OFF
     runs-on: macos-14
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       QT_QPA_PLATFORM: offscreen
     steps:
@@ -209,6 +209,6 @@ jobs:
           print(f'PASS: {len(targets)} codemodel targets contain no ktm/xc2 name')
           PY
       - name: Build romHEX14 and base tests
-        run: cmake --build build --parallel
+        run: cmake --build build --parallel 3
       - name: Run all registered base tests
         run: ctest --test-dir build --output-on-failure
