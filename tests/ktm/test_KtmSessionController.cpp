@@ -1281,6 +1281,45 @@ private slots:
                  KtmSessionState::Stopped);
     }
 
+    void stopDuringStartNormalizationCancelsOuterStart()
+    {
+        BootstrapHarness harness;
+        QPointer<Xc2BackendManager> oldBackend =
+            KtmSessionControllerTestAccess::backendGuard(
+                harness.controller);
+        QVERIFY(oldBackend);
+        delete oldBackend.data();
+        QVERIFY(oldBackend.isNull());
+        KtmSessionControllerTestAccess::setOperation(
+            harness.controller, KtmSessionOperation::Lookup);
+        bool stopRequested = false;
+        QObject::connect(
+            &harness.controller, &KtmSessionController::operationChanged,
+            &harness.controller,
+            [&harness, &stopRequested](KtmSessionOperation operation) {
+                if (operation != KtmSessionOperation::None || stopRequested)
+                    return;
+                stopRequested = true;
+                harness.controller.stop();
+            }, Qt::DirectConnection);
+        harness.trace.clear();
+
+        const bool started = harness.start();
+
+        QVERIFY(stopRequested);
+        QCOMPARE(harness.trace.count(QStringLiteral("start:C:/XC2")), 0);
+        QVERIFY(!started);
+        QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
+                 KtmSessionState::Stopped);
+        QVERIFY(!KtmSessionControllerTestAccess::stopping(
+            harness.controller));
+        harness.trace.clear();
+        QVERIFY(harness.start());
+        QCOMPARE(harness.trace.count(QStringLiteral("start:C:/XC2")), 1);
+        QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
+                 KtmSessionState::BackendStarting);
+    }
+
     void rejectsPublishedWebSocketAuthorityMismatch()
     {
         BootstrapHarness harness;

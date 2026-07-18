@@ -69,9 +69,11 @@ void KtmSessionController::ensureBackendManager()
 bool KtmSessionController::startProduction(const QString &installRoot,
                                            xc2::Xc2Error *error)
 {
-    if (m_resetting || m_stopping || m_projectingPayload || m_failing)
+    if (m_resetting || m_stopping || m_projectingPayload || m_failing
+        || m_normalizingOperation)
         return false;
     m_pendingFailure.reset();
+    m_stopRequestedDuringNormalization = false;
     m_stopTeardownActive = false;
     m_awaitingBackendStop = false;
     m_backendStoppedDuringTeardown = false;
@@ -96,12 +98,17 @@ bool KtmSessionController::startProduction(const QString &installRoot,
     }
 
     if (m_operation != KtmSessionOperation::None) {
-        m_stopping = true;
+        m_normalizingOperation = true;
         const bool normalized =
             publishOperation(KtmSessionOperation::None);
         if (!entryGuard)
             return false;
-        m_stopping = false;
+        m_normalizingOperation = false;
+        if (m_stopRequestedDuringNormalization) {
+            m_stopRequestedDuringNormalization = false;
+            stop();
+            return false;
+        }
         if (!normalized || entryEpoch != m_sessionEpoch
             || entryState != m_state || !backendGuard
             || backendGuard != m_backend
@@ -153,6 +160,7 @@ bool KtmSessionController::startProduction(const QString &installRoot,
 bool KtmSessionController::lookupVci(xc2::Xc2Error *error)
 {
     if (m_resetting || m_stopping || m_projectingPayload || m_failing
+        || m_normalizingOperation
         || m_state != KtmSessionState::SessionReady
         || m_operation != KtmSessionOperation::None) {
         const xc2::Xc2Error failure = localError(
@@ -192,7 +200,8 @@ bool KtmSessionController::lookupVci(xc2::Xc2Error *error)
 bool KtmSessionController::applyVci(const xc2::Xc2VciDevice &device,
                                     xc2::Xc2Error *error)
 {
-    if (m_resetting || m_stopping || m_projectingPayload || m_failing)
+    if (m_resetting || m_stopping || m_projectingPayload || m_failing
+        || m_normalizingOperation)
         return false;
     const QString approvedProvider =
         xc2::Xc2ContractProfile::approved().supportedPduApiShortName();
@@ -285,6 +294,7 @@ bool KtmSessionController::applyVci(const xc2::Xc2VciDevice &device,
 bool KtmSessionController::closeVci(xc2::Xc2Error *error)
 {
     if (m_resetting || m_stopping || m_projectingPayload || m_failing
+        || m_normalizingOperation
         || m_state != KtmSessionState::VciReady
         || m_operation != KtmSessionOperation::None
         || !m_confirmedDevice) {
@@ -338,6 +348,10 @@ bool KtmSessionController::closeVci(xc2::Xc2Error *error)
 
 void KtmSessionController::stop()
 {
+    if (m_normalizingOperation) {
+        m_stopRequestedDuringNormalization = true;
+        return;
+    }
     if (m_resetting) {
         if (!m_stopping)
             m_stopRequestedDuringReset = true;

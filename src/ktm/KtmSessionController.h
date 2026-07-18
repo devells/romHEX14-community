@@ -205,6 +205,8 @@ private:
     bool m_projectingPayload = false;
     bool m_failing = false;
     bool m_stopRequestedDuringReset = false;
+    bool m_normalizingOperation = false;
+    bool m_stopRequestedDuringNormalization = false;
     bool m_stopTeardownActive = false;
     bool m_awaitingBackendStop = false;
     bool m_backendStoppedDuringTeardown = false;
