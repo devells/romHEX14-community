@@ -73,6 +73,8 @@ find_package(ZLIB QUIET)
 
 if(RX14_KTM_XC2)
     add_library(rx14_ktm_xc2 STATIC
+        src/ktm/KtmSessionController.cpp
+        src/ktm/KtmSessionController.h
         src/ktm/xc2/Xc2ContractProfile.cpp
         src/ktm/xc2/Xc2ContractProfile.h
         src/ktm/xc2/Xc2JsonCodec.cpp
@@ -574,6 +576,18 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
 endif()
 
 if(BUILD_TESTING AND RX14_KTM_XC2)
+    add_executable(test_KtmSessionController
+        tests/ktm/test_KtmSessionController.cpp
+    )
+    target_link_libraries(test_KtmSessionController PRIVATE
+        rx14_ktm_xc2
+        Qt6::Test
+    )
+    add_test(NAME ktm_session_controller COMMAND test_KtmSessionController)
+    set_tests_properties(ktm_session_controller PROPERTIES
+        LABELS "unit;ktm"
+    )
+
     add_executable(test_Xc2ContractProfile
         tests/ktm/test_Xc2ContractProfile.cpp
     )
