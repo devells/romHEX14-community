@@ -1,0 +1,214 @@
+name: KTM XC2 Foundation
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows / KTM ON
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify exact event SHA
+        shell: pwsh
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:GITHUB_SHA) {
+            throw "checkout SHA $actual does not equal event SHA $env:GITHUB_SHA"
+          }
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: windows
+          target: desktop
+          arch: win64_mingw
+          tools: tools_mingw1310
+          modules: qtwebsockets
+      - name: Select Qt MinGW 13.1
+        shell: pwsh
+        run: |
+          $mingw = Join-Path $env:IQTA_TOOLS 'mingw1310_64\bin'
+          if (-not (Test-Path -LiteralPath $mingw -PathType Container)) {
+            throw "Qt MinGW 13.1 was not installed at $mingw"
+          }
+          $mingw | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Configure KTM foundation
+        run: >-
+          cmake -S . -B build -G "MinGW Makefiles"
+          -DCMAKE_BUILD_TYPE=Release
+          -DRX14_PRO_BUILD=OFF
+          -DBUILD_TESTING=ON
+          -DRX14_KTM_XC2=ON
+      - name: Build
+        run: cmake --build build --parallel
+      - name: Run fake and golden KTM tests
+        run: ctest --test-dir build --output-on-failure -L ktm --no-tests=error
+
+  linux:
+    name: Linux / KTM OFF
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify exact event SHA
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Install Qt base dependencies without WebSockets
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            qt6-base-dev qt6-tools-dev qt6-tools-dev-tools qt6-l10n-tools \
+            libgl-dev libxkbcommon-dev libxcb-cursor0 zlib1g-dev
+      - name: Request CMake codemodel v2
+        shell: bash
+        run: |
+          mkdir -p build/.cmake/api/v1/query
+          : > build/.cmake/api/v1/query/codemodel-v2
+      - name: Configure option-off build
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DRX14_PRO_BUILD=OFF
+          -DBUILD_TESTING=ON
+          -DRX14_KTM_XC2=OFF
+      - name: Prove KTM targets and optional Qt modules are absent
+        shell: bash
+        run: |
+          grep -Fx 'RX14_KTM_XC2:BOOL=OFF' build/CMakeCache.txt
+          if grep -q '^Qt6Test_DIR:' build/CMakeCache.txt; then
+            echo 'Qt Test was discovered with KTM disabled' >&2
+            exit 1
+          fi
+          if grep -q '^Qt6WebSockets_DIR:' build/CMakeCache.txt; then
+            echo 'Qt WebSockets was discovered with KTM disabled' >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import re
+
+          reply = Path('build/.cmake/api/v1/reply')
+          indexes = sorted(reply.glob('index-*.json'))
+          if not indexes:
+              raise SystemExit('missing CMake file API reply index')
+          index = json.loads(indexes[-1].read_text(encoding='utf-8'))
+          codemodels = [
+              item for item in index.get('objects', [])
+              if item.get('kind') == 'codemodel'
+              and item.get('version', {}).get('major') == 2
+          ]
+          if len(codemodels) != 1:
+              raise SystemExit(
+                  f'expected one codemodel-v2 reply, got {len(codemodels)}')
+          codemodel = json.loads(
+              (reply / codemodels[0]['jsonFile']).read_text(encoding='utf-8'))
+          targets = [
+              target.get('name', '')
+              for config in codemodel.get('configurations', [])
+              for target in config.get('targets', [])
+          ]
+          forbidden = sorted(
+              name for name in targets if re.search(r'(ktm|xc2)', name, re.I))
+          if forbidden:
+              raise SystemExit(f'forbidden option-off targets: {forbidden}')
+          print(f'PASS: {len(targets)} codemodel targets contain no ktm/xc2 name')
+          PY
+      - name: Build romHEX14 and base tests
+        run: cmake --build build --parallel
+      - name: Run all registered base tests
+        run: ctest --test-dir build --output-on-failure
+
+  macos:
+    name: macOS / KTM OFF
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify exact event SHA
+        run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: mac
+          target: desktop
+          arch: clang_64
+      - name: Request CMake codemodel v2
+        shell: bash
+        run: |
+          mkdir -p build/.cmake/api/v1/query
+          : > build/.cmake/api/v1/query/codemodel-v2
+      - name: Configure option-off build
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DRX14_PRO_BUILD=OFF
+          -DBUILD_TESTING=ON
+          -DRX14_KTM_XC2=OFF
+      - name: Prove KTM targets and optional Qt modules are absent
+        shell: bash
+        run: |
+          grep -Fx 'RX14_KTM_XC2:BOOL=OFF' build/CMakeCache.txt
+          if grep -q '^Qt6Test_DIR:' build/CMakeCache.txt; then
+            echo 'Qt Test was discovered with KTM disabled' >&2
+            exit 1
+          fi
+          if grep -q '^Qt6WebSockets_DIR:' build/CMakeCache.txt; then
+            echo 'Qt WebSockets was discovered with KTM disabled' >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import re
+
+          reply = Path('build/.cmake/api/v1/reply')
+          indexes = sorted(reply.glob('index-*.json'))
+          if not indexes:
+              raise SystemExit('missing CMake file API reply index')
+          index = json.loads(indexes[-1].read_text(encoding='utf-8'))
+          codemodels = [
+              item for item in index.get('objects', [])
+              if item.get('kind') == 'codemodel'
+              and item.get('version', {}).get('major') == 2
+          ]
+          if len(codemodels) != 1:
+              raise SystemExit(
+                  f'expected one codemodel-v2 reply, got {len(codemodels)}')
+          codemodel = json.loads(
+              (reply / codemodels[0]['jsonFile']).read_text(encoding='utf-8'))
+          targets = [
+              target.get('name', '')
+              for config in codemodel.get('configurations', [])
+              for target in config.get('targets', [])
+          ]
+          forbidden = sorted(
+              name for name in targets if re.search(r'(ktm|xc2)', name, re.I))
+          if forbidden:
+              raise SystemExit(f'forbidden option-off targets: {forbidden}')
+          print(f'PASS: {len(targets)} codemodel targets contain no ktm/xc2 name')
+          PY
+      - name: Build romHEX14 and base tests
+        run: cmake --build build --parallel
+      - name: Run all registered base tests
+        run: ctest --test-dir build --output-on-failure

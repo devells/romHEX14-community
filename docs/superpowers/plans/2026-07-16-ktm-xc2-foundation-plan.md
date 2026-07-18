@@ -2310,7 +2310,7 @@ rtk git commit -m "feat: add XC2 STOMP WebSocket transport"
   `Xc2BackendManager`, `QProcess`, Java, or a JAR. CI starts only the probe child
   and the in-process loopback fake; it never starts an XC2 artifact.
 
-- [ ] **Step 1: Write failing job-registry tests**
+- [x] **Step 1: Write failing job-registry tests**
 
 Use `QSignalSpy` and data rows for all four terminal states. Add:
 
@@ -2344,7 +2344,7 @@ payload is `Contract`; an equal payload under a different delivery identity is a
 distinct accepted event and is preserved. This avoids unsafe content-based
 deduplication.
 
-- [ ] **Step 2: Run registry tests to verify red behavior**
+- [x] **Step 2: Run registry tests to verify red behavior**
 
 ```powershell
 rtk cmake --build build-test --target test_Xc2JobRegistry --parallel
@@ -2352,7 +2352,7 @@ rtk cmake --build build-test --target test_Xc2JobRegistry --parallel
 
 Expected: missing-registry compile failure.
 
-- [ ] **Step 3: Implement the delivery envelope and registry interface**
+- [x] **Step 3: Implement the delivery envelope and registry interface**
 
 ```cpp
 struct Xc2JobEvent {
@@ -2395,7 +2395,7 @@ requires `Topic::Progress`, the exact profile destination, non-empty Task 7
 `messageId`, and a strict successful `Xc2JsonCodec::jobProgress()` result before
 constructing an event. Do not trust topic text or parse the body a second way.
 
-- [ ] **Step 4: Implement one atomic transition and signal policy**
+- [x] **Step 4: Implement one atomic transition and signal policy**
 
 Validate the complete input before changing maps, ordering, visibility,
 tombstones, or event lists. Apply this exact table:
@@ -2444,7 +2444,7 @@ record from another job never clears it. Tombstones live for the registry's
 session lifetime; a later controller creates a new registry for a new sidecar
 session rather than silently reusing retired IDs.
 
-- [ ] **Step 5: Write the real-process probe integration tests before the probe**
+- [x] **Step 5: Write the real-process probe integration tests before the probe**
 
 Extend Task 7's single-authority `FakeXc2TransportServer`; do not create an HTTP
 fake and WebSocket fake on different ports. Add scripts for strict health and
@@ -2501,7 +2501,7 @@ Success does not wait for a topic MESSAGE: the matching DISCONNECT receipt prove
 the broker processed the preceding ordered subscriptions without triggering a
 domain operation.
 
-- [ ] **Step 6: Register probe tests and verify both new targets are red**
+- [x] **Step 6: Register probe tests and verify both new targets are red**
 
 Create `xc2_job_registry` with labels `unit;contract;ktm`. Create
 `xc2_contract_probe_integration` with labels `contract;integration;ktm` and a
@@ -2515,7 +2515,7 @@ rtk cmake --build build-test --target test_Xc2JobRegistry test_Xc2ContractProbe 
 Expected: missing registry/probe compilation fails after CMake knows both
 targets; the optional port-8082 service is never contacted.
 
-- [ ] **Step 7: Implement the exact read-only contract probe**
+- [x] **Step 7: Implement the exact read-only contract probe**
 
 Add these immutable Task 1 policy values and tests:
 
@@ -2583,7 +2583,7 @@ login/name/dealer fields, permissions, sessionIndex, developer detail, or an
 arbitrary backend message. Exit 0 must not persist approval or enable any later
 state-changing capability.
 
-- [ ] **Step 8: Implement the strict PowerShell wrapper**
+- [x] **Step 8: Implement the strict PowerShell wrapper**
 
 `run_xc2_mock_contract.ps1` uses `[CmdletBinding()]` with mandatory raw string
 `-BaseUrl`, optional literal `-ProbePath` defaulting to the repository's exact
@@ -2601,7 +2601,7 @@ or executable. The integration test supplies the exact CMake target path and
 proves pass-through of `0`, `2`, `3`, `4`, and `5`, including a path containing
 spaces.
 
-- [ ] **Step 9: Run narrow Windows verification and the optional live probe**
+- [x] **Step 9: Run narrow Windows verification and the optional live probe**
 
 ```powershell
 rtk cmake --build build-test --target test_Xc2JobRegistry test_Xc2ContractProbe --parallel
@@ -2618,34 +2618,42 @@ starts nor stops the explicitly selected service.
 - [ ] **Step 10: Add required three-platform CI evidence**
 
 Create `ktm-xc2-foundation.yml` for `pull_request` and branch pushes; do not use
-the manual packaging/release workflow as the only test gate. Its Windows job
-installs Qt WebSockets, configures `BUILD_TESTING=ON` and `RX14_KTM_XC2=ON`,
-builds, and runs `ctest --output-on-failure -L ktm`. It runs only fake/golden
-tests and never downloads or launches XC2/Java.
+the manual packaging/release workflow as the only test gate. Use read-only
+`contents` permission and three independent jobs. Each checks out
+`${{ github.sha }}` and asserts `git rev-parse HEAD` equals the event SHA. The
+Windows job is
+pinned to `windows-2022`, installs Qt WebSockets, configures
+`BUILD_TESTING=ON` and `RX14_KTM_XC2=ON`, performs the full build, and runs
+`ctest --test-dir build --output-on-failure -L ktm --no-tests=error`. It runs
+only fake/golden tests and never downloads or launches XC2/Java.
 
-Linux and macOS jobs explicitly configure
-`-DBUILD_TESTING=ON -DRX14_KTM_XC2=OFF`, build romHEX14, and run all registered
-base tests. Keep Qt WebSockets absent where the platform packaging allows it and
-assert from build-system target help/file-api data that `rx14_ktm_xc2`,
-`xc2_contract_probe`, and every KTM test target are absent. A successful Windows
-`RX14_KTM_XC2=OFF` configure is useful local evidence for the option-off branch,
-but it is not evidence of a non-Windows build. Do not check this step from the
-current Windows workstation; retain the Linux/macOS job URLs and commit SHA.
+Before configure, Linux and macOS jobs create the CMake file API
+`codemodel-v2` query, then explicitly configure
+`-DBUILD_TESTING=ON -DRX14_KTM_XC2=OFF`. Require the exact cache entry
+`RX14_KTM_XC2:BOOL=OFF`, no `Qt6Test_DIR` or `Qt6WebSockets_DIR` cache entry,
+and no reply-codemodel target name matching `(ktm|xc2)` case-insensitively.
+Each job performs the full build and an unfiltered CTest run. A successful
+Windows `RX14_KTM_XC2=OFF` configure is useful local evidence for the option-off
+branch, but it is not evidence of a non-Windows build. Keep this step unchecked
+until the Linux/macOS job URLs and the common exact commit SHA are retained.
 
-- [ ] **Step 11: Self-review and commit the implementation to trigger CI**
+- [x] **Step 11: Self-review and commit the implementation to trigger CI**
 
 ```powershell
-rtk rg -n "T[B]D|T[O]DO|F[I]XME|P[L]ACEHOLDER" src/ktm tests/ktm docs/superpowers/plans/2026-07-16-ktm-xc2-foundation-plan.md docs/superpowers/specs/2026-07-16-ktm-xc2-integration-design.md
+rtk python .superpowers/sdd/task-8c-workflow-check.py
+rtk rg -n "T[B]D|T[O]DO|F[I]XME|P[L]ACEHOLDER" .github/workflows/ktm-xc2-foundation.yml docs/superpowers/plans/2026-07-16-ktm-xc2-foundation-plan.md docs/superpowers/specs/2026-07-16-ktm-xc2-integration-design.md
 rtk git diff --check
 rtk git status --short
-rtk git add CMakeLists.txt .github/workflows/ktm-xc2-foundation.yml src/ktm/xc2/Xc2ContractProfile.* src/ktm/xc2/Xc2JobRegistry.* tests/ktm/FakeXc2TransportServer.* tests/ktm/test_Xc2ContractProfile.cpp tests/ktm/test_Xc2JobRegistry.cpp tests/ktm/test_Xc2ContractProbe.cpp tests/ktm/xc2_contract_probe.cpp tests/ktm/run_xc2_mock_contract.ps1 docs/superpowers/specs/2026-07-16-ktm-xc2-integration-design.md docs/superpowers/plans/2026-07-16-ktm-xc2-foundation-plan.md
+rtk git add .github/workflows/ktm-xc2-foundation.yml docs/superpowers/specs/2026-07-16-ktm-xc2-integration-design.md docs/superpowers/plans/2026-07-16-ktm-xc2-foundation-plan.md
+rtk git diff --cached --check
+rtk git diff --cached --name-only
 rtk git commit -m "feat: complete the XC2 communication foundation"
 ```
 
-Before the commit, status may contain exactly the Task 8 implementation files
-listed above plus intentional checkbox changes; the old expectation that only a
-plan checkbox is uncommitted is invalid. Leave Step 10 and the final completion
-checkbox unchecked until the pushed commit's three jobs finish.
+Before the implementation commit, status must contain exactly the three Task 8c
+tracked files staged above. Leave Steps 10 and 12 and the Phase 1 completion gate
+open until the pushed implementation commit's three jobs finish for one exact
+SHA.
 
 - [ ] **Step 12: Record CI evidence, finish checkboxes, and commit docs**
 

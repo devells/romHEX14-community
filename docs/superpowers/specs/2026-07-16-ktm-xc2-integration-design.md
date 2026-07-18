@@ -565,11 +565,39 @@ option is enabled; configuration fails with a direct prerequisite message when
 it is missing. Non-Windows builds retain the rest of romHEX14 and omit the KTM
 service action.
 
+The required three-platform foundation workflow has independent Windows, Linux,
+and macOS jobs. The Windows job is pinned to `windows-2022`, installs Qt
+WebSockets, configures with `BUILD_TESTING=ON` and `RX14_KTM_XC2=ON`, performs
+the full build with `cmake --build build --parallel`, and then runs only the
+fake/golden KTM CTests with
+`ctest --test-dir build --output-on-failure -L ktm --no-tests=error`.
+
+The Linux and macOS jobs do not install Qt WebSockets. Before configure, each
+creates the CMake file API query
+`build/.cmake/api/v1/query/codemodel-v2`, then configures with
+`BUILD_TESTING=ON` and `RX14_KTM_XC2=OFF`. Each job must prove from
+`CMakeCache.txt` that the exact entry `RX14_KTM_XC2:BOOL=OFF` is present and
+that neither `Qt6Test_DIR` nor `Qt6WebSockets_DIR` is present. It must also prove
+from the returned codemodel-v2 reply that no target name matches `(ktm|xc2)`
+case-insensitively. Each then performs the full build with
+`cmake --build build --parallel` and runs unfiltered CTest with
+`ctest --test-dir build --output-on-failure`.
+
 Configuration stores only paths and user preferences. Firmware, XC2 JARs,
 vendor DLLs, credentials, and dealer data are not copied into the romHEX14
 repository or project format.
 
 ## 11. Testing
+
+Phase 1 completion requires one successful `push` workflow run for one exact
+commit SHA with all three independent jobs green: `Windows / KTM ON`,
+`Linux / KTM OFF`, and `macOS / KTM OFF`. Each job must check out
+`${{ github.sha }}` and assert that `git rev-parse HEAD` equals `GITHUB_SHA`, so
+all three results are tied to the same exact Git object. Retained evidence must
+include the run URL and exact `headSha` plus each job's URL and successful
+conclusion. Local Windows evidence cannot replace either non-Windows job, and
+results from a pull-request merge commit, another run, or another SHA cannot be
+combined.
 
 ### 11.1 Unit Tests
 
