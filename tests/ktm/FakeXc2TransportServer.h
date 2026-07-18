@@ -172,6 +172,7 @@ public:
     int stateChangingRestRequestCount() const;
     int unexpectedOperationCount() const;
     int pendingActionCount() const;
+    int pendingUpgradeConnectionCount() const;
     int canceledActionCount() const;
     int liveSocketObjectCount() const;
     bool scriptExhausted() const;
@@ -226,6 +227,13 @@ signals:
 private:
     struct RawConnection;
     struct PendingAction;
+    struct ResolvedAction {
+        Action action;
+        QPointer<QTcpSocket> httpSocket;
+        QPointer<QWebSocket> webSocket;
+        quint64 connectionId = 0;
+        bool targetWasPresent = false;
+    };
 
     void acceptConnections();
     void inspect(QTcpSocket *socket);
@@ -253,10 +261,12 @@ private:
                             quint64 connectionId,
                             const FakeXc2HttpRequest *request,
                             const ktm::xc2::Xc2StompFrame *frame);
-    void runActions(const QList<Action> &actions,
-                    QTcpSocket *eventHttpSocket,
-                    QWebSocket *eventWebSocket,
-                    quint64 eventConnectionId);
+    QList<ResolvedAction> resolveActions(
+        const QList<Action> &actions,
+        QTcpSocket *eventHttpSocket,
+        QWebSocket *eventWebSocket,
+        quint64 eventConnectionId) const;
+    void runActions(const QList<ResolvedAction> &actions);
     bool scheduleAction(const Action &action,
                         QTcpSocket *httpSocket,
                         QWebSocket *webSocket,
@@ -271,6 +281,8 @@ private:
     void cancelPendingActions(QTcpSocket *socket);
     void cancelPendingActions(QWebSocket *socket);
     void appendTrace(TraceEvent event);
+    RawConnection *rawConnection(QTcpSocket *socket,
+                                 quint64 connectionId) const;
     QWebSocket *activeWebSocket() const;
     static FakeXc2HttpRequest parseRequest(const QByteArray &headerBlock);
 

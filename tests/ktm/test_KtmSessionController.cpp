@@ -5,8 +5,11 @@
 #include "ktm/xc2/Xc2JsonCodec.h"
 
 #include <QPointer>
+#include <QNetworkRequest>
 #include <QSignalSpy>
 #include <QTcpSocket>
+#include <QWebSocket>
+#include <QWebSocketHandshakeOptions>
 #include <QtTest>
 
 #include <algorithm>
@@ -758,6 +761,9 @@ FakeExpectation upgradeExpectation(
              + QByteArray::number(server.port())},
         {QByteArrayLiteral("Cookie"), cookie},
         {QByteArrayLiteral("Upgrade"), QByteArrayLiteral("websocket")},
+        {QByteArrayLiteral("Connection"), QByteArrayLiteral("Upgrade")},
+        {QByteArrayLiteral("Sec-WebSocket-Version"),
+         QByteArrayLiteral("13")},
         {QByteArrayLiteral("Sec-WebSocket-Protocol"),
          QByteArrayLiteral("v12.stomp")},
     };
@@ -957,6 +963,50 @@ QList<FakePhase> strictHealthOnlyScript(
     if (!respond)
         phases[0].expectations[0].actions.clear();
     return phases;
+}
+
+QList<FakePhase> upgradeOnlyScript(
+    const FakeXc2TransportServer &server,
+    const QByteArray &cookie = QByteArrayLiteral("session=task4"))
+{
+    return {orderedPhase(QStringLiteral("upgrade"),
+                         upgradeExpectation(server, cookie))};
+}
+
+QByteArray rawUpgradeRequest(const FakeXc2TransportServer &server,
+                             const QByteArray &cookie,
+                             const QString &fault = {})
+{
+    QByteArray request = QByteArrayLiteral(
+        "GET /xc2-websocket HTTP/1.1\r\nHost: 127.0.0.1:")
+        + QByteArray::number(server.port())
+        + QByteArrayLiteral("\r\nUpgrade: websocket\r\n");
+    if (fault != QStringLiteral("missing-connection")) {
+        request += QByteArrayLiteral("Connection: Upgrade\r\n");
+        if (fault == QStringLiteral("duplicate-connection"))
+            request += QByteArrayLiteral("cOnNeCtIoN: Upgrade\r\n");
+    }
+    if (fault != QStringLiteral("missing-key")) {
+        const QByteArray key = fault == QStringLiteral("malformed-key")
+            ? QByteArrayLiteral("not-a-valid-websocket-key")
+            : QByteArrayLiteral("dGhlIHNhbXBsZSBub25jZQ==");
+        request += QByteArrayLiteral("Sec-WebSocket-Key: ") + key
+            + QByteArrayLiteral("\r\n");
+        if (fault == QStringLiteral("duplicate-key")) {
+            request += QByteArrayLiteral(
+                "sec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n");
+        }
+    }
+    request += QByteArrayLiteral("Sec-WebSocket-Version: ")
+        + (fault == QStringLiteral("wrong-version")
+               ? QByteArrayLiteral("12") : QByteArrayLiteral("13"))
+        + QByteArrayLiteral(
+            "\r\nSec-WebSocket-Protocol: v12.stomp\r\nCookie: ")
+        + cookie + QByteArrayLiteral("\r\n");
+    if (fault == QStringLiteral("extra-header"))
+        request += QByteArrayLiteral("Authorization: Bearer drift\r\n");
+    request += QByteArrayLiteral("\r\n");
+    return request;
 }
 
 FakeAction transportFailureAction(bool visibilityLoss)
@@ -1460,6 +1510,12 @@ private slots:
             << QStringLiteral("wrong-content-type");
         QTest::newRow("initial-tail")
             << QStringLiteral("initial-tail");
+        QTest::newRow("extra-header")
+            << QStringLiteral("extra-header");
+        QTest::newRow("duplicate-mixed-case-header")
+            << QStringLiteral("duplicate-mixed-case-header");
+        QTest::newRow("case-changed-value")
+            << QStringLiteral("case-changed-value");
     }
 
     void sameAuthorityStrictHttpFraming()
@@ -1504,9 +1560,16 @@ private slots:
         } else if (fault == QStringLiteral("get-body")) {
             request += QByteArrayLiteral("Content-Length: 1\r\n");
         }
+        request += QByteArrayLiteral("Accept: */*\r\n");
+        if (fault == QStringLiteral("duplicate-mixed-case-header"))
+            request += QByteArrayLiteral("aCcEpT: */*\r\n");
+        if (fault == QStringLiteral("extra-header"))
+            request += QByteArrayLiteral("X-Retry: 1\r\n");
         request += QByteArrayLiteral(
-            "Accept: */*\r\nAccept-Encoding: identity\r\n"
-            "Connection: close\r\n\r\n");
+            "Accept-Encoding: identity\r\nConnection: ");
+        request += fault == QStringLiteral("case-changed-value")
+            ? QByteArrayLiteral("Close\r\n\r\n")
+            : QByteArrayLiteral("close\r\n\r\n");
         if (fault == QStringLiteral("get-body"))
             request += 'x';
         if (fault == QStringLiteral("initial-tail"))
@@ -1555,6 +1618,207 @@ private slots:
                  1);
         QTRY_COMPARE_WITH_TIMEOUT(server.liveSocketObjectCount(), 0, 3000);
         QVERIFY(!server.scriptExhausted());
+    }
+
+    void sameAuthorityStrictUpgradeHeaders_data()
+    {
+        QTest::addColumn<QString>("fault");
+        QTest::newRow("extra-header") << QStringLiteral("extra-header");
+        QTest::newRow("missing-key") << QStringLiteral("missing-key");
+        QTest::newRow("malformed-key")
+            << QStringLiteral("malformed-key");
+        QTest::newRow("duplicate-key")
+            << QStringLiteral("duplicate-key");
+        QTest::newRow("missing-connection")
+            << QStringLiteral("missing-connection");
+        QTest::newRow("duplicate-connection")
+            << QStringLiteral("duplicate-connection");
+        QTest::newRow("wrong-version")
+            << QStringLiteral("wrong-version");
+    }
+
+    void sameAuthorityStrictUpgradeHeaders()
+    {
+        QFETCH(QString, fault);
+        FakeXc2TransportServer server;
+        const QByteArray cookie = QByteArrayLiteral("session=task4");
+        QString scriptError;
+        QVERIFY2(server.setScript(upgradeOnlyScript(server, cookie),
+                                  &scriptError),
+                 qPrintable(scriptError));
+        const QByteArray request = rawUpgradeRequest(server, cookie, fault);
+        QTcpSocket socket;
+        socket.connectToHost(QHostAddress::LocalHost, server.port());
+        QVERIFY(socket.waitForConnected(1000));
+        QCOMPARE(socket.write(request), qint64(request.size()));
+        socket.flush();
+        QTRY_COMPARE_WITH_TIMEOUT(server.unexpectedOperationCount(), 1,
+                                  3000);
+        QCOMPARE(server.pendingUpgradeConnectionCount(), 0);
+        QCOMPARE(server.webSocketConnectionCount(), 0);
+        QVERIFY(!server.scriptExhausted());
+        socket.abort();
+        QTRY_COMPARE_WITH_TIMEOUT(server.liveSocketObjectCount(), 0, 3000);
+    }
+
+    void sameAuthorityUpgradeCaptureMayAbortExactSocket()
+    {
+        FakeXc2TransportServer server;
+        const QByteArray cookie = QByteArrayLiteral("session=task4");
+        QString scriptError;
+        QVERIFY2(server.setScript(upgradeOnlyScript(server, cookie),
+                                  &scriptError),
+                 qPrintable(scriptError));
+        bool closeScheduled = false;
+        connect(&server, &FakeXc2TransportServer::upgradeRequestCaptured,
+                &server, [&server, &closeScheduled] {
+            FakeAction close;
+            close.label = QStringLiteral("capture-close-exact-upgrade");
+            close.type = FakeAction::Type::CloseHttp;
+            close.target = FakeAction::Target::ExpectationSocket;
+            close.targetExpectation = QStringLiteral("websocket-upgrade");
+            closeScheduled = server.performAction(close);
+        });
+        const QByteArray request = rawUpgradeRequest(server, cookie);
+        QTcpSocket socket;
+        socket.connectToHost(QHostAddress::LocalHost, server.port());
+        QVERIFY(socket.waitForConnected(1000));
+        QCOMPARE(socket.write(request), qint64(request.size()));
+        socket.flush();
+        QTRY_VERIFY_WITH_TIMEOUT(closeScheduled, 3000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.liveSocketObjectCount(), 0, 3000);
+        QCOMPARE(server.webSocketConnectionCount(), 0);
+        QCOMPARE(server.pendingUpgradeConnectionCount(), 0);
+        QCOMPARE(server.pendingActionCount(), 0);
+        QCOMPARE(server.canceledActionCount(), 0);
+        QCOMPARE(server.unexpectedOperationCount(), 0);
+        QVERIFY(server.scriptExhausted());
+        const qsizetype captured = traceIndex(
+            server, QStringLiteral("websocket-upgrade"));
+        const qsizetype closed = traceIndex(
+            server, QStringLiteral("capture-close-exact-upgrade"));
+        QVERIFY(captured >= 0);
+        QVERIFY(closed > captured);
+    }
+
+    void sameAuthorityStompActionNeverFallsForwardToNewSocket()
+    {
+        FakeXc2TransportServer server;
+        const QByteArray cookie = QByteArrayLiteral("session=task4");
+        QString scriptError;
+        QVERIFY2(server.setScript(upgradeOnlyScript(server, cookie),
+                                  &scriptError),
+                 qPrintable(scriptError));
+        const QUrl url(QStringLiteral("ws://127.0.0.1:%1/xc2-websocket")
+                           .arg(server.port()));
+        QWebSocketHandshakeOptions handshake;
+        handshake.setSubprotocols({QStringLiteral("v12.stomp")});
+
+        QWebSocket oldClient;
+        oldClient.setProxy(QNetworkProxy::NoProxy);
+        QNetworkRequest oldRequest(url);
+        oldRequest.setRawHeader(QByteArrayLiteral("Cookie"), cookie);
+        QSignalSpy oldConnected(&oldClient, &QWebSocket::connected);
+        oldClient.open(oldRequest, handshake);
+        QTRY_COMPARE_WITH_TIMEOUT(oldConnected.count(), 1, 3000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.webSocketConnectionCount(), 1,
+                                  3000);
+        QVERIFY(server.scriptExhausted());
+        quint64 oldConnectionId = 0;
+        for (const auto &event : server.trace()) {
+            if (event.label == QStringLiteral("websocket-upgrade")) {
+                oldConnectionId = event.connectionId;
+                break;
+            }
+        }
+        QVERIFY(oldConnectionId != 0);
+
+        QVERIFY2(server.setScript(upgradeOnlyScript(server, cookie),
+                                  &scriptError),
+                 qPrintable(scriptError));
+        QWebSocket newClient;
+        newClient.setProxy(QNetworkProxy::NoProxy);
+        QNetworkRequest newRequest(url);
+        newRequest.setRawHeader(QByteArrayLiteral("Cookie"), cookie);
+        QSignalSpy newConnected(&newClient, &QWebSocket::connected);
+        QSignalSpy newMessages(&newClient, &QWebSocket::textMessageReceived);
+        newClient.open(newRequest, handshake);
+        QTRY_COMPARE_WITH_TIMEOUT(newConnected.count(), 1, 3000);
+        QTRY_COMPARE_WITH_TIMEOUT(server.webSocketConnectionCount(), 2,
+                                  3000);
+        QVERIFY(server.scriptExhausted());
+
+        Xc2StompFrame trigger;
+        trigger.command = QByteArrayLiteral("SEND");
+        trigger.headers.insert(QByteArrayLiteral("destination"),
+                               QByteArrayLiteral("/task4/reentrant"));
+        trigger.body = QByteArrayLiteral("old-event");
+        Xc2StompFrame marker;
+        marker.command = QByteArrayLiteral("MESSAGE");
+        marker.headers.insert(QByteArrayLiteral("destination"),
+                              QByteArrayLiteral("/task4/marker"));
+        marker.body = QByteArrayLiteral("must-not-reach-new-socket");
+        FakeAction markerAction;
+        markerAction.label = QStringLiteral("old-event-marker");
+        markerAction.type = FakeAction::Type::SendStompFrame;
+        markerAction.target = FakeAction::Target::WebSocket;
+        markerAction.stompFrame = marker;
+        FakeExpectation triggerExpectation = stompExpectation(
+            QStringLiteral("old-event-trigger"), trigger, {markerAction});
+        QVERIFY2(server.setScript(
+                     {orderedPhase(QStringLiteral("old-event"),
+                                   std::move(triggerExpectation))},
+                     &scriptError),
+                 qPrintable(scriptError));
+
+        bool oldServerSocketDestroyedInCapture = false;
+        connect(&server, &FakeXc2TransportServer::stompFrameReceived,
+                &server, [&] {
+            const int disconnections = server.webSocketDisconnectionCount();
+            oldClient.abort();
+            QElapsedTimer wait;
+            wait.start();
+            while (server.webSocketDisconnectionCount() == disconnections
+                   && wait.elapsed() < 1000) {
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+            }
+            for (int attempt = 0; attempt < 4; ++attempt) {
+                QCoreApplication::sendPostedEvents(
+                    nullptr, QEvent::DeferredDelete);
+                QCoreApplication::processEvents(QEventLoop::AllEvents, 10);
+            }
+            oldServerSocketDestroyedInCapture =
+                server.liveSocketObjectCount() == 1;
+        }, Qt::DirectConnection);
+
+        const QByteArray encoded = Xc2StompCodec::encode(trigger);
+        QCOMPARE(oldClient.sendTextMessage(QString::fromUtf8(encoded)),
+                 qint64(encoded.size()));
+        QTRY_VERIFY_WITH_TIMEOUT(server.scriptExhausted(), 3000);
+        QVERIFY(oldServerSocketDestroyedInCapture);
+        QTest::qWait(100);
+        QCOMPARE(newMessages.count(), 0);
+        QCOMPARE(traceCount(
+                     server, QStringLiteral("old-event-marker"),
+                     FakeXc2TransportServer::TraceEvent::Direction::Sent),
+                 0);
+        QCOMPARE(traceCount(
+                     server, QStringLiteral("old-event-marker"),
+                     FakeXc2TransportServer::TraceEvent::Direction::Canceled),
+                 1);
+        const auto canceled = std::find_if(
+            server.trace().cbegin(), server.trace().cend(),
+            [](const FakeXc2TransportServer::TraceEvent &event) {
+                return event.label == QStringLiteral("old-event-marker")
+                    && event.direction
+                        == FakeXc2TransportServer::TraceEvent::Direction::Canceled;
+            });
+        QVERIFY(canceled != server.trace().cend());
+        QCOMPARE(canceled->connectionId, oldConnectionId);
+        QCOMPARE(server.pendingActionCount(), 0);
+        QCOMPARE(server.unexpectedOperationCount(), 0);
+        newClient.abort();
+        QTRY_COMPARE_WITH_TIMEOUT(server.liveSocketObjectCount(), 0, 3000);
     }
 
     void sameAuthorityStrictHttpRejectsLateTail()
