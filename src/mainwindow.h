@@ -56,6 +56,11 @@ class DebugRpc;
 class QJsonObject;
 class QJsonArray;
 #endif
+#ifdef RX14_KTM_XC2
+namespace ktm {
+class KtmServiceWorkspaceHost;
+}
+#endif
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -451,6 +456,9 @@ private:
     QAction        *m_actCmdPalette = nullptr;
     QAction        *m_actPreferences = nullptr;
     CommandPalette *m_cmdPalette    = nullptr;  // lazily constructed
+#ifdef RX14_KTM_XC2
+    ktm::KtmServiceWorkspaceHost *m_ktmServiceWorkspaceHost = nullptr;
+#endif
 
     // ── Map operation actions ──────────────────────────────────────────
     QAction *m_actOptimize   = nullptr;

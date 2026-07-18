@@ -66,6 +66,9 @@
 #include "brandlogo.h"
 #include "commandpalette.h"
 #include "projectregistry.h"
+#ifdef RX14_KTM_XC2
+#  include "ktm/ui/KtmServiceWorkspace.h"
+#endif
 #include <QStackedWidget>
 #include <QListWidget>
 #include <QListWidgetItem>
@@ -2046,6 +2049,11 @@ void MainWindow::buildActions()
     connect(m_actCmdPalette, &QAction::triggered,
             this, &MainWindow::actShowCommandPalette);
 
+#ifdef RX14_KTM_XC2
+    m_ktmServiceWorkspaceHost =
+        new ktm::KtmServiceWorkspaceHost(this);
+#endif
+
     m_actPreferences = new QAction(tr("Settings\u2026"), this);
     m_actPreferences->setMenuRole(QAction::NoRole);
     connect(m_actPreferences, &QAction::triggered, this, [this]() {
@@ -2806,6 +2814,12 @@ void MainWindow::retranslateUi()
     m_menuMisc->addSeparator();
     // Preferences and Command Palette — placed BEFORE submenus
     if (m_actCmdPalette) m_menuMisc->addAction(m_actCmdPalette);
+#ifdef RX14_KTM_XC2
+    if (m_ktmServiceWorkspaceHost) {
+        m_ktmServiceWorkspaceHost->retranslate(tr("KTM Service"));
+        m_ktmServiceWorkspaceHost->attachToMenu(m_menuMisc);
+    }
+#endif
     if (m_actPreferences) m_menuMisc->addAction(m_actPreferences);
     m_menuMisc->addSeparator();
 

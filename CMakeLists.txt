@@ -485,6 +485,17 @@ target_link_libraries(rx14 PRIVATE
     Qt6::Sql
 )
 
+if(RX14_KTM_XC2)
+    target_sources(rx14 PRIVATE
+        src/ktm/ui/KtmConnectionPage.cpp
+        src/ktm/ui/KtmConnectionPage.h
+        src/ktm/ui/KtmServiceWorkspace.cpp
+        src/ktm/ui/KtmServiceWorkspace.h
+    )
+    target_link_libraries(rx14 PRIVATE rx14_ktm_xc2)
+    target_compile_definitions(rx14 PRIVATE RX14_KTM_XC2=1)
+endif()
+
 if(RX14_PRO_BUILD)
     target_compile_definitions(rx14 PRIVATE RX14_PRO_BUILD)
 endif()
@@ -576,6 +587,38 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
 endif()
 
 if(BUILD_TESTING AND RX14_KTM_XC2)
+    add_executable(test_KtmConnectionPage
+        src/ktm/ui/KtmConnectionPage.cpp
+        src/ktm/ui/KtmConnectionPage.h
+        tests/ktm/test_KtmConnectionPage.cpp
+    )
+    target_link_libraries(test_KtmConnectionPage PRIVATE
+        rx14_ktm_xc2
+        Qt6::Widgets
+        Qt6::Test
+    )
+    add_test(NAME ktm_connection_page COMMAND test_KtmConnectionPage)
+    set_tests_properties(ktm_connection_page PROPERTIES
+        LABELS "unit;ui;ktm"
+    )
+
+    add_executable(test_KtmServiceWorkspace
+        src/ktm/ui/KtmConnectionPage.cpp
+        src/ktm/ui/KtmConnectionPage.h
+        src/ktm/ui/KtmServiceWorkspace.cpp
+        src/ktm/ui/KtmServiceWorkspace.h
+        tests/ktm/test_KtmServiceWorkspace.cpp
+    )
+    target_link_libraries(test_KtmServiceWorkspace PRIVATE
+        rx14_ktm_xc2
+        Qt6::Widgets
+        Qt6::Test
+    )
+    add_test(NAME ktm_service_workspace COMMAND test_KtmServiceWorkspace)
+    set_tests_properties(ktm_service_workspace PROPERTIES
+        LABELS "unit;ui;ktm"
+    )
+
     add_executable(test_KtmSessionController
         tests/ktm/FakeXc2TransportServer.cpp
         tests/ktm/FakeXc2TransportServer.h
