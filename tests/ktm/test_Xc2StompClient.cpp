@@ -5,6 +5,7 @@
 #include "ktm/xc2/Xc2StompClient.h"
 
 #include <QAbstractSocket>
+#include <QAbstractEventDispatcher>
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QEventLoop>
@@ -2685,7 +2686,60 @@ private slots:
                               QStringLiteral("error"),
                               QStringLiteral("visibility")}));
         QVERIFY(waitDuration(120));
+        QCOMPARE(socketDestroyed.count(), 1);
         QCOMPARE(server.connectionCount(), connections);
+    }
+
+    void retirementOwnerBoundsSocketWithoutDeferredDelete()
+    {
+        FakeXc2TransportServer server;
+        Xc2RestClient rest;
+        QVERIFY(establishRestSession(server, rest));
+        auto *client = new Xc2StompClient;
+        QVERIFY(establishStompSession(server, rest, *client));
+
+        QPointer<Xc2StompClient> clientGuard(client);
+        QPointer<QWebSocket> socketGuard(ownedWebSocket(*client));
+        QVERIFY(socketGuard);
+        QSignalSpy clientDestroyed(client, &QObject::destroyed);
+        QSignalSpy socketDestroyed(socketGuard, &QObject::destroyed);
+        QPointer<QObject> retirementOwnerGuard;
+
+        connect(client, &Xc2StompClient::visibilityLost, this,
+                [&client, &socketGuard,
+                 &retirementOwnerGuard](Xc2StompGeneration,
+                                        const Xc2Error &) {
+            delete client;
+            client = nullptr;
+            if (!socketGuard)
+                return;
+            QCoreApplication::removePostedEvents(
+                socketGuard, QEvent::DeferredDelete);
+            retirementOwnerGuard = socketGuard->parent();
+        });
+
+        server.closeWebSocket();
+        QVERIFY(waitForCount(clientDestroyed, 1));
+        QVERIFY(clientGuard.isNull());
+        QVERIFY(socketGuard);
+        QVERIFY2(retirementOwnerGuard,
+                 "retired socket has no dispatcher-bound owner");
+        QCOMPARE(socketGuard->parent(), retirementOwnerGuard.data());
+        QCOMPARE(socketGuard->thread(), retirementOwnerGuard->thread());
+        QAbstractEventDispatcher *const dispatcher =
+            QAbstractEventDispatcher::instance(socketGuard->thread());
+        QVERIFY(dispatcher);
+        QCOMPARE(retirementOwnerGuard->parent(), dispatcher);
+
+        QSignalSpy retirementOwnerDestroyed(retirementOwnerGuard,
+                                             &QObject::destroyed);
+        delete retirementOwnerGuard.data();
+        QCOMPARE(retirementOwnerDestroyed.count(), 1);
+        QCOMPARE(socketDestroyed.count(), 1);
+        QVERIFY(retirementOwnerGuard.isNull());
+        QVERIFY(socketGuard.isNull());
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        QCOMPARE(socketDestroyed.count(), 1);
     }
 
     void connectFailureAndIntentionalDisconnectDoNotLoseVisibility()

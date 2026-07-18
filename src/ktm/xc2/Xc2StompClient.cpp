@@ -3,6 +3,7 @@
 #include "Xc2RestClient.h"
 #include "Xc2StompCodec.h"
 
+#include <QAbstractEventDispatcher>
 #include <QAbstractSocket>
 #include <QDeadlineTimer>
 #include <QElapsedTimer>
@@ -13,6 +14,7 @@
 #include <QSet>
 #include <QStringDecoder>
 #include <QTimer>
+#include <QThread>
 #include <QUrl>
 #include <QWebSocket>
 #include <QWebSocketHandshakeOptions>
@@ -27,6 +29,31 @@ namespace ktm::xc2 {
 namespace {
 
 constexpr quint64 kCodecMaximumBytes = 8 * 1024 * 1024;
+
+class StompSocketRetirementOwner final : public QObject {
+public:
+    explicit StompSocketRetirementOwner(QAbstractEventDispatcher *dispatcher)
+        : QObject(dispatcher)
+    {
+    }
+};
+
+QObject *socketRetirementOwner(QWebSocket *socket)
+{
+    if (!socket || socket->thread() != QThread::currentThread())
+        return nullptr;
+    QAbstractEventDispatcher *const dispatcher =
+        QAbstractEventDispatcher::instance(socket->thread());
+    if (!dispatcher || dispatcher->thread() != socket->thread())
+        return nullptr;
+    for (QObject *child : dispatcher->children()) {
+        if (auto *owner =
+                dynamic_cast<StompSocketRetirementOwner *>(child)) {
+            return owner;
+        }
+    }
+    return new StompSocketRetirementOwner(dispatcher);
+}
 
 Xc2Error contractError(QString message, QByteArray payload = {})
 {
@@ -354,7 +381,10 @@ struct Xc2StompClient::Private {
 
         if (retiredSocket) {
             retiredSocket->disconnect(q);
-            retiredSocket->setParent(nullptr);
+            QObject *const retirementOwner =
+                socketRetirementOwner(retiredSocket);
+            Q_ASSERT(retirementOwner);
+            retiredSocket->setParent(retirementOwner);
             if (forceAbort)
                 retiredSocket->abort();
             retiredSocket->deleteLater();
