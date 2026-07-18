@@ -73,6 +73,17 @@ QByteArray FakeHttpRequest::headerValue(const QByteArray &name) const
     return {};
 }
 
+QList<QByteArray> FakeHttpRequest::headerValues(
+    const QByteArray &name) const
+{
+    QList<QByteArray> values;
+    for (const auto &header : headers) {
+        if (equalsHeaderName(header.first, name))
+            values.append(header.second);
+    }
+    return values;
+}
+
 FakeHttpServer::FakeHttpServer(const QHostAddress &address, QObject *parent)
     : QObject(parent), m_server(new QTcpServer(this))
 {

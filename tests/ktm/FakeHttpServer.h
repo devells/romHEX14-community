@@ -19,6 +19,7 @@ struct FakeHttpRequest {
     QByteArray body;
 
     QByteArray headerValue(const QByteArray &name) const;
+    QList<QByteArray> headerValues(const QByteArray &name) const;
 };
 
 struct FakeHttpResponse {

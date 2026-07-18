@@ -1,6 +1,7 @@
 #include <QtTest>
 
 #include <QElapsedTimer>
+#include <QJsonDocument>
 #include <QNetworkProxy>
 #include <QPointer>
 #include <QSignalSpy>
@@ -105,6 +106,9 @@ private slots:
     {
         qRegisterMetaType<Xc2Result<Xc2ServiceStatus>>();
         qRegisterMetaType<Xc2Result<Xc2CurrentUser>>();
+        qRegisterMetaType<Xc2Result<Xc2JobAccepted>>();
+        qRegisterMetaType<Xc2Result<QList<Xc2VciDevice>>>();
+        qRegisterMetaType<Xc2Result<Xc2SelectedVci>>();
         qRegisterMetaType<Xc2Error>();
     }
 
@@ -294,6 +298,760 @@ private slots:
         QCOMPARE(server.requests().at(2).headerValue("Content-Length"),
                  QByteArrayLiteral("0"));
         QVERIFY(server.requests().at(2).body.isEmpty());
+    }
+
+    void typedVciRequestsUseExactTargetsBodiesHeadersAndSignals()
+    {
+        FakeHttpServer origin(QHostAddress::LocalHost);
+        FakeHttpServer proxyTrap(QHostAddress::LocalHost);
+        QVERIFY(origin.isListening());
+        QVERIFY(proxyTrap.isListening());
+
+        origin.enqueueResponse(FakeHttpServer::complete(
+            200, QByteArrayLiteral(R"({"jobID":"lookup-1"})")));
+        origin.enqueueResponse(FakeHttpServer::complete(
+            200,
+            QByteArrayLiteral(
+                R"([{"id":"vci-1","name":"VCI One","internalName":"AVL Ditest VCI2K_DPDU_API"}])")));
+        origin.enqueueResponse(FakeHttpServer::complete(
+            200,
+            QByteArrayLiteral(
+                R"({"id":"vci-1","name":"VCI One","internalName":"AVL Ditest VCI2K_DPDU_API","additionalModuleInformation":null})")));
+        origin.enqueueResponse(FakeHttpServer::complete(204));
+        origin.enqueueResponse(FakeHttpServer::complete(204));
+
+        QNetworkProxy proxy(QNetworkProxy::HttpProxy,
+                            QStringLiteral("127.0.0.1"),
+                            proxyTrap.port());
+        ApplicationProxyGuard proxyGuard(proxy);
+
+        Xc2RestClient client({500, 250});
+        QVERIFY(client.setBaseUrl(encodedBase(origin)));
+        QSignalSpy lookupFinished(
+            &client, &Xc2RestClient::deviceLookupFinished);
+        QSignalSpy devicesFinished(&client, &Xc2RestClient::devicesFinished);
+        QSignalSpy selectedFinished(
+            &client, &Xc2RestClient::selectedDeviceFinished);
+        QSignalSpy applyFinished(&client, &Xc2RestClient::applyDeviceFinished);
+        QSignalSpy closeFinished(&client, &Xc2RestClient::closeDeviceFinished);
+        QSignalSpy shutdownFinished(&client, &Xc2RestClient::shutdownFinished);
+
+        const Xc2VciDevice applyDevice{
+            QStringLiteral("vci-1"),
+            QStringLiteral("VCI One"),
+            QStringLiteral("AVL Ditest VCI2K_DPDU_API"),
+            std::nullopt,
+        };
+        const Xc2VciDevice closeDevice{
+            QStringLiteral("vci-2"),
+            QStringLiteral("VCI Two"),
+            QStringLiteral("AVL Ditest VCI2K_DPDU_API"),
+            QStringLiteral("module-2"),
+        };
+
+        QList<Xc2RequestId> ids;
+        ids.append(client.requestDeviceLookup());
+        QVERIFY(lookupFinished.wait(kSignalWaitMs));
+        ids.append(client.requestDevices());
+        QVERIFY(devicesFinished.wait(kSignalWaitMs));
+        ids.append(client.requestSelectedDevice());
+        QVERIFY(selectedFinished.wait(kSignalWaitMs));
+        ids.append(client.requestApplyDevice(applyDevice));
+        QVERIFY(applyFinished.wait(kSignalWaitMs));
+        ids.append(client.requestCloseDevice(closeDevice));
+        QVERIFY(closeFinished.wait(kSignalWaitMs));
+
+        for (qsizetype i = 0; i < ids.size(); ++i) {
+            QVERIFY(ids.at(i) != 0);
+            for (qsizetype j = i + 1; j < ids.size(); ++j)
+                QVERIFY(ids.at(i) != ids.at(j));
+        }
+
+        QCOMPARE(lookupFinished.count(), 1);
+        const QList<QVariant> lookupArguments = lookupFinished.takeFirst();
+        QCOMPARE(lookupArguments.at(0).toULongLong(), ids.at(0));
+        const auto lookupResult =
+            qvariant_cast<Xc2Result<Xc2JobAccepted>>(lookupArguments.at(1));
+        QVERIFY2(lookupResult.ok(), qPrintable(lookupResult.error.message));
+        QCOMPARE(lookupResult.value->jobId, QStringLiteral("lookup-1"));
+
+        QCOMPARE(devicesFinished.count(), 1);
+        const QList<QVariant> devicesArguments = devicesFinished.takeFirst();
+        QCOMPARE(devicesArguments.at(0).toULongLong(), ids.at(1));
+        const auto devicesResult =
+            qvariant_cast<Xc2Result<QList<Xc2VciDevice>>>(
+                devicesArguments.at(1));
+        QVERIFY2(devicesResult.ok(), qPrintable(devicesResult.error.message));
+        QCOMPARE(devicesResult.value->size(), 1);
+        QCOMPARE(devicesResult.value->front().id, QStringLiteral("vci-1"));
+
+        QCOMPARE(selectedFinished.count(), 1);
+        const QList<QVariant> selectedArguments = selectedFinished.takeFirst();
+        QCOMPARE(selectedArguments.at(0).toULongLong(), ids.at(2));
+        const auto selectedResult =
+            qvariant_cast<Xc2Result<Xc2SelectedVci>>(
+                selectedArguments.at(1));
+        QVERIFY2(selectedResult.ok(), qPrintable(selectedResult.error.message));
+        QVERIFY(selectedResult.value->device.has_value());
+        QCOMPARE(selectedResult.value->device->id, QStringLiteral("vci-1"));
+
+        QCOMPARE(applyFinished.count(), 1);
+        const QList<QVariant> applyArguments = applyFinished.takeFirst();
+        QCOMPARE(applyArguments.at(0).toULongLong(), ids.at(3));
+        QCOMPARE(qvariant_cast<Xc2Error>(applyArguments.at(1)).category,
+                 Xc2ErrorCategory::None);
+        QCOMPARE(closeFinished.count(), 1);
+        const QList<QVariant> closeArguments = closeFinished.takeFirst();
+        QCOMPARE(closeArguments.at(0).toULongLong(), ids.at(4));
+        QCOMPARE(qvariant_cast<Xc2Error>(closeArguments.at(1)).category,
+                 Xc2ErrorCategory::None);
+        QCOMPARE(shutdownFinished.count(), 0);
+
+        QCOMPARE(origin.requestCount(), 5);
+        QCOMPARE(proxyTrap.requestCount(), 0);
+        const QList<QByteArray> methods{
+            QByteArrayLiteral("GET"), QByteArrayLiteral("GET"),
+            QByteArrayLiteral("GET"), QByteArrayLiteral("POST"),
+            QByteArrayLiteral("POST"),
+        };
+        const QList<QByteArray> targets{
+            QByteArrayLiteral("/xc2/1.0/device/lookup"),
+            QByteArrayLiteral("/xc2/1.0/device/get"),
+            QByteArrayLiteral("/xc2/1.0/device/getSelected"),
+            QByteArrayLiteral("/xc2/1.0/device/apply"),
+            QByteArrayLiteral("/xc2/1.0/device/close"),
+        };
+        const QByteArray expectedHost = QByteArrayLiteral("127.0.0.1:")
+            + QByteArray::number(origin.port());
+        for (qsizetype i = 0; i < origin.requests().size(); ++i) {
+            const FakeHttpRequest &request = origin.requests().at(i);
+            QCOMPARE(request.method, methods.at(i));
+            QCOMPARE(request.target, targets.at(i));
+            QCOMPARE(request.headerValues("Host"),
+                     QList<QByteArray>{expectedHost});
+            QCOMPARE(request.headerValues("Connection"),
+                     QList<QByteArray>{QByteArrayLiteral("close")});
+            QCOMPARE(request.headerValues("Accept-Encoding"),
+                     QList<QByteArray>{QByteArrayLiteral("identity")});
+        }
+
+        for (qsizetype i = 0; i < 3; ++i) {
+            QVERIFY(origin.requests().at(i).headerValues(
+                        "Content-Type").isEmpty());
+            QVERIFY(origin.requests().at(i).headerValues(
+                        "Content-Length").isEmpty());
+            QVERIFY(origin.requests().at(i).body.isEmpty());
+        }
+
+        const QList<Xc2VciDevice> postedDevices{applyDevice, closeDevice};
+        for (qsizetype i = 0; i < postedDevices.size(); ++i) {
+            const FakeHttpRequest &request = origin.requests().at(i + 3);
+            QCOMPARE(request.headerValues("Content-Type"),
+                     QList<QByteArray>{
+                         QByteArrayLiteral("application/json")});
+            QCOMPARE(request.headerValues("Content-Length"),
+                     QList<QByteArray>{
+                         QByteArray::number(request.body.size())});
+            QJsonObject expectedObject{
+                {QStringLiteral("id"), postedDevices.at(i).id},
+                {QStringLiteral("name"), postedDevices.at(i).name},
+                {QStringLiteral("internalName"),
+                 postedDevices.at(i).internalName},
+                {QStringLiteral("additionalModuleInformation"),
+                 postedDevices.at(i).additionalModuleInformation.has_value()
+                     ? QJsonValue(
+                           *postedDevices.at(i).additionalModuleInformation)
+                     : QJsonValue(QJsonValue::Null)},
+            };
+            const QByteArray expectedBody =
+                QJsonDocument(expectedObject).toJson(QJsonDocument::Compact);
+            QCOMPARE(request.body, expectedBody);
+            QCOMPARE(QJsonDocument::fromJson(request.body).object().size(), 4);
+            QVERIFY(!request.body.contains('\n'));
+            QVERIFY(!request.body.contains('\r'));
+        }
+    }
+
+    void vciRequestsReturnZeroImmediatelyWithoutConfiguredBase()
+    {
+        Xc2RestClient client;
+        QSignalSpy lookupFinished(
+            &client, &Xc2RestClient::deviceLookupFinished);
+        QSignalSpy devicesFinished(&client, &Xc2RestClient::devicesFinished);
+        QSignalSpy selectedFinished(
+            &client, &Xc2RestClient::selectedDeviceFinished);
+        QSignalSpy applyFinished(&client, &Xc2RestClient::applyDeviceFinished);
+        QSignalSpy closeFinished(&client, &Xc2RestClient::closeDeviceFinished);
+        QSignalSpy shutdownFinished(&client, &Xc2RestClient::shutdownFinished);
+        const Xc2VciDevice device{
+            QStringLiteral("vci-1"), QStringLiteral("VCI One"),
+            QStringLiteral("AVL Ditest VCI2K_DPDU_API"), std::nullopt,
+        };
+
+        QCOMPARE(client.requestDeviceLookup(), Xc2RequestId(0));
+        QCOMPARE(client.requestDevices(), Xc2RequestId(0));
+        QCOMPARE(client.requestSelectedDevice(), Xc2RequestId(0));
+        QCOMPARE(client.requestApplyDevice(device), Xc2RequestId(0));
+        QCOMPARE(client.requestCloseDevice(device), Xc2RequestId(0));
+        QCoreApplication::processEvents();
+        QCOMPARE(lookupFinished.count(), 0);
+        QCOMPARE(devicesFinished.count(), 0);
+        QCOMPARE(selectedFinished.count(), 0);
+        QCOMPARE(applyFinished.count(), 0);
+        QCOMPARE(closeFinished.count(), 0);
+        QCOMPARE(shutdownFinished.count(), 0);
+    }
+
+    void typedVciRedirectIsNotFollowedOrRetried()
+    {
+        FakeHttpServer origin(QHostAddress::LocalHost);
+        FakeHttpServer trap(QHostAddress::LocalHost);
+        QVERIFY(origin.isListening());
+        QVERIFY(trap.isListening());
+        origin.enqueueResponse(FakeHttpServer::redirect(
+            307, trapUrl(trap), backendError(307, 3007)));
+
+        Xc2RestClient client({500, 250});
+        QVERIFY(client.setBaseUrl(encodedBase(origin)));
+        QSignalSpy trapCaptured(&trap, &FakeHttpServer::requestCaptured);
+        QSignalSpy applyFinished(&client, &Xc2RestClient::applyDeviceFinished);
+        QSignalSpy shutdownFinished(&client, &Xc2RestClient::shutdownFinished);
+        const Xc2VciDevice device{
+            QStringLiteral("vci-1"), QStringLiteral("VCI One"),
+            QStringLiteral("AVL Ditest VCI2K_DPDU_API"), std::nullopt,
+        };
+
+        const Xc2RequestId id = client.requestApplyDevice(device);
+        QVERIFY(id != 0);
+        QVERIFY(applyFinished.wait(kSignalWaitMs));
+        QCOMPARE(applyFinished.count(), 1);
+        const QList<QVariant> arguments = applyFinished.takeFirst();
+        QCOMPARE(arguments.at(0).toULongLong(), id);
+        const Xc2Error error = qvariant_cast<Xc2Error>(arguments.at(1));
+        QCOMPARE(error.category, Xc2ErrorCategory::Backend);
+        QCOMPARE(error.httpStatus, 307);
+        QCOMPARE(error.rawPayload, backendError(307, 3007));
+        QCOMPARE(error.endpoint, QStringLiteral("device/apply"));
+        QCOMPARE(origin.requestCount(), 1);
+        QVERIFY(!trapCaptured.wait(120));
+        QCOMPARE(trap.requestCount(), 0);
+        QCOMPARE(shutdownFinished.count(), 0);
+    }
+
+    void lookupAndDevicesResponseMatrix_data()
+    {
+        QTest::addColumn<int>("operation");
+        QTest::addColumn<int>("status");
+        QTest::addColumn<QByteArray>("body");
+        QTest::addColumn<bool>("expectedOk");
+
+        QTest::newRow("lookup valid")
+            << 0 << 200 << QByteArrayLiteral(R"({"jobID":"job-1"})")
+            << true;
+        QTest::newRow("lookup empty job id")
+            << 0 << 200 << QByteArrayLiteral(R"({"jobID":""})")
+            << false;
+        QTest::newRow("lookup malformed")
+            << 0 << 200 << QByteArrayLiteral("{") << false;
+        QTest::newRow("lookup trailing JSON")
+            << 0 << 200
+            << QByteArrayLiteral(R"({"jobID":"job-1"} trailing)")
+            << false;
+        QTest::newRow("lookup other 2xx")
+            << 0 << 201 << QByteArrayLiteral(R"({"jobID":"job-1"})")
+            << false;
+        QTest::newRow("devices valid")
+            << 1 << 200
+            << QByteArrayLiteral(
+                   R"([{"id":"vci-1","name":"VCI One","internalName":"AVL Ditest VCI2K_DPDU_API","additionalModuleInformation":null}])")
+            << true;
+        QTest::newRow("devices empty array")
+            << 1 << 200 << QByteArrayLiteral("[]") << true;
+        QTest::newRow("devices object")
+            << 1 << 200 << QByteArrayLiteral("{}") << false;
+        QTest::newRow("devices 204")
+            << 1 << 204 << QByteArray{} << false;
+        QTest::newRow("devices other 2xx")
+            << 1 << 202 << QByteArrayLiteral("[]") << false;
+    }
+
+    void lookupAndDevicesResponseMatrix()
+    {
+        QFETCH(int, operation);
+        QFETCH(int, status);
+        QFETCH(QByteArray, body);
+        QFETCH(bool, expectedOk);
+
+        FakeHttpServer server(QHostAddress::LocalHost);
+        QVERIFY(server.isListening());
+        server.enqueueResponse(FakeHttpServer::complete(status, body));
+        Xc2RestClient client({500, 250});
+        QVERIFY(client.setBaseUrl(encodedBase(server)));
+        QSignalSpy lookupFinished(
+            &client, &Xc2RestClient::deviceLookupFinished);
+        QSignalSpy devicesFinished(&client, &Xc2RestClient::devicesFinished);
+        QSignalSpy shutdownFinished(&client, &Xc2RestClient::shutdownFinished);
+
+        const Xc2RequestId id = operation == 0
+            ? client.requestDeviceLookup() : client.requestDevices();
+        QSignalSpy *active = operation == 0
+            ? &lookupFinished : &devicesFinished;
+        QVERIFY(id != 0);
+        QVERIFY(active->wait(kSignalWaitMs));
+        QCOMPARE(active->count(), 1);
+        const QList<QVariant> arguments = active->takeFirst();
+        QCOMPARE(arguments.at(0).toULongLong(), id);
+
+        Xc2Error error;
+        bool actualOk = false;
+        if (operation == 0) {
+            const auto result =
+                qvariant_cast<Xc2Result<Xc2JobAccepted>>(arguments.at(1));
+            actualOk = result.ok();
+            error = result.error;
+            if (expectedOk)
+                QCOMPARE(result.value->jobId, QStringLiteral("job-1"));
+        } else {
+            const auto result =
+                qvariant_cast<Xc2Result<QList<Xc2VciDevice>>>(
+                    arguments.at(1));
+            actualOk = result.ok();
+            error = result.error;
+        }
+        QCOMPARE(actualOk, expectedOk);
+        if (!expectedOk) {
+            QCOMPARE(error.category, Xc2ErrorCategory::Contract);
+            QCOMPARE(error.httpStatus, status);
+            QCOMPARE(error.rawPayload, body);
+            QCOMPARE(error.endpoint, operation == 0
+                         ? QStringLiteral("device/lookup")
+                         : QStringLiteral("device/get"));
+        }
+        QCOMPARE(lookupFinished.count(), 0);
+        QCOMPARE(devicesFinished.count(), 0);
+        QCOMPARE(shutdownFinished.count(), 0);
+        QCOMPARE(server.requestCount(), 1);
+    }
+
+    void selectedDeviceResponseMatrix_data()
+    {
+        QTest::addColumn<int>("status");
+        QTest::addColumn<QByteArray>("body");
+        QTest::addColumn<bool>("expectedOk");
+        QTest::addColumn<bool>("expectedDevice");
+
+        const QByteArray device = QByteArrayLiteral(
+            R"({"id":"vci-1","name":"VCI One","internalName":"AVL Ditest VCI2K_DPDU_API","additionalModuleInformation":null})");
+        QTest::newRow("200 object") << 200 << device << true << true;
+        QTest::newRow("200 null")
+            << 200 << QByteArrayLiteral("null") << true << false;
+        QTest::newRow("200 zero bytes")
+            << 200 << QByteArray{} << true << false;
+        QTest::newRow("204 zero bytes")
+            << 204 << QByteArray{} << true << false;
+        QTest::newRow("200 whitespace is not empty")
+            << 200 << QByteArrayLiteral(" \t\r\n") << false << false;
+        QTest::newRow("200 scalar")
+            << 200 << QByteArrayLiteral("true") << false << false;
+        QTest::newRow("200 malformed")
+            << 200 << QByteArrayLiteral("{") << false << false;
+        QTest::newRow("other 2xx")
+            << 201 << device << false << false;
+    }
+
+    void selectedDeviceResponseMatrix()
+    {
+        QFETCH(int, status);
+        QFETCH(QByteArray, body);
+        QFETCH(bool, expectedOk);
+        QFETCH(bool, expectedDevice);
+
+        FakeHttpServer server(QHostAddress::LocalHost);
+        QVERIFY(server.isListening());
+        server.enqueueResponse(FakeHttpServer::complete(status, body));
+        Xc2RestClient client({500, 250});
+        QVERIFY(client.setBaseUrl(encodedBase(server)));
+        QSignalSpy selectedFinished(
+            &client, &Xc2RestClient::selectedDeviceFinished);
+        QSignalSpy shutdownFinished(&client, &Xc2RestClient::shutdownFinished);
+
+        const Xc2RequestId id = client.requestSelectedDevice();
+        QVERIFY(id != 0);
+        QVERIFY(selectedFinished.wait(kSignalWaitMs));
+        QCOMPARE(selectedFinished.count(), 1);
+        const QList<QVariant> arguments = selectedFinished.takeFirst();
+        QCOMPARE(arguments.at(0).toULongLong(), id);
+        const auto result = qvariant_cast<Xc2Result<Xc2SelectedVci>>(
+            arguments.at(1));
+        QCOMPARE(result.ok(), expectedOk);
+        if (expectedOk) {
+            QCOMPARE(result.value->device.has_value(), expectedDevice);
+        } else {
+            QCOMPARE(result.error.category, Xc2ErrorCategory::Contract);
+            QCOMPARE(result.error.httpStatus, status);
+            QCOMPARE(result.error.rawPayload, body);
+            QCOMPARE(result.error.endpoint,
+                     QStringLiteral("device/getSelected"));
+        }
+        QCOMPARE(shutdownFinished.count(), 0);
+        QCOMPARE(server.requestCount(), 1);
+    }
+
+    void applyAndCloseResponseMatrix_data()
+    {
+        QTest::addColumn<int>("operation");
+        QTest::addColumn<int>("status");
+        QTest::addColumn<QByteArray>("body");
+        QTest::addColumn<bool>("expectedOk");
+
+        QTest::newRow("apply 200 zero bytes")
+            << 0 << 200 << QByteArray{} << true;
+        QTest::newRow("close 204 zero bytes")
+            << 1 << 204 << QByteArray{} << true;
+        QTest::newRow("object")
+            << 0 << 200 << QByteArrayLiteral(R"({"accepted":true})") << true;
+        QTest::newRow("array")
+            << 1 << 200 << QByteArrayLiteral("[1,2]") << true;
+        QTest::newRow("string with whitespace")
+            << 0 << 200 << QByteArrayLiteral(" \t\"accepted\"\r\n") << true;
+        QTest::newRow("number")
+            << 1 << 200 << QByteArrayLiteral("-12.5e2") << true;
+        QTest::newRow("boolean")
+            << 0 << 200 << QByteArrayLiteral("true") << true;
+        QTest::newRow("null")
+            << 1 << 200 << QByteArrayLiteral("null") << true;
+        QTest::newRow("BOM scalar")
+            << 0 << 200 << QByteArrayLiteral("\xEF\xBB\xBFtrue") << true;
+        QTest::newRow("whitespace only")
+            << 1 << 200 << QByteArrayLiteral(" \t\r\n") << false;
+        QTest::newRow("malformed")
+            << 0 << 200 << QByteArrayLiteral("{") << false;
+        QTest::newRow("trailing garbage")
+            << 1 << 200 << QByteArrayLiteral("{} trailing") << false;
+        QTest::newRow("two values")
+            << 0 << 200 << QByteArrayLiteral("null true") << false;
+        QTest::newRow("apply other 2xx")
+            << 0 << 201 << QByteArrayLiteral("{}") << false;
+        QTest::newRow("close other 2xx")
+            << 1 << 202 << QByteArray{} << false;
+    }
+
+    void applyAndCloseResponseMatrix()
+    {
+        QFETCH(int, operation);
+        QFETCH(int, status);
+        QFETCH(QByteArray, body);
+        QFETCH(bool, expectedOk);
+
+        FakeHttpServer server(QHostAddress::LocalHost);
+        QVERIFY(server.isListening());
+        server.enqueueResponse(FakeHttpServer::complete(status, body));
+        Xc2RestClient client({500, 250});
+        QVERIFY(client.setBaseUrl(encodedBase(server)));
+        QSignalSpy applyFinished(&client, &Xc2RestClient::applyDeviceFinished);
+        QSignalSpy closeFinished(&client, &Xc2RestClient::closeDeviceFinished);
+        QSignalSpy shutdownFinished(&client, &Xc2RestClient::shutdownFinished);
+        const Xc2VciDevice device{
+            QStringLiteral("vci-1"), QStringLiteral("VCI One"),
+            QStringLiteral("AVL Ditest VCI2K_DPDU_API"), std::nullopt,
+        };
+
+        const Xc2RequestId id = operation == 0
+            ? client.requestApplyDevice(device)
+            : client.requestCloseDevice(device);
+        QSignalSpy *active = operation == 0 ? &applyFinished : &closeFinished;
+        QVERIFY(id != 0);
+        QVERIFY(active->wait(kSignalWaitMs));
+        QCOMPARE(active->count(), 1);
+        const QList<QVariant> arguments = active->takeFirst();
+        QCOMPARE(arguments.at(0).toULongLong(), id);
+        const Xc2Error error = qvariant_cast<Xc2Error>(arguments.at(1));
+        QCOMPARE(error.category == Xc2ErrorCategory::None, expectedOk);
+        if (!expectedOk) {
+            QCOMPARE(error.category, Xc2ErrorCategory::Contract);
+            QCOMPARE(error.httpStatus, status);
+            QCOMPARE(error.rawPayload, body);
+            QCOMPARE(error.endpoint, operation == 0
+                         ? QStringLiteral("device/apply")
+                         : QStringLiteral("device/close"));
+        }
+        QCOMPARE(applyFinished.count(), 0);
+        QCOMPARE(closeFinished.count(), 0);
+        QCOMPARE(shutdownFinished.count(), 0);
+        QCOMPARE(server.requestCount(), 1);
+    }
+
+    void typedVciFailureDispatchMatrix_data()
+    {
+        QTest::addColumn<int>("operation");
+        QTest::addColumn<int>("failureMode");
+        QTest::addColumn<int>("status");
+        QTest::addColumn<QByteArray>("body");
+        QTest::addColumn<int>("expectedCategory");
+
+        QTest::newRow("lookup transport")
+            << 0 << 1 << 0 << QByteArray{}
+            << int(Xc2ErrorCategory::Transport);
+        QTest::newRow("devices backend error")
+            << 1 << 0 << 403 << backendError(403, 1007)
+            << int(Xc2ErrorCategory::Backend);
+        QTest::newRow("selected malformed backend error")
+            << 2 << 0 << 500 << QByteArrayLiteral("not-json")
+            << int(Xc2ErrorCategory::Contract);
+        QTest::newRow("apply backend error")
+            << 3 << 0 << 403 << backendError(403, 1007)
+            << int(Xc2ErrorCategory::Backend);
+        QTest::newRow("close unapproved success status")
+            << 4 << 0 << 201 << QByteArrayLiteral("null")
+            << int(Xc2ErrorCategory::Contract);
+    }
+
+    void typedVciFailureDispatchMatrix()
+    {
+        QFETCH(int, operation);
+        QFETCH(int, failureMode);
+        QFETCH(int, status);
+        QFETCH(QByteArray, body);
+        QFETCH(int, expectedCategory);
+
+        FakeHttpServer server(QHostAddress::LocalHost);
+        QVERIFY(server.isListening());
+        server.enqueueResponse(failureMode == 1
+            ? FakeHttpServer::closeBeforeStatus()
+            : FakeHttpServer::complete(status, body));
+        Xc2RestClient client({500, 250});
+        QVERIFY(client.setBaseUrl(encodedBase(server)));
+        QSignalSpy lookupFinished(
+            &client, &Xc2RestClient::deviceLookupFinished);
+        QSignalSpy devicesFinished(&client, &Xc2RestClient::devicesFinished);
+        QSignalSpy selectedFinished(
+            &client, &Xc2RestClient::selectedDeviceFinished);
+        QSignalSpy applyFinished(&client, &Xc2RestClient::applyDeviceFinished);
+        QSignalSpy closeFinished(&client, &Xc2RestClient::closeDeviceFinished);
+        QSignalSpy shutdownFinished(&client, &Xc2RestClient::shutdownFinished);
+        const Xc2VciDevice device{
+            QStringLiteral("vci-1"), QStringLiteral("VCI One"),
+            QStringLiteral("AVL Ditest VCI2K_DPDU_API"), std::nullopt,
+        };
+
+        Xc2RequestId id = 0;
+        switch (operation) {
+        case 0: id = client.requestDeviceLookup(); break;
+        case 1: id = client.requestDevices(); break;
+        case 2: id = client.requestSelectedDevice(); break;
+        case 3: id = client.requestApplyDevice(device); break;
+        case 4: id = client.requestCloseDevice(device); break;
+        }
+        QList<QSignalSpy *> spies{
+            &lookupFinished, &devicesFinished, &selectedFinished,
+            &applyFinished, &closeFinished,
+        };
+        QSignalSpy *active = spies.at(operation);
+        QVERIFY(id != 0);
+        QVERIFY(active->wait(kSignalWaitMs));
+        QCOMPARE(active->count(), 1);
+        const QList<QVariant> arguments = active->takeFirst();
+        QCOMPARE(arguments.at(0).toULongLong(), id);
+
+        Xc2Error error;
+        if (operation == 0) {
+            error = qvariant_cast<Xc2Result<Xc2JobAccepted>>(
+                arguments.at(1)).error;
+        } else if (operation == 1) {
+            error = qvariant_cast<Xc2Result<QList<Xc2VciDevice>>>(
+                arguments.at(1)).error;
+        } else if (operation == 2) {
+            error = qvariant_cast<Xc2Result<Xc2SelectedVci>>(
+                arguments.at(1)).error;
+        } else {
+            error = qvariant_cast<Xc2Error>(arguments.at(1));
+        }
+        QCOMPARE(int(error.category), expectedCategory);
+        QCOMPARE(error.httpStatus, status);
+        QCOMPARE(error.rawPayload, body);
+        const QStringList endpoints{
+            QStringLiteral("device/lookup"), QStringLiteral("device/get"),
+            QStringLiteral("device/getSelected"),
+            QStringLiteral("device/apply"), QStringLiteral("device/close"),
+        };
+        QCOMPARE(error.endpoint, endpoints.at(operation));
+        for (QSignalSpy *spy : spies)
+            QCOMPARE(spy->count(), 0);
+        QCOMPARE(shutdownFinished.count(), 0);
+        QCOMPARE(server.requestCount(), 1);
+    }
+
+    void stateChangingVciRequestsAreSentOnceAfterTimeoutOrFailure_data()
+    {
+        QTest::addColumn<int>("operation");
+        QTest::addColumn<int>("responseMode");
+        QTest::addColumn<int>("expectedReason");
+
+        QTest::newRow("apply total deadline")
+            << 0 << 0 << int(Xc2TransportReason::Timeout);
+        QTest::newRow("close network failure")
+            << 1 << 1 << int(Xc2TransportReason::Network);
+    }
+
+    void stateChangingVciRequestsAreSentOnceAfterTimeoutOrFailure()
+    {
+        QFETCH(int, operation);
+        QFETCH(int, responseMode);
+        QFETCH(int, expectedReason);
+
+        constexpr int deviceDeadlineMs = 80;
+        FakeHttpServer server(QHostAddress::LocalHost);
+        QVERIFY(server.isListening());
+        server.enqueueResponse(responseMode == 0
+            ? FakeHttpServer::neverRespond()
+            : FakeHttpServer::closeBeforeStatus());
+        Xc2RestClientOptions options;
+        options.totalDeadlineMs = 1000;
+        options.transferTimeoutMs = 1000;
+        options.deviceOperationDeadlineMs = deviceDeadlineMs;
+        Xc2RestClient client(options);
+        QVERIFY(client.setBaseUrl(encodedBase(server)));
+        QSignalSpy captured(&server, &FakeHttpServer::requestCaptured);
+        QSignalSpy applyFinished(&client, &Xc2RestClient::applyDeviceFinished);
+        QSignalSpy closeFinished(&client, &Xc2RestClient::closeDeviceFinished);
+        QSignalSpy shutdownFinished(&client, &Xc2RestClient::shutdownFinished);
+        const Xc2VciDevice device{
+            QStringLiteral("vci-1"), QStringLiteral("VCI One"),
+            QStringLiteral("AVL Ditest VCI2K_DPDU_API"), std::nullopt,
+        };
+
+        const Xc2RequestId id = operation == 0
+            ? client.requestApplyDevice(device)
+            : client.requestCloseDevice(device);
+        QSignalSpy *active = operation == 0 ? &applyFinished : &closeFinished;
+        QVERIFY(id != 0);
+        if (captured.isEmpty())
+            QVERIFY(captured.wait(kSignalWaitMs));
+        QCOMPARE(captured.count(), 1);
+        QVERIFY(active->wait(kSignalWaitMs));
+        QCOMPARE(active->count(), 1);
+        const QList<QVariant> arguments = active->takeFirst();
+        QCOMPARE(arguments.at(0).toULongLong(), id);
+        const Xc2Error error = qvariant_cast<Xc2Error>(arguments.at(1));
+        QCOMPARE(error.category, Xc2ErrorCategory::Transport);
+        QCOMPARE(int(error.transportReason), expectedReason);
+        QCOMPARE(error.endpoint, operation == 0
+                     ? QStringLiteral("device/apply")
+                     : QStringLiteral("device/close"));
+        captured.clear();
+        QVERIFY(!captured.wait(deviceDeadlineMs + 80));
+        QCOMPARE(server.requestCount(), 1);
+        QCOMPARE(shutdownFinished.count(), 0);
+    }
+
+    void typedVci204FramingFailuresUseTypedSignals_data()
+    {
+        QTest::addColumn<int>("operation");
+        QTest::addColumn<QByteArray>("wire");
+
+        const QByteArray head = QByteArrayLiteral(
+            "HTTP/1.1 204 No Content\r\nConnection: close\r\n");
+        QTest::newRow("selected content length")
+            << 0 << head + QByteArrayLiteral("Content-Length: 0\r\n\r\n");
+        QTest::newRow("apply body bytes")
+            << 1 << head + QByteArrayLiteral("\r\nx");
+        QTest::newRow("close transfer encoding")
+            << 2 << head
+                + QByteArrayLiteral("Transfer-Encoding: chunked\r\n\r\n");
+    }
+
+    void typedVci204FramingFailuresUseTypedSignals()
+    {
+        QFETCH(int, operation);
+        QFETCH(QByteArray, wire);
+
+        FakeHttpServer server(QHostAddress::LocalHost);
+        QVERIFY(server.isListening());
+        server.enqueueResponse(FakeHttpServer::rawResponse(wire));
+        Xc2RestClient client({500, 250});
+        QVERIFY(client.setBaseUrl(encodedBase(server)));
+        QSignalSpy selectedFinished(
+            &client, &Xc2RestClient::selectedDeviceFinished);
+        QSignalSpy applyFinished(&client, &Xc2RestClient::applyDeviceFinished);
+        QSignalSpy closeFinished(&client, &Xc2RestClient::closeDeviceFinished);
+        QSignalSpy shutdownFinished(&client, &Xc2RestClient::shutdownFinished);
+        const Xc2VciDevice device{
+            QStringLiteral("vci-1"), QStringLiteral("VCI One"),
+            QStringLiteral("AVL Ditest VCI2K_DPDU_API"), std::nullopt,
+        };
+
+        Xc2RequestId id = 0;
+        if (operation == 0)
+            id = client.requestSelectedDevice();
+        else if (operation == 1)
+            id = client.requestApplyDevice(device);
+        else
+            id = client.requestCloseDevice(device);
+        QList<QSignalSpy *> spies{
+            &selectedFinished, &applyFinished, &closeFinished,
+        };
+        QSignalSpy *active = spies.at(operation);
+        QVERIFY(id != 0);
+        QVERIFY(active->wait(kSignalWaitMs));
+        QCOMPARE(active->count(), 1);
+        const QList<QVariant> arguments = active->takeFirst();
+        QCOMPARE(arguments.at(0).toULongLong(), id);
+        Xc2Error error;
+        if (operation == 0) {
+            error = qvariant_cast<Xc2Result<Xc2SelectedVci>>(
+                arguments.at(1)).error;
+        } else {
+            error = qvariant_cast<Xc2Error>(arguments.at(1));
+        }
+        QCOMPARE(error.category, Xc2ErrorCategory::Transport);
+        QCOMPARE(error.transportReason, Xc2TransportReason::Network);
+        QCOMPARE(error.httpStatus, 204);
+        QCOMPARE(error.rawPayload, QByteArray{});
+        const QStringList endpoints{
+            QStringLiteral("device/getSelected"),
+            QStringLiteral("device/apply"), QStringLiteral("device/close"),
+        };
+        QCOMPARE(error.endpoint, endpoints.at(operation));
+        for (QSignalSpy *spy : spies)
+            QCOMPARE(spy->count(), 0);
+        QCOMPARE(shutdownFinished.count(), 0);
+        QCOMPARE(server.requestCount(), 1);
+    }
+
+    void deletingClientInsideTypedFinishedSlotIsSafeAndExactlyOnce()
+    {
+        FakeHttpServer server(QHostAddress::LocalHost);
+        QVERIFY(server.isListening());
+        server.enqueueResponse(FakeHttpServer::complete(204));
+        auto *client = new Xc2RestClient({500, 250});
+        QPointer<Xc2RestClient> guard(client);
+        QVERIFY(client->setBaseUrl(encodedBase(server)));
+        QSignalSpy destroyed(client, &QObject::destroyed);
+        int completionCount = 0;
+        connect(client, &Xc2RestClient::applyDeviceFinished,
+                this, [&client, &completionCount](Xc2RequestId,
+                                                  const Xc2Error &) {
+            ++completionCount;
+            delete client;
+            client = nullptr;
+        });
+        const Xc2VciDevice device{
+            QStringLiteral("vci-1"), QStringLiteral("VCI One"),
+            QStringLiteral("AVL Ditest VCI2K_DPDU_API"), std::nullopt,
+        };
+
+        guard->requestApplyDevice(device);
+        if (destroyed.isEmpty())
+            QVERIFY(destroyed.wait(kSignalWaitMs));
+        QCOMPARE(destroyed.count(), 1);
+        QCOMPARE(completionCount, 1);
+        QVERIFY(guard.isNull());
+        QCOMPARE(server.requestCount(), 1);
+    }
+
+    void deviceOperationDeadlineDefaultsToThirtySeconds()
+    {
+        QCOMPARE(Xc2RestClientOptions{}.deviceOperationDeadlineMs, 30000);
     }
 
     void closeBeforeStatusSendsOneRequestOnly_data()

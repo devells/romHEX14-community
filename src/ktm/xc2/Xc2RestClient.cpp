@@ -5,6 +5,9 @@
 
 #include <QAbstractSocket>
 #include <QHostAddress>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonParseError>
 #include <QMetaObject>
 #include <QNetworkCookie>
 #include <QNetworkCookieJar>
@@ -199,12 +202,66 @@ bool isApprovedSuccessStatus(Endpoint endpoint, int httpStatus)
     switch (endpoint) {
     case Endpoint::ServiceStatus:
     case Endpoint::CurrentUser:
+    case Endpoint::DeviceLookup:
+    case Endpoint::DeviceGet:
         return httpStatus == 200;
     case Endpoint::Shutdown:
+    case Endpoint::DeviceGetSelected:
+    case Endpoint::DeviceApply:
+    case Endpoint::DeviceClose:
         return httpStatus == 200 || httpStatus == 204;
     default:
         return false;
     }
+}
+
+bool isSupportedEndpoint(Endpoint endpoint)
+{
+    switch (endpoint) {
+    case Endpoint::ServiceStatus:
+    case Endpoint::Shutdown:
+    case Endpoint::CurrentUser:
+    case Endpoint::DeviceLookup:
+    case Endpoint::DeviceGet:
+    case Endpoint::DeviceGetSelected:
+    case Endpoint::DeviceApply:
+    case Endpoint::DeviceClose:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool isDeviceOperation(Endpoint endpoint)
+{
+    switch (endpoint) {
+    case Endpoint::DeviceLookup:
+    case Endpoint::DeviceGet:
+    case Endpoint::DeviceGetSelected:
+    case Endpoint::DeviceApply:
+    case Endpoint::DeviceClose:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool isSingleJsonValue(const QByteArray &body)
+{
+    QByteArray json = body;
+    if (json.startsWith(QByteArrayLiteral("\xEF\xBB\xBF")))
+        json.remove(0, 3);
+
+    QByteArray wrapper;
+    wrapper.reserve(json.size() + 2);
+    wrapper += '[';
+    wrapper += json;
+    wrapper += ']';
+    QJsonParseError parseError;
+    const QJsonDocument document =
+        QJsonDocument::fromJson(wrapper, &parseError);
+    return parseError.error == QJsonParseError::NoError
+        && document.isArray() && document.array().size() == 1;
 }
 
 bool isDecimal(const QByteArray &value)
@@ -449,6 +506,37 @@ Xc2RequestId Xc2RestClient::requestShutdown()
     return startRequest(Endpoint::Shutdown);
 }
 
+Xc2RequestId Xc2RestClient::requestDeviceLookup()
+{
+    return startRequest(Endpoint::DeviceLookup);
+}
+
+Xc2RequestId Xc2RestClient::requestDevices()
+{
+    return startRequest(Endpoint::DeviceGet);
+}
+
+Xc2RequestId Xc2RestClient::requestSelectedDevice()
+{
+    return startRequest(Endpoint::DeviceGetSelected);
+}
+
+Xc2RequestId Xc2RestClient::requestApplyDevice(
+    const Xc2VciDevice &device)
+{
+    const QByteArray body = QJsonDocument(
+        Xc2JsonCodec::vciDeviceJson(device)).toJson(QJsonDocument::Compact);
+    return startRequest(Endpoint::DeviceApply, body);
+}
+
+Xc2RequestId Xc2RestClient::requestCloseDevice(
+    const Xc2VciDevice &device)
+{
+    const QByteArray body = QJsonDocument(
+        Xc2JsonCodec::vciDeviceJson(device)).toJson(QJsonDocument::Compact);
+    return startRequest(Endpoint::DeviceClose, body);
+}
+
 Xc2Result<QByteArray> Xc2RestClient::cookieHeaderFor(
     const QByteArray &encodedUrl) const
 {
@@ -495,15 +583,29 @@ void Xc2RestClient::abort(Xc2RequestId id)
     forceStop(id, Xc2TransportReason::Canceled);
 }
 
-Xc2RequestId Xc2RestClient::startRequest(Endpoint endpoint)
+Xc2RequestId Xc2RestClient::startRequest(Endpoint endpoint,
+                                         QByteArray jsonBody)
 {
-    if (m_baseUrl.isEmpty())
+    if (m_baseUrl.isEmpty() || !isSupportedEndpoint(endpoint))
         return 0;
 
     const Xc2ContractProfile &profile = Xc2ContractProfile::approved();
     const EndpointSpec spec = profile.endpoint(endpoint);
-    if (spec.method != HttpMethod::Get
-        && spec.method != HttpMethod::PostForm) {
+    if (spec.maxAutomaticRetries != 0)
+        return 0;
+    if (spec.method == HttpMethod::Get) {
+        if (!jsonBody.isEmpty())
+            return 0;
+    } else if (spec.method == HttpMethod::PostForm) {
+        if (endpoint != Endpoint::Shutdown || !jsonBody.isEmpty())
+            return 0;
+    } else if (spec.method == HttpMethod::PostJson) {
+        if ((endpoint != Endpoint::DeviceApply
+             && endpoint != Endpoint::DeviceClose)
+            || jsonBody.isEmpty()) {
+            return 0;
+        }
+    } else {
         return 0;
     }
 
@@ -546,8 +648,13 @@ Xc2RequestId Xc2RestClient::startRequest(Endpoint endpoint)
         pending->requestBytes += QByteArrayLiteral(
             "Content-Type: application/x-www-form-urlencoded\r\n"
             "Content-Length: 0\r\n");
+    } else if (spec.method == HttpMethod::PostJson) {
+        pending->requestBytes += QByteArrayLiteral(
+            "Content-Type: application/json\r\nContent-Length: ")
+            + QByteArray::number(jsonBody.size()) + QByteArrayLiteral("\r\n");
     }
     pending->requestBytes += QByteArrayLiteral("\r\n");
+    pending->requestBytes += jsonBody;
     m_pending.insert(id, pending);
 
     connect(pending->socket, &QTcpSocket::connected, this, [this, id] {
@@ -586,7 +693,9 @@ Xc2RequestId Xc2RestClient::startRequest(Endpoint endpoint)
         forceStop(id, Xc2TransportReason::Timeout);
     });
 
-    pending->totalDeadline->start(qMax(1, m_options.totalDeadlineMs));
+    const int totalDeadlineMs = isDeviceOperation(endpoint)
+        ? m_options.deviceOperationDeadlineMs : m_options.totalDeadlineMs;
+    pending->totalDeadline->start(qMax(1, totalDeadlineMs));
     if (!pending->responseComplete && m_options.transferTimeoutMs > 0) {
         pending->inactivityDeadline->start(
             qMax(1, m_options.transferTimeoutMs));
@@ -1115,6 +1224,8 @@ void Xc2RestClient::completeOnce(Xc2RequestId id)
     const bool hasTransportFailure =
         forcedReason != Xc2TransportReason::None
         || protocolFailure || !responseComplete || httpStatus == 0;
+    bool hasCommonFailure = false;
+    Xc2Error commonError;
     if (hasTransportFailure) {
         const Xc2TransportReason reason =
             forcedReason == Xc2TransportReason::None
@@ -1126,95 +1237,144 @@ void Xc2RestClient::completeOnce(Xc2RequestId id)
                     ? QStringLiteral("Request deadline expired")
                     : QStringLiteral("Incomplete HTTP response");
         }
-        const Xc2Error error = transportError(
+        commonError = transportError(
             reason, httpStatus, rawPayload, spec.path, networkMessage);
-        if (endpoint == Endpoint::ServiceStatus) {
-            const auto result =
-                Xc2Result<Xc2ServiceStatus>::failure(error);
-            cleanup();
-            emit serviceStatusFinished(
-                id, result);
-            return;
-        } else if (endpoint == Endpoint::CurrentUser) {
-            const auto result = Xc2Result<Xc2CurrentUser>::failure(error);
-            cleanup();
-            emit currentUserFinished(
-                id, result);
-            return;
-        } else {
-            cleanup();
-            emit shutdownFinished(id, error);
-            return;
-        }
+        hasCommonFailure = true;
     } else if (unapprovedSuccessStatus) {
-        Xc2Error error = contractError(QStringLiteral(
+        commonError = contractError(QStringLiteral(
             "HTTP success status is not approved for this endpoint"));
-        error.httpStatus = httpStatus;
-        error.rawPayload = rawPayload;
-        error.endpoint = spec.path;
-        if (endpoint == Endpoint::ServiceStatus) {
-            const auto result =
-                Xc2Result<Xc2ServiceStatus>::failure(error);
-            cleanup();
-            emit serviceStatusFinished(id, result);
-            return;
-        } else if (endpoint == Endpoint::CurrentUser) {
-            const auto result = Xc2Result<Xc2CurrentUser>::failure(error);
-            cleanup();
-            emit currentUserFinished(id, result);
-            return;
-        } else {
-            cleanup();
-            emit shutdownFinished(id, error);
-            return;
-        }
+        commonError.httpStatus = httpStatus;
+        commonError.rawPayload = rawPayload;
+        commonError.endpoint = spec.path;
+        hasCommonFailure = true;
     } else if (httpStatus < 200 || httpStatus >= 300) {
-        const Xc2Error error = Xc2JsonCodec::error(
+        commonError = Xc2JsonCodec::error(
             rawPayload, httpStatus, spec.path);
-        if (endpoint == Endpoint::ServiceStatus) {
-            const auto result =
-                Xc2Result<Xc2ServiceStatus>::failure(error);
-            cleanup();
-            emit serviceStatusFinished(
-                id, result);
-            return;
-        } else if (endpoint == Endpoint::CurrentUser) {
-            const auto result = Xc2Result<Xc2CurrentUser>::failure(error);
-            cleanup();
-            emit currentUserFinished(
-                id, result);
-            return;
-        } else {
-            cleanup();
-            emit shutdownFinished(id, error);
-            return;
-        }
-    } else if (endpoint == Endpoint::ServiceStatus) {
-        Xc2Result<Xc2ServiceStatus> result =
-            Xc2JsonCodec::serviceStatus(rawPayload);
-        if (!result.ok()) {
-            result.error.httpStatus = httpStatus;
-            result.error.endpoint = spec.path;
-            result.error.rawPayload = rawPayload;
-        }
+        hasCommonFailure = true;
+    }
+
+    const auto addResponseContext = [&](Xc2Error &error) {
+        error.httpStatus = httpStatus;
+        error.endpoint = spec.path;
+        error.rawPayload = rawPayload;
+    };
+
+    switch (endpoint) {
+    case Endpoint::ServiceStatus: {
+        Xc2Result<Xc2ServiceStatus> result = hasCommonFailure
+            ? Xc2Result<Xc2ServiceStatus>::failure(commonError)
+            : Xc2JsonCodec::serviceStatus(rawPayload);
+        if (!result.ok() && !hasCommonFailure)
+            addResponseContext(result.error);
         cleanup();
         emit serviceStatusFinished(id, result);
         return;
-    } else if (endpoint == Endpoint::CurrentUser) {
-        Xc2Result<Xc2CurrentUser> result =
-            Xc2JsonCodec::currentUser(rawPayload);
-        if (!result.ok()) {
-            result.error.httpStatus = httpStatus;
-            result.error.endpoint = spec.path;
-            result.error.rawPayload = rawPayload;
-        }
+    }
+    case Endpoint::CurrentUser: {
+        Xc2Result<Xc2CurrentUser> result = hasCommonFailure
+            ? Xc2Result<Xc2CurrentUser>::failure(commonError)
+            : Xc2JsonCodec::currentUser(rawPayload);
+        if (!result.ok() && !hasCommonFailure)
+            addResponseContext(result.error);
         cleanup();
         emit currentUserFinished(id, result);
         return;
-    } else {
-        const Xc2Error success;
+    }
+    case Endpoint::Shutdown: {
+        const Xc2Error result = hasCommonFailure
+            ? commonError : Xc2Error{};
         cleanup();
-        emit shutdownFinished(id, success);
+        emit shutdownFinished(id, result);
+        return;
+    }
+    case Endpoint::DeviceLookup: {
+        Xc2Result<Xc2JobAccepted> result = hasCommonFailure
+            ? Xc2Result<Xc2JobAccepted>::failure(commonError)
+            : Xc2JsonCodec::jobAccepted(rawPayload);
+        if (result.ok() && result.value->jobId.isEmpty()) {
+            Xc2Error error = contractError(
+                QStringLiteral("Field 'jobID' must not be empty"));
+            addResponseContext(error);
+            result = Xc2Result<Xc2JobAccepted>::failure(std::move(error));
+        } else if (!result.ok() && !hasCommonFailure) {
+            addResponseContext(result.error);
+        }
+        cleanup();
+        emit deviceLookupFinished(id, result);
+        return;
+    }
+    case Endpoint::DeviceGet: {
+        Xc2Result<QList<Xc2VciDevice>> result = hasCommonFailure
+            ? Xc2Result<QList<Xc2VciDevice>>::failure(commonError)
+            : Xc2JsonCodec::vciDevices(rawPayload);
+        if (!result.ok() && !hasCommonFailure)
+            addResponseContext(result.error);
+        cleanup();
+        emit devicesFinished(id, result);
+        return;
+    }
+    case Endpoint::DeviceGetSelected: {
+        Xc2Result<Xc2SelectedVci> result = hasCommonFailure
+            ? Xc2Result<Xc2SelectedVci>::failure(commonError)
+            : rawPayload.isEmpty()
+                ? Xc2Result<Xc2SelectedVci>::success({std::nullopt})
+                : Xc2JsonCodec::selectedVci(rawPayload);
+        if (!result.ok() && !hasCommonFailure)
+            addResponseContext(result.error);
+        cleanup();
+        emit selectedDeviceFinished(id, result);
+        return;
+    }
+    case Endpoint::DeviceApply: {
+        Xc2Error result = hasCommonFailure ? commonError : Xc2Error{};
+        if (!hasCommonFailure && !rawPayload.isEmpty()
+            && !isSingleJsonValue(rawPayload)) {
+            result = contractError(QStringLiteral(
+                "Device apply response must contain one JSON value"));
+            addResponseContext(result);
+        }
+        cleanup();
+        emit applyDeviceFinished(id, result);
+        return;
+    }
+    case Endpoint::DeviceClose: {
+        Xc2Error result = hasCommonFailure ? commonError : Xc2Error{};
+        if (!hasCommonFailure && !rawPayload.isEmpty()
+            && !isSingleJsonValue(rawPayload)) {
+            result = contractError(QStringLiteral(
+                "Device close response must contain one JSON value"));
+            addResponseContext(result);
+        }
+        cleanup();
+        emit closeDeviceFinished(id, result);
+        return;
+    }
+    case Endpoint::Login:
+    case Endpoint::Logout:
+    case Endpoint::SettingsGet:
+    case Endpoint::SettingsSet:
+    case Endpoint::VehicleDetect:
+    case Endpoint::VehicleManufacturers:
+    case Endpoint::VehicleSeries:
+    case Endpoint::VehicleModels:
+    case Endpoint::VehicleSelect:
+    case Endpoint::VehicleInfo:
+    case Endpoint::AutoScan:
+    case Endpoint::EcuDomains:
+    case Endpoint::EcuOpen:
+    case Endpoint::EcuClose:
+    case Endpoint::EcuScan:
+    case Endpoint::EcuClearDtc:
+    case Endpoint::EcuMeasurementsGet:
+    case Endpoint::EcuMeasurementsStart:
+    case Endpoint::EcuMeasurementsStop:
+    case Endpoint::EcuExecuteFlow:
+    case Endpoint::VehicleExecuteFlow:
+    case Endpoint::FlowUpdateGui:
+    case Endpoint::DownloadMapping:
+    case Endpoint::FlashAutomatic:
+    case Endpoint::FlashFile:
+        cleanup();
         return;
     }
 }
