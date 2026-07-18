@@ -354,6 +354,7 @@ struct Xc2StompClient::Private {
 
         if (retiredSocket) {
             retiredSocket->disconnect(q);
+            retiredSocket->setParent(nullptr);
             if (forceAbort)
                 retiredSocket->abort();
             retiredSocket->deleteLater();

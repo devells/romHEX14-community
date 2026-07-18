@@ -2625,6 +2625,69 @@ private slots:
         QCOMPARE(server.connectionCount(), connections);
     }
 
+    void deletingClientInsideVisibilityLostRetiresSocketSafely()
+    {
+        FakeXc2TransportServer server;
+        Xc2RestClient rest;
+        QVERIFY(establishRestSession(server, rest));
+        auto *client = new Xc2StompClient;
+        QVERIFY(establishStompSession(server, rest, *client));
+
+        const Xc2StompGeneration generation = client->generation();
+        const int connections = server.connectionCount();
+        QPointer<Xc2StompClient> clientGuard(client);
+        QPointer<QWebSocket> socketGuard(ownedWebSocket(*client));
+        QVERIFY(socketGuard);
+        QSignalSpy clientDestroyed(client, &QObject::destroyed);
+        QSignalSpy socketDestroyed(socketGuard, &QObject::destroyed);
+        QSignalSpy errors(client, &Xc2StompClient::errorOccurred);
+        QSignalSpy lost(client, &Xc2StompClient::visibilityLost);
+        QSignalSpy disconnected(client, &Xc2StompClient::disconnected);
+        QStringList terminalSignals;
+        bool socketAliveAfterOwnerDeletion = false;
+
+        connect(client, &Xc2StompClient::stateChanged, this,
+                [&terminalSignals](Xc2StompGeneration,
+                                   Xc2StompState state) {
+            if (state == Xc2StompState::Failed)
+                terminalSignals.append(QStringLiteral("state"));
+        });
+        connect(client, &Xc2StompClient::errorOccurred, this,
+                [&terminalSignals](Xc2StompGeneration, const Xc2Error &) {
+            terminalSignals.append(QStringLiteral("error"));
+        });
+        connect(client, &Xc2StompClient::visibilityLost, this,
+                [&client, &socketGuard, &socketAliveAfterOwnerDeletion,
+                 &terminalSignals](Xc2StompGeneration, const Xc2Error &) {
+            terminalSignals.append(QStringLiteral("visibility"));
+            delete client;
+            client = nullptr;
+            socketAliveAfterOwnerDeletion = !socketGuard.isNull();
+        });
+        connect(client, &Xc2StompClient::disconnected, this,
+                [&terminalSignals](Xc2StompGeneration) {
+            terminalSignals.append(QStringLiteral("disconnected"));
+        });
+
+        server.closeWebSocket();
+        QVERIFY(waitForCount(clientDestroyed, 1));
+        QVERIFY(clientGuard.isNull());
+        QVERIFY(socketAliveAfterOwnerDeletion);
+        QVERIFY(waitForCount(socketDestroyed, 1));
+        QVERIFY(socketGuard.isNull());
+        QCOMPARE(errors.count(), 1);
+        QCOMPARE(lost.count(), 1);
+        QCOMPARE(disconnected.count(), 0);
+        QCOMPARE(errors.constFirst().at(0).toULongLong(), generation);
+        QCOMPARE(lost.constFirst().at(0).toULongLong(), generation);
+        QCOMPARE(terminalSignals,
+                 QStringList({QStringLiteral("state"),
+                              QStringLiteral("error"),
+                              QStringLiteral("visibility")}));
+        QVERIFY(waitDuration(120));
+        QCOMPARE(server.connectionCount(), connections);
+    }
+
     void connectFailureAndIntentionalDisconnectDoNotLoseVisibility()
     {
         {
