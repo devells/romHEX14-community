@@ -50,7 +50,7 @@ Each later plan consumes only the reviewed public interfaces produced here. The 
 - Consumes: No KTM production interface.
 - Produces: `ktm::xc2::Xc2ContractProfile`, `Endpoint`, `EndpointSpec`, `OperationSemantics`, `Topic`, and `rx14_ktm_xc2` static library target.
 
-- [ ] **Step 1: Add the failing contract-profile test and CTest registration**
+- [x] **Step 1: Add the failing contract-profile test and CTest registration**
 
 Create `tests/ktm/test_Xc2ContractProfile.cpp` with these behavioral assertions:
 
@@ -179,7 +179,7 @@ Create and register KTM test targets only inside
 labels `unit;ktm`. A non-Windows build with `RX14_KTM_XC2=OFF` must not search
 for either Qt Test or Qt WebSockets.
 
-- [ ] **Step 2: Configure/build to verify the test is red**
+- [x] **Step 2: Configure/build to verify the test is red**
 
 Run:
 
@@ -190,7 +190,7 @@ rtk cmake --build build-test --target test_Xc2ContractProfile --parallel
 
 Expected: compilation fails because `ktm/xc2/Xc2ContractProfile.h` and its types do not exist. On the current workstation, the earlier prerequisite failure `cmake: program not found` is expected until Task 1's toolchain prerequisite is installed; it is not accepted as the behavioral red test.
 
-- [ ] **Step 3: Implement the complete immutable profile interface**
+- [x] **Step 3: Implement the complete immutable profile interface**
 
 Create `Xc2ContractProfile.h` with this public surface:
 
@@ -287,7 +287,7 @@ File selection is a native romHEX14 UI concern and is deliberately absent from
 the resulting path through form POST `ecu/flashFile`. Do not invent a
 `selectFlashFile` backend route.
 
-- [ ] **Step 4: Build and run the profile test**
+- [x] **Step 4: Build and run the profile test**
 
 Run:
 
@@ -298,7 +298,7 @@ rtk ctest --test-dir build-test --output-on-failure -R xc2_contract_profile
 
 Expected: `100% tests passed, 0 tests failed`.
 
-- [ ] **Step 5: Update Windows CI prerequisites**
+- [x] **Step 5: Update Windows CI prerequisites**
 
 In `.github/workflows/release.yml`, add `modules: 'qtwebsockets'` to the Windows `install-qt-action`, configure with `-DBUILD_TESTING=ON -DRX14_KTM_XC2=ON`, and run:
 
@@ -309,7 +309,7 @@ In `.github/workflows/release.yml`, add `modules: 'qtwebsockets'` to the Windows
 
 Set `-DRX14_KTM_XC2=OFF` explicitly for macOS and Linux configure commands.
 
-- [ ] **Step 6: Commit the build gate and profile**
+- [x] **Step 6: Commit the build gate and profile**
 
 ```powershell
 rtk git add CMakeLists.txt .github/workflows/release.yml src/ktm/xc2/Xc2ContractProfile.* tests/ktm/test_Xc2ContractProfile.cpp
@@ -341,7 +341,7 @@ rtk git commit -m "feat: define KTM XC2 contract profile"
 - Consumes: `Endpoint` and `Xc2ContractProfile` from Task 1.
 - Produces: `Xc2Error`, `Xc2Result<T>`, `Xc2ServiceStatus`, `Xc2CurrentUser`, `Xc2VciDevice`, `Xc2JobAccepted`, `Xc2LocalizedText`, `Xc2JobProgress`, and strict `Xc2JsonCodec` parse/serialization functions.
 
-- [ ] **Step 1: Add red tests for valid, malformed, and missing-field payloads**
+- [x] **Step 1: Add red tests for valid, malformed, and missing-field payloads**
 
 Create `test_Xc2JsonCodec.cpp` with fixture loading and these cases:
 
@@ -438,7 +438,7 @@ input in `rawPayload`.
 
 Register `xc2_json_codec` with labels `unit;contract;ktm` and compile definition `KTM_FIXTURE_DIR` pointing at `tests/ktm/fixtures`.
 
-- [ ] **Step 2: Run the codec test to verify red behavior**
+- [x] **Step 2: Run the codec test to verify red behavior**
 
 Run:
 
@@ -448,7 +448,7 @@ rtk cmake --build build-test --target test_Xc2JsonCodec --parallel
 
 Expected: compile failure for missing `Xc2Models.h`/`Xc2JsonCodec.h`.
 
-- [ ] **Step 3: Implement value types and strict results**
+- [x] **Step 3: Implement value types and strict results**
 
 Define the following exact core types in `Xc2Models.h`:
 
@@ -529,7 +529,7 @@ Place every type and codec in `namespace ktm::xc2`. Put
 specializations used by Tasks 5-8. Use `std::optional`, not sentinel empty
 strings, for result success or nullable DTO properties.
 
-- [ ] **Step 4: Implement strict codec functions**
+- [x] **Step 4: Implement strict codec functions**
 
 Expose:
 
@@ -577,7 +577,7 @@ five wire properties `status`, `message`, `code`, `devMessage`, and `info`, and
 maps the last two into `developerMessage` and `info` without equating the XC2
 code to the HTTP status.
 
-- [ ] **Step 5: Add sanitized golden fixtures**
+- [x] **Step 5: Add sanitized golden fixtures**
 
 Use these fixture semantics:
 
@@ -613,7 +613,7 @@ captures. Do not copy real VINs, credentials, or dealer data.
 properties and `internalName` exactly `AVL Ditest VCI2K_DPDU_API`; no real VCI
 serial number or network address is retained.
 
-- [ ] **Step 6: Run codec and profile tests**
+- [x] **Step 6: Run codec and profile tests**
 
 ```powershell
 rtk cmake --build build-test --target test_Xc2JsonCodec test_Xc2ContractProfile --parallel
@@ -622,7 +622,7 @@ rtk ctest --test-dir build-test --output-on-failure -L ktm
 
 Expected: both tests pass.
 
-- [ ] **Step 7: Commit models, codec, and fixtures**
+- [x] **Step 7: Commit models, codec, and fixtures**
 
 ```powershell
 rtk git add CMakeLists.txt src/ktm/xc2/Xc2Models.* src/ktm/xc2/Xc2JsonCodec.* tests/ktm/test_Xc2JsonCodec.cpp tests/ktm/fixtures/README.md tests/ktm/fixtures/manifest.json tests/ktm/fixtures/rest
@@ -647,7 +647,7 @@ rtk git commit -m "feat: add strict XC2 contract models"
 - Consumes: `Xc2Error` and strict `Xc2JsonCodec::jobProgress()` from Task 2.
 - Produces: `Xc2StompFrame`, `Xc2StompDecodeResult`, and `Xc2StompCodec::feed/encode`.
 
-- [ ] **Step 1: Write failing parser tests**
+- [x] **Step 1: Write failing parser tests**
 
 Cover all of these exact cases in `test_Xc2StompCodec.cpp`:
 
@@ -677,7 +677,7 @@ The golden test requires the progress frame to be exactly 298 bytes with
 the decoded body through `Xc2JsonCodec::jobProgress()` and checks localized
 message ID/text rather than merely searching for the job ID.
 
-- [ ] **Step 2: Run the parser test to verify red behavior**
+- [x] **Step 2: Run the parser test to verify red behavior**
 
 ```powershell
 rtk cmake --build build-test --target test_Xc2StompCodec --parallel
@@ -685,7 +685,7 @@ rtk cmake --build build-test --target test_Xc2StompCodec --parallel
 
 Expected: missing-header compile failure.
 
-- [ ] **Step 3: Implement the codec public interface**
+- [x] **Step 3: Implement the codec public interface**
 
 ```cpp
 struct Xc2StompFrame {
@@ -732,7 +732,7 @@ Implement STOMP 1.2 framing without globally rewriting the byte stream:
 Reject negative/non-numeric content length, missing command, invalid escapes,
 and a complete declared body followed by a non-NUL byte.
 
-- [ ] **Step 4: Add and parse sanitized STOMP fixtures**
+- [x] **Step 4: Add and parse sanitized STOMP fixtures**
 
 `connected.frame` records the observed read-only handshake negotiation
 `version:1.2` and `heart-beat:0,0` after the client offered
@@ -749,7 +749,7 @@ alone is `observed-read-only-handshake`; `error.frame` is a
 real `0x00` byte, not the two text characters `\\0`; tests assert the terminator
 and exact byte count (298 bytes for progress).
 
-- [ ] **Step 5: Run all pure contract tests**
+- [x] **Step 5: Run all pure contract tests**
 
 ```powershell
 rtk cmake --build build-test --target test_Xc2StompCodec --parallel
@@ -758,7 +758,7 @@ rtk ctest --test-dir build-test --output-on-failure -L ktm
 
 Expected: all KTM tests pass with no network process.
 
-- [ ] **Step 6: Commit the STOMP codec**
+- [x] **Step 6: Commit the STOMP codec**
 
 ```powershell
 rtk git add CMakeLists.txt src/ktm/xc2/Xc2StompCodec.* tests/ktm/test_Xc2StompCodec.cpp tests/ktm/fixtures/manifest.json tests/ktm/fixtures/stomp
@@ -781,7 +781,7 @@ rtk git commit -m "feat: add incremental XC2 STOMP codec"
 - Consumes: approved hashes/profile from Task 1 and `Xc2Error` from Task 2.
 - Produces: `Xc2Settings`, `Xc2InstallLayout`, `Xc2ValidationPolicy`, `Xc2RegistryRequest`, `Xc2PrerequisiteReport`, and separate production/test inspection entry points.
 
-- [ ] **Step 1: Write failing tests with a temporary synthetic installation**
+- [x] **Step 1: Write failing tests with a temporary synthetic installation**
 
 Test these independent results:
 
@@ -809,7 +809,7 @@ approved profile. Prepend a decoy `MVCI_PDU_API` node to the D-PDU XML so the
 test proves selection by `SHORT_NAME`, not by element order. Assert stable issue
 codes, not localized message text.
 
-- [ ] **Step 2: Run the probe test to verify red behavior**
+- [x] **Step 2: Run the probe test to verify red behavior**
 
 ```powershell
 rtk cmake --build build-test --target test_Xc2InstallationProbe --parallel
@@ -817,7 +817,7 @@ rtk cmake --build build-test --target test_Xc2InstallationProbe --parallel
 
 Expected: missing interface compile failure.
 
-- [ ] **Step 3: Implement settings and report types**
+- [x] **Step 3: Implement settings and report types**
 
 ```cpp
 class Xc2Settings final {
@@ -865,7 +865,7 @@ QSettings format, switches the default to `IniFormat`, redirects
 `sync()`, and restores the prior default format; the redirected path remains
 process-local to the dedicated test executable.
 
-- [ ] **Step 4: Implement deterministic installation inspection**
+- [x] **Step 4: Implement deterministic installation inspection**
 
 Expose:
 
@@ -934,7 +934,7 @@ provider DLL. The same package contains unrelated x64 Java, so path and machine
 checks are both mandatory. Hash with `QCryptographicHash::Sha256`. Every file
 is opened read-only; the provider DLL is never loaded.
 
-- [ ] **Step 5: Run the prerequisite tests**
+- [x] **Step 5: Run the prerequisite tests**
 
 ```powershell
 rtk cmake --build build-test --target test_Xc2InstallationProbe --parallel
@@ -943,7 +943,7 @@ rtk ctest --test-dir build-test --output-on-failure -R xc2_installation
 
 Expected: all listed cases pass.
 
-- [ ] **Step 6: Commit settings and the read-only probe**
+- [x] **Step 6: Commit settings and the read-only probe**
 
 ```powershell
 rtk git add CMakeLists.txt src/ktm/xc2/Xc2Settings.* src/ktm/xc2/Xc2InstallationProbe.* tests/ktm/test_Xc2InstallationProbe.cpp
@@ -987,7 +987,7 @@ rtk git commit -m "feat: validate external XC2 installation"
   loopback destination, one HTTP/1.1 request, and no reconnect, retry, or
   connection reuse.
 
-- [ ] **Step 1: Write a complete loopback fake server before the client**
+- [x] **Step 1: Write a complete loopback fake server before the client**
 
 `FakeHttpServer` binds an explicitly supplied `QHostAddress::LocalHost` or
 `QHostAddress::LocalHostIPv6` on port zero. It incrementally parses the request
@@ -1008,7 +1008,7 @@ do not use a timing guess that can cancel before the request reaches the wire.
 Expose enough connection/request counts to prove that a close-before-status
 response caused exactly one captured GET or POST and no hidden reconnect.
 
-- [ ] **Step 2: Write failing raw-URL, rebase, and cookie-authority tests**
+- [x] **Step 2: Write failing raw-URL, rebase, and cookie-authority tests**
 
 Add these data-driven cases to `test_Xc2RestClient.cpp`:
 
@@ -1085,7 +1085,7 @@ change to another canonical authority replaces the dedicated cookie jar before
 the new authority becomes usable, so neither REST nor WebSocket export can
 inherit cookies from the old authority.
 
-- [ ] **Step 3: Write failing exact-wire, no-retry, and redirect tests**
+- [x] **Step 3: Write failing exact-wire, no-retry, and redirect tests**
 
 Add these cases:
 
@@ -1121,7 +1121,7 @@ server. The client has no redirect-following code: both operations fail, each
 origin records exactly one request, and each trap remains at zero through the
 full deadline.
 
-- [ ] **Step 4: Write failing strict HTTP/1.1 parser and cookie-ingest tests**
+- [x] **Step 4: Write failing strict HTTP/1.1 parser and cookie-ingest tests**
 
 Add parser rows for:
 
@@ -1159,7 +1159,7 @@ against the canonical endpoint URL. A timeout, cancel, truncation, malformed
 response, or over-limit response installs no cookies visible through either
 the WebSocket or exact shutdown-REST export.
 
-- [ ] **Step 5: Write failing deadline, exactly-once, and response-matrix tests**
+- [x] **Step 5: Write failing deadline, exactly-once, and response-matrix tests**
 
 Add these cases:
 
@@ -1207,7 +1207,7 @@ by `abort()`. The shutdown capture repeats the Step 3 exact-wire assertions;
 close without a response and wait beyond the deadline to prove
 `requestCount() == 1`.
 
-- [ ] **Step 6: Run the REST target to verify red behavior**
+- [x] **Step 6: Run the REST target to verify red behavior**
 
 ```powershell
 rtk cmake --build build-test --target test_Xc2RestClient --parallel
@@ -1215,7 +1215,7 @@ rtk cmake --build build-test --target test_Xc2RestClient --parallel
 
 Expected: missing-client compile failure.
 
-- [ ] **Step 7: Implement the raw-byte authority and domain interface**
+- [x] **Step 7: Implement the raw-byte authority and domain interface**
 
 ```cpp
 enum class Xc2TransportReason { None, Canceled, Timeout, Network };
@@ -1269,7 +1269,7 @@ and separately exporting cookies for only the exact derived shutdown REST
 target. It does not own or instantiate a `QNetworkAccessManager`, and exposes
 no generic cookie-export URL.
 
-- [ ] **Step 8: Implement one-shot sockets, the incremental parser, and one completion path**
+- [x] **Step 8: Implement one-shot sockets, the incremental parser, and one completion path**
 
 Create one pending record per request containing the ID, endpoint, fresh
 `QTcpSocket`, request bytes, total and inactivity timers, forced transport
@@ -1295,7 +1295,7 @@ socket/state, and emits exactly once. A non-forced incomplete or malformed
 transfer maps to `Transport/Network`; successful HTTP/body classifications
 retain `Xc2TransportReason::None`.
 
-- [ ] **Step 9: Run REST and contract tests**
+- [x] **Step 9: Run REST and contract tests**
 
 ```powershell
 rtk cmake --build build-test --target test_Xc2RestClient --parallel
@@ -1308,7 +1308,7 @@ limits, response matrix, deadline, and exactly-once tests all pass. No test or
 production path instantiates `QNetworkAccessManager`; shutdown is one exact
 request and both redirect traps remain at zero.
 
-- [ ] **Step 10: Commit the REST client**
+- [x] **Step 10: Commit the REST client**
 
 ```powershell
 rtk git add CMakeLists.txt src/ktm/xc2/Xc2Models.h src/ktm/xc2/Xc2RestClient.* tests/ktm/FakeHttpServer.* tests/ktm/test_Xc2RestClient.cpp
@@ -1339,7 +1339,7 @@ rtk git commit -m "feat: add strict XC2 REST transport"
   `Xc2BackendManager` lifecycle. No public report, layout, launch spec, program,
   argv callback, candidate allocator, or lock-path seam has spawn authority.
 
-- [ ] **Step 1: Implement the fake sidecar test executable before manager code**
+- [x] **Step 1: Implement the fake sidecar test executable before manager code**
 
 The fake sidecar is a `QCoreApplication` plus `QTcpServer` that binds exactly
 IPv4 `127.0.0.1`. It accepts:
@@ -1383,7 +1383,7 @@ Pass `$<TARGET_FILE:fake_xc2_sidecar>` and
 `$<TARGET_FILE:xc2_manager_exit_helper>` to the test through compile definitions
 `FAKE_XC2_SIDECAR_PATH` and `XC2_MANAGER_EXIT_HELPER_PATH`.
 
-- [ ] **Step 2: Write failing launch-profile and bind tests**
+- [x] **Step 2: Write failing launch-profile and bind tests**
 
 Add these cases first:
 
@@ -1475,7 +1475,7 @@ current attempt, listener PID, health, and user have all passed; only then expos
 `http://127.0.0.1:<selected>/xc2/1.0` and
 `ws://127.0.0.1:<selected>/xc2-websocket`.
 
-- [ ] **Step 3: Write failing PID ownership, collision, and lock tests**
+- [x] **Step 3: Write failing PID ownership, collision, and lock tests**
 
 Use real child processes, `GetExtendedTcpTable`, and bounded
 `QSignalSpy`/`QTRY_COMPARE_WITH_TIMEOUT` checks for:
@@ -1584,7 +1584,7 @@ partial or failed write is never retried. The fake event logs prove the normal
 path receives one exact empty-form POST and every decoy/handoff path receives
 zero bytes.
 
-- [ ] **Step 4: Write failing startup, lifecycle, and output tests**
+- [x] **Step 4: Write failing startup, lifecycle, and output tests**
 
 Add:
 
@@ -1695,7 +1695,7 @@ HANDLE signals; crash leftovers are dead-owner stale locks. Strict lock
 retention across forced owner death would require an external guardian process
 and is outside this scope.
 
-- [ ] **Step 5: Run the manager target to verify red behavior**
+- [x] **Step 5: Run the manager target to verify red behavior**
 
 ```powershell
 rtk cmake --build build-test --target test_Xc2BackendManager --parallel
@@ -1703,7 +1703,7 @@ rtk cmake --build build-test --target test_Xc2BackendManager --parallel
 
 Expected: missing manager compile failure.
 
-- [ ] **Step 6: Implement the provenance-safe manager interface**
+- [x] **Step 6: Implement the provenance-safe manager interface**
 
 ```cpp
 namespace ktm::xc2 {
@@ -1771,7 +1771,7 @@ absolute test lock paths, exact IPv4 bind address, non-empty callback, and
 candidate ports before acquiring the lock. Clear a supplied error on every
 accepted start. Register both public metatypes before queued signals/QSignalSpy.
 
-- [ ] **Step 7: Implement run-scoped ownership and Windows listener proof**
+- [x] **Step 7: Implement run-scoped ownership and Windows listener proof**
 
 `RunContext` owns immutable `runId`, one fixed `QLockFile`, failure/stopped
 completion flags, public-state snapshots, and the active attempt. Each attempt
@@ -1833,7 +1833,7 @@ rely only on `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` child-tree containment. They
 make no strict post-owner lock-ordering promise; an external guardian would be
 required and is outside scope.
 
-- [ ] **Step 8: Run manager and all KTM tests**
+- [x] **Step 8: Run manager and all KTM tests**
 
 ```powershell
 rtk cmake --build build-test --target test_Xc2BackendManager --parallel
@@ -1852,7 +1852,7 @@ Job Object containment only. The valid 8082 decoy, handoff decoy, and port-steal
 traps remain alive until their test-owned cleanup and record zero unauthorized
 shutdown bytes.
 
-- [ ] **Step 9: Commit the owned manager**
+- [x] **Step 9: Commit the owned manager**
 
 ```powershell
 rtk git add CMakeLists.txt src/ktm/xc2/Xc2BackendManager.* src/ktm/xc2/internal/Xc2ProcessOutput.* tests/ktm/fake_xc2_sidecar.cpp tests/ktm/xc2_manager_exit_helper.cpp tests/ktm/test_Xc2BackendManager.cpp
@@ -1900,7 +1900,7 @@ rtk git commit -m "feat: manage the XC2 sidecar lifecycle"
   cap. This task proves the WebSocket/message/generation integration without
   duplicating those parser tests.
 
-- [ ] **Step 1: Build deterministic loopback WebSocket test servers**
+- [x] **Step 1: Build deterministic loopback WebSocket test servers**
 
 Create `FakeXc2TransportServer` with one `QTcpServer` bound only to
 `QHostAddress::LocalHost` on port zero. The same listener authority must serve
@@ -1926,7 +1926,7 @@ Use `QTEST_GUILESS_MAIN`, not `QTEST_APPLESS_MAIN`, so `QCoreApplication`,
 timers, sockets, and the event dispatcher exist. Add `Q_DECLARE_METATYPE` for
 the public state/session/message types used by `QSignalSpy`.
 
-- [ ] **Step 2: Write failing authority, handshake, protocol, and state tests**
+- [x] **Step 2: Write failing authority, handshake, protocol, and state tests**
 
 Add these cases first:
 
@@ -1982,7 +1982,7 @@ Call connect twice while the first call is in flight and prove one server
 connection. Then abort generation A, connect generation B, and make A deliver a
 queued error/close/timer callback; B must remain unaffected.
 
-- [ ] **Step 3: Write failing heartbeat, subscription, routing, fragmentation,
+- [x] **Step 3: Write failing heartbeat, subscription, routing, fragmentation,
   disconnect, and visibility tests**
 
 Add these cases:
@@ -2061,7 +2061,7 @@ CONNECTED emits one visibility-loss event and never opens another connection.
 A connection that never reached CONNECTED and an intentional disconnect have no
 established visibility to lose.
 
-- [ ] **Step 4: Run the client target to verify red behavior**
+- [x] **Step 4: Run the client target to verify red behavior**
 
 ```powershell
 rtk cmake --build build-test --target test_Xc2StompClient --parallel
@@ -2069,7 +2069,7 @@ rtk cmake --build build-test --target test_Xc2StompClient --parallel
 
 Expected: missing-client compile failure.
 
-- [ ] **Step 5: Implement the bounded public interface**
+- [x] **Step 5: Implement the bounded public interface**
 
 ```cpp
 using Xc2StompGeneration = quint64;
@@ -2134,7 +2134,7 @@ signals:
 };
 ```
 
-- [ ] **Step 6: Implement authority-bound handshake and one connection generation**
+- [x] **Step 6: Implement authority-bound handshake and one connection generation**
 
 `connectToBackend` accepts only a configured `Xc2RestClient` named `rest`. In
 the same call, copy its canonical `rest.webSocketUrl()` and request
@@ -2170,7 +2170,7 @@ force-aborts the current socket, is idempotent, and completes with
 `Transport/Canceled`; it gives an owner such as the contract probe a hard stop
 when its outer REST-plus-WebSocket deadline expires.
 
-- [ ] **Step 7: Implement strict STOMP negotiation and frame dispatch**
+- [x] **Step 7: Implement strict STOMP negotiation and frame dispatch**
 
 Encode all client frames with `Xc2StompCodec` and send CONNECT, SUBSCRIBE,
 UNSUBSCRIBE, DISCONNECT, and heartbeat LF as text WebSocket messages. CONNECT
@@ -2198,7 +2198,7 @@ twice. Complete-message delivery lets QWebSocket reassemble TCP and WebSocket
 frame fragmentation, while the codec independently handles STOMP frames split
 across WebSocket messages or coalesced in one message.
 
-- [ ] **Step 8: Implement heartbeat, stable subscriptions, and strict routing**
+- [x] **Step 8: Implement heartbeat, stable subscriptions, and strict routing**
 
 For CONNECT `heart-beat:<cx>,<cy>` and CONNECTED
 `heart-beat:<sx>,<sy>`, calculate:
@@ -2231,7 +2231,7 @@ the non-empty `message-id`. Only a consistent current-generation tuple produces
 `messageReceived`; report and drop every mismatch or missing field. Never expose
 an arbitrary string subscription API.
 
-- [ ] **Step 9: Implement receipt-bounded disconnect and visibility semantics**
+- [x] **Step 9: Implement receipt-bounded disconnect and visibility semantics**
 
 From Connected, stop heartbeat timers, enter Disconnecting, and send exactly one
 DISCONNECT with `receipt:disconnect-<generation>`. Keep the socket open until a
@@ -2251,7 +2251,7 @@ intentional disconnect do not. The later session controller consumes this event
 and may explicitly start a fresh generation only when its destructive-job gate
 allows it; Task 8 records degraded visibility without changing job state.
 
-- [ ] **Step 10: Run only STOMP client and codec tests**
+- [x] **Step 10: Run only STOMP client and codec tests**
 
 ```powershell
 rtk cmake --build build-test --target test_Xc2StompClient test_Xc2StompCodec --parallel
@@ -2262,7 +2262,7 @@ Expected: authority/cookie traps, v12 handshake, protocol/state/deadline races,
 heartbeat matrix, fragmentation, stable routing, receipt-bounded disconnect,
 and visibility semantics all pass with no external process.
 
-- [ ] **Step 11: Commit the WebSocket client**
+- [x] **Step 11: Commit the WebSocket client**
 
 ```powershell
 rtk git add CMakeLists.txt src/ktm/xc2/Xc2StompClient.* tests/ktm/FakeXc2TransportServer.* tests/ktm/test_Xc2StompClient.cpp
@@ -2615,7 +2615,7 @@ surface and a current user with `EcuDiagnosticRead`; an unauthenticated local
 mock returns 5 and is recorded, never converted into a passing test. It neither
 starts nor stops the explicitly selected service.
 
-- [ ] **Step 10: Add required three-platform CI evidence**
+- [x] **Step 10: Add required three-platform CI evidence**
 
 Create `ktm-xc2-foundation.yml` for `pull_request` and branch pushes; do not use
 the manual packaging/release workflow as the only test gate. Use read-only
@@ -2655,7 +2655,14 @@ tracked files staged above. Leave Steps 10 and 12 and the Phase 1 completion gat
 open until the pushed implementation commit's three jobs finish for one exact
 SHA.
 
-- [ ] **Step 12: Record CI evidence, finish checkboxes, and commit docs**
+- [x] **Step 12: Record CI evidence, finish checkboxes, and commit docs**
+CI evidence (observed after completion):
+- Implementation SHA: e1e77645b6e6d9fd97f0825b8c24062442a1dceb
+- Push run: [29629009807](https://github.com/devells/romHEX14-community/actions/runs/29629009807) - conclusion success
+- Windows / KTM ON: [job 88038992476](https://github.com/devells/romHEX14-community/actions/runs/29629009807/job/88038992476) - conclusion success
+- Linux / KTM OFF: [job 88038992456](https://github.com/devells/romHEX14-community/actions/runs/29629009807/job/88038992456) - conclusion success
+- macOS / KTM OFF: [job 88038992700](https://github.com/devells/romHEX14-community/actions/runs/29629009807/job/88038992700) - conclusion success
+- Conclusion: exact push run for the implementation SHA completed with all three required jobs successful.
 
 After the implementation commit is pushed, require green Windows, Linux, and
 macOS jobs for that exact SHA. Record their run URLs/SHA beside this step, mark
@@ -2676,21 +2683,21 @@ a substitute for non-Windows execution evidence.
 Before writing the diagnostics plan, verify all of the following with current
 artifacts rather than intent:
 
-- The Windows option and Qt WebSockets prerequisite behave as specified.
-- Every KTM CTest target passes on Qt 6.8.3/MinGW 13.1.
-- Golden fixtures contain no real VIN, credential, or dealer identity.
-- Installation inspection is read-only and rejects wrong hash/PE bitness.
-- The manager never reuses 8082 and shuts down only its owned fake child.
-- REST is loopback-only, strict, cookie-preserving, and performs zero internal
+- [x] The Windows option and Qt WebSockets prerequisite behave as specified.
+- [x] Every KTM CTest target passes on Qt 6.8.3/MinGW 13.1.
+- [x] Golden fixtures contain no real VIN, credential, or dealer identity.
+- [x] Installation inspection is read-only and rejects wrong hash/PE bitness.
+- [x] The manager never reuses 8082 and shuts down only its owned fake child.
+- [x] REST is loopback-only, strict, cookie-preserving, and performs zero internal
   retry.
-- STOMP handles fragmentation, heartbeats, content length, topic allowlisting,
+- [x] STOMP handles fragmentation, heartbeats, content length, topic allowlisting,
   and visibility loss.
-- Job delivery identity, atomic signals, stable ordering, visibility recovery,
+- [x] Job delivery identity, atomic signals, stable ordering, visibility recovery,
   terminal tombstones, and non-regressive progress behave deterministically.
-- The real probe executable passes the single-authority fake allowlist with zero
+- [x] The real probe executable passes the single-authority fake allowlist with zero
   state-changing/unexpected calls and every documented exit code.
-- The optional live probe performs only the two approved REST reads, two status
+- [x] The optional live probe performs only the two approved REST reads, two status
   subscriptions, and receipt-confirmed disconnect under one deadline.
-- Green Windows-ON and Linux/macOS-OFF CI jobs exist for the same commit; the
+- [x] Green Windows-ON and Linux/macOS-OFF CI jobs exist for the same commit; the
   main application builds with `RX14_KTM_XC2=OFF` without KTM targets or Qt
   WebSockets/Test discovery.
