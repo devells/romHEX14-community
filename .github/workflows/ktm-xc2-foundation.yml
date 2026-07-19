@@ -151,7 +151,7 @@ jobs:
           print('PASS: rx14 codemodel contains no src/ktm sources')
           PY
       - name: Build romHEX14 and base tests
-        run: cmake --build build --parallel
+        run: cmake --build build --parallel 3
       - name: Run all registered base tests
         run: ctest --test-dir build --output-on-failure
 
