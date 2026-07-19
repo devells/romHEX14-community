@@ -127,6 +127,28 @@ jobs:
           if forbidden:
               raise SystemExit(f'forbidden option-off targets: {forbidden}')
           print(f'PASS: {len(targets)} codemodel targets contain no ktm/xc2 name')
+          rx14_targets = [
+              target
+              for config in codemodel.get('configurations', [])
+              for target in config.get('targets', [])
+              if target.get('name') == 'rx14'
+          ]
+          if len(rx14_targets) != 1:
+              raise SystemExit(
+                  f'expected exactly one rx14 target, got {len(rx14_targets)}')
+          rx14 = json.loads(
+              (reply / rx14_targets[0]['jsonFile']).read_text(encoding='utf-8'))
+          sources = [
+              str(source.get('path', '')).replace('\\', '/')
+              for source in rx14.get('sources', [])
+          ]
+          forbidden_sources = sorted(
+              path for path in sources
+              if re.search(r'(^|/)src/ktm(/|$)', path, re.I))
+          if forbidden_sources:
+              raise SystemExit(
+                  f'forbidden option-off rx14 sources: {forbidden_sources}')
+          print('PASS: rx14 codemodel contains no src/ktm sources')
           PY
       - name: Build romHEX14 and base tests
         run: cmake --build build --parallel
@@ -207,6 +229,28 @@ jobs:
           if forbidden:
               raise SystemExit(f'forbidden option-off targets: {forbidden}')
           print(f'PASS: {len(targets)} codemodel targets contain no ktm/xc2 name')
+          rx14_targets = [
+              target
+              for config in codemodel.get('configurations', [])
+              for target in config.get('targets', [])
+              if target.get('name') == 'rx14'
+          ]
+          if len(rx14_targets) != 1:
+              raise SystemExit(
+                  f'expected exactly one rx14 target, got {len(rx14_targets)}')
+          rx14 = json.loads(
+              (reply / rx14_targets[0]['jsonFile']).read_text(encoding='utf-8'))
+          sources = [
+              str(source.get('path', '')).replace('\\', '/')
+              for source in rx14.get('sources', [])
+          ]
+          forbidden_sources = sorted(
+              path for path in sources
+              if re.search(r'(^|/)src/ktm(/|$)', path, re.I))
+          if forbidden_sources:
+              raise SystemExit(
+                  f'forbidden option-off rx14 sources: {forbidden_sources}')
+          print('PASS: rx14 codemodel contains no src/ktm sources')
           PY
       - name: Build romHEX14 and base tests
         run: cmake --build build --parallel 3
