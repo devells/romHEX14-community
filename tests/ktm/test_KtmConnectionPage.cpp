@@ -251,6 +251,74 @@ private slots:
         QVERIFY(!error->text().contains(QStringLiteral("sentinel")));
     }
 
+    void sessionBoundariesDiscardStaleProjection()
+    {
+        KtmConnectionPage page;
+        QComboBox *const combo = requiredChild<QComboBox>(
+            page, "ktmVciDeviceCombo");
+        QPushButton *const connectButton = requiredChild<QPushButton>(
+            page, "ktmConnectVciButton");
+        QLabel *const voltage = requiredChild<QLabel>(
+            page, "ktmVciVoltageLabel");
+        QLabel *const error = requiredChild<QLabel>(
+            page, "ktmSessionErrorLabel");
+
+        page.projectState(KtmSessionState::SessionReady);
+        page.projectDevices({approvedDevice()});
+        combo->setCurrentIndex(0);
+        QVERIFY(connectButton->isEnabled());
+
+        Xc2VciStatus connected;
+        connected.connected = true;
+        connected.voltage = 12.4;
+        page.projectStatus(connected);
+        QVERIFY(voltage->text() != QStringLiteral("--"));
+        page.projectState(KtmSessionState::VciReady);
+        page.projectState(KtmSessionState::SessionReady);
+        QCOMPARE(voltage->text(), QStringLiteral("--"));
+        QCOMPARE(combo->count(), 1);
+        QCOMPARE(combo->currentIndex(), 0);
+        page.projectStatus(connected);
+
+        Xc2Error staleError;
+        staleError.message = QStringLiteral("Stale failure");
+        page.projectError(staleError);
+        page.projectOperation(KtmSessionOperation::Lookup);
+        QVERIFY(error->text().isEmpty());
+
+        page.projectState(KtmSessionState::VciLookup);
+        QCOMPARE(combo->count(), 0);
+        QVERIFY(!connectButton->isEnabled());
+
+        page.projectDevices({approvedDevice()});
+        combo->setCurrentIndex(0);
+        page.projectStatus(connected);
+        page.projectError(staleError);
+        page.projectOperation(KtmSessionOperation::None);
+        page.projectState(KtmSessionState::BackendStarting);
+        QCOMPARE(combo->count(), 0);
+        QCOMPARE(voltage->text(), QStringLiteral("--"));
+        QVERIFY(error->text().isEmpty());
+
+        page.projectDevices({approvedDevice()});
+        combo->setCurrentIndex(0);
+        page.projectStatus(connected);
+        page.projectError(staleError);
+        page.projectState(KtmSessionState::Failed);
+        QCOMPARE(combo->count(), 0);
+        QCOMPARE(voltage->text(), QStringLiteral("--"));
+        QVERIFY(error->text().isEmpty());
+
+        page.projectDevices({approvedDevice()});
+        combo->setCurrentIndex(0);
+        page.projectStatus(connected);
+        page.projectError(staleError);
+        page.projectState(KtmSessionState::Stopped);
+        QCOMPARE(combo->count(), 0);
+        QCOMPARE(voltage->text(), QStringLiteral("--"));
+        QVERIFY(error->text().isEmpty());
+    }
+
     void busyOperationGatesUnsafeControls_data()
     {
         QTest::addColumn<KtmSessionState>("state");

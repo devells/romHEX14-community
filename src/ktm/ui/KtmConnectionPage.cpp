@@ -112,6 +112,15 @@ KtmConnectionPage::KtmConnectionPage(QWidget *parent)
 void KtmConnectionPage::projectState(KtmSessionState state)
 {
     m_state = state;
+    const bool sessionBoundary = state == KtmSessionState::Stopped
+        || state == KtmSessionState::BackendStarting
+        || state == KtmSessionState::Failed;
+    if (sessionBoundary || state == KtmSessionState::VciLookup)
+        m_deviceCombo->clear();
+    if (sessionBoundary || state == KtmSessionState::SessionReady)
+        m_voltageLabel->setText(QStringLiteral("--"));
+    if (sessionBoundary)
+        m_errorLabel->clear();
     m_stateLabel->setText(stateText(state));
     updateControls();
     updateProgress();
@@ -120,6 +129,8 @@ void KtmConnectionPage::projectState(KtmSessionState state)
 void KtmConnectionPage::projectOperation(KtmSessionOperation operation)
 {
     m_operation = operation;
+    if (operation != KtmSessionOperation::None)
+        m_errorLabel->clear();
     updateControls();
     updateProgress();
 }
