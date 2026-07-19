@@ -239,7 +239,7 @@ bool KtmSessionController::applyVci(const xc2::Xc2VciDevice &device,
     m_applyRequestId = 0;
     m_selectedRequestId = 0;
     m_applyRequestSelectionEpoch = selectionEpoch;
-    m_selectedRequestSelectionEpoch = selectionEpoch;
+    m_selectedRequestSelectionEpoch = 0;
     QPointer<KtmSessionController> guard(this);
     if (!publishOperation(KtmSessionOperation::Apply) || !guard
         || sessionEpoch != m_sessionEpoch
@@ -271,21 +271,6 @@ bool KtmSessionController::applyVci(const xc2::Xc2VciDevice &device,
         m_applyRequestSelectionEpoch = 0;
         failLocal(xc2::Xc2ErrorCategory::Transport,
                   QStringLiteral("Failed to start VCI apply request"));
-        return false;
-    }
-    const xc2::Xc2RequestId selectedRequestId = requestSelectedDevice();
-    if (!guard || sessionEpoch != m_sessionEpoch
-        || selectionEpoch != m_selectionEpoch
-        || !restGuard || restGuard != m_restClient
-        || m_operation != KtmSessionOperation::Apply
-        || m_state != KtmSessionState::VciApplying) {
-        return false;
-    }
-    m_selectedRequestId = selectedRequestId;
-    if (selectedRequestId == 0) {
-        m_selectedRequestSelectionEpoch = 0;
-        failLocal(xc2::Xc2ErrorCategory::Transport,
-                  QStringLiteral("Failed to start selected-VCI request"));
         return false;
     }
     return true;
@@ -1573,7 +1558,26 @@ void KtmSessionController::handleApplyDeviceFinished(
         return;
     }
     m_applySucceeded = true;
-    tryPublishVciReady();
+    QPointer<KtmSessionController> guard(this);
+    QPointer<xc2::Xc2RestClient> restGuard = m_restClient;
+    m_selectedRequestSelectionEpoch = selectionEpoch;
+    const xc2::Xc2RequestId selectedRequestId = requestSelectedDevice();
+    if (!guard || epoch != m_sessionEpoch
+        || selectionEpoch != m_selectionEpoch
+        || !restGuard || restGuard != m_restClient
+        || identity != reinterpret_cast<quintptr>(m_restClient.data())
+        || m_operation != KtmSessionOperation::Apply
+        || m_state != KtmSessionState::VciApplying || !m_applySucceeded
+        || m_selectedRequestId != 0
+        || m_selectedRequestSelectionEpoch != selectionEpoch) {
+        return;
+    }
+    m_selectedRequestId = selectedRequestId;
+    if (selectedRequestId == 0) {
+        m_selectedRequestSelectionEpoch = 0;
+        failLocal(xc2::Xc2ErrorCategory::Transport,
+                  QStringLiteral("Failed to start selected-VCI request"));
+    }
 }
 
 void KtmSessionController::handleSelectedDeviceFinished(

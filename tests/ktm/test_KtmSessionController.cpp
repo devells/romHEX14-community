@@ -70,6 +70,14 @@ public:
         controller.m_testOps.stopBackend = std::move(stopBackend);
     }
 
+    static void setRequestSelectedOp(
+        KtmSessionController &controller,
+        std::function<xc2::Xc2RequestId()> requestSelected)
+    {
+        controller.m_testOps.requestSelectedDevice =
+            std::move(requestSelected);
+    }
+
     static KtmSessionState state(const KtmSessionController &controller)
     {
         return controller.m_state;
@@ -95,6 +103,18 @@ public:
     static quint64 selectionEpoch(const KtmSessionController &controller)
     {
         return controller.m_selectionEpoch;
+    }
+
+    static xc2::Xc2RequestId applyRequestId(
+        const KtmSessionController &controller)
+    {
+        return controller.m_applyRequestId;
+    }
+
+    static xc2::Xc2RequestId selectedRequestId(
+        const KtmSessionController &controller)
+    {
+        return controller.m_selectedRequestId;
     }
 
     static Xc2StompGeneration stompGeneration(
@@ -335,6 +355,15 @@ public:
     {
         controller.handleApplyDeviceFinished(
             sessionEpoch, selectionEpoch, identity, id, error);
+    }
+
+    static void staleSelectedDeviceFinished(
+        KtmSessionController &controller, quint64 sessionEpoch,
+        quint64 selectionEpoch, quintptr identity, xc2::Xc2RequestId id,
+        const xc2::Xc2Result<xc2::Xc2SelectedVci> &result)
+    {
+        controller.handleSelectedDeviceFinished(
+            sessionEpoch, selectionEpoch, identity, id, result);
     }
 
     static void advanceSelectionEpoch(KtmSessionController &controller)
@@ -885,29 +914,27 @@ QList<FakePhase> completeHappyScript(const FakeXc2TransportServer &server,
     phases.append(
         orderedPhase(QStringLiteral("devices"), std::move(devices)));
 
-    FakePhase apply;
-    apply.label = QStringLiteral("apply-and-selected");
-    apply.unordered = true;
-    apply.expectations = {
-        restExpectation(
-            server, QStringLiteral("device-apply"), QByteArrayLiteral("POST"),
-            QByteArrayLiteral("/xc2/1.0/device/apply"),
-            compactDevice(device), cookie),
-        restExpectation(
-            server, QStringLiteral("device-selected"),
-            QByteArrayLiteral("GET"),
-            QByteArrayLiteral("/xc2/1.0/device/getSelected"), {}, cookie),
-    };
-    apply.completionActions = {
-        httpReply(QStringLiteral("apply-response"), 204,
-                  QByteArrayLiteral("No Content"), {}, {},
-                  QStringLiteral("device-apply")),
+    FakeExpectation apply = restExpectation(
+        server, QStringLiteral("device-apply"), QByteArrayLiteral("POST"),
+        QByteArrayLiteral("/xc2/1.0/device/apply"),
+        compactDevice(device), cookie);
+    apply.actions.append(httpReply(
+        QStringLiteral("apply-response"), 204,
+        QByteArrayLiteral("No Content")));
+    phases.append(
+        orderedPhase(QStringLiteral("apply"), std::move(apply)));
+
+    FakeExpectation selected = restExpectation(
+        server, QStringLiteral("device-selected"), QByteArrayLiteral("GET"),
+        QByteArrayLiteral("/xc2/1.0/device/getSelected"), {}, cookie);
+    selected.actions = {
         sendTopic(QStringLiteral("status-before-selected"), status),
         httpReply(QStringLiteral("selected-response"), 200,
                   QByteArrayLiteral("OK"), compactDevice(device),
-                  jsonHeader, QStringLiteral("device-selected")),
+                  jsonHeader),
     };
-    phases.append(std::move(apply));
+    phases.append(
+        orderedPhase(QStringLiteral("selected"), std::move(selected)));
 
     FakeExpectation close = restExpectation(
         server, QStringLiteral("device-close"), QByteArrayLiteral("POST"),
@@ -923,8 +950,7 @@ QList<FakePhase> canceledLookupScript(
     const FakeXc2TransportServer &server, const Xc2VciDevice &device)
 {
     QList<FakePhase> phases = completeHappyScript(server, device);
-    phases.removeLast();
-    phases.removeLast();
+    phases.resize(9);
     phases[7].expectations[0].actions[0].stompFrame.body =
         progressBody(QStringLiteral("lookup-task4"), Xc2JobState::Canceled);
     return phases;
@@ -936,13 +962,13 @@ QList<FakePhase> selectionVariantScript(
 {
     QList<FakePhase> phases = completeHappyScript(server, device);
     phases.removeLast();
-    phases[9].completionActions[1].stompFrame.body =
+    phases[10].expectations[0].actions[0].stompFrame.body =
         QJsonDocument(QJsonObject{
             {QStringLiteral("voltage"), voltage},
             {QStringLiteral("connected"), true},
         }).toJson(QJsonDocument::Compact);
     if (selectedBeforeStatus)
-        phases[9].completionActions.swapItemsAt(1, 2);
+        phases[10].expectations[0].actions.swapItemsAt(0, 1);
     return phases;
 }
 
@@ -2980,14 +3006,15 @@ private slots:
 
     void applyCorrelatesThreeFactsInEitherOrder_data()
     {
-        QTest::addColumn<bool>("statusFirst");
-        QTest::newRow("status-before-selected") << true;
-        QTest::newRow("selected-before-status") << false;
+        QTest::addColumn<int>("completionOrder");
+        QTest::newRow("status-before-apply-success") << 0;
+        QTest::newRow("status-before-selected") << 1;
+        QTest::newRow("selected-before-status") << 2;
     }
 
     void applyCorrelatesThreeFactsInEitherOrder()
     {
-        QFETCH(bool, statusFirst);
+        QFETCH(int, completionOrder);
         BootstrapHarness harness;
         harness.completeBootstrap();
         QSignalSpy ready(&harness.controller,
@@ -3004,12 +3031,22 @@ private slots:
                  before + 1);
         QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
                  KtmSessionState::VciApplying);
-        QCOMPARE(harness.trace.count(QStringLiteral("selected")), 1);
+        QCOMPARE(harness.trace.count(QStringLiteral("selected")), 0);
         QCOMPARE(harness.trace.filter(QStringLiteral("apply:")).size(), 1);
 
+        if (completionOrder == 0) {
+            KtmSessionControllerTestAccess::stompMessage(
+                harness.controller, vciStatusMessage(7, true, 0.0));
+            QCOMPARE(ready.count(), 0);
+        }
         KtmSessionControllerTestAccess::applyDeviceFinished(
             harness.controller, harness.applyId);
-        if (statusFirst) {
+        QCOMPARE(harness.trace.count(QStringLiteral("selected")), 1);
+        if (completionOrder == 0) {
+            KtmSessionControllerTestAccess::selectedDeviceFinished(
+                harness.controller, harness.selectedId,
+                Xc2Result<Xc2SelectedVci>::success({confirmed}));
+        } else if (completionOrder == 1) {
             KtmSessionControllerTestAccess::stompMessage(
                 harness.controller, vciStatusMessage(7, true, 0.0));
             KtmSessionControllerTestAccess::selectedDeviceFinished(
@@ -3079,13 +3116,20 @@ private slots:
             harness.applyId = 0;
         else
             harness.selectedId = 0;
-        QVERIFY(!harness.controller.applyVci(approvedDevice()));
+        QCOMPARE(harness.controller.applyVci(approvedDevice()), !zeroApply);
+        QCOMPARE(harness.trace.count(QStringLiteral("selected")), 0);
+        if (!zeroApply) {
+            QCOMPARE(KtmSessionControllerTestAccess::state(
+                         harness.controller),
+                     KtmSessionState::VciApplying);
+            KtmSessionControllerTestAccess::applyDeviceFinished(
+                harness.controller, harness.applyId);
+            QCOMPARE(harness.trace.count(QStringLiteral("selected")), 1);
+        }
         QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
                  KtmSessionState::Failed);
-        if (!zeroApply) {
-            QCOMPARE(harness.trace.count(QStringLiteral("abort-rest:31")),
-                     1);
-        }
+        QCOMPARE(harness.trace.count(QStringLiteral("abort-rest:31")), 0);
+        QCOMPARE(harness.trace.count(QStringLiteral("abort-rest:32")), 0);
     }
 
     void onlyOneVciOperationMayOwnTheController()
@@ -3597,9 +3641,7 @@ private slots:
         KtmSessionControllerTestAccess::staleApplyDeviceFinished(
             harness.controller, sessionEpoch, selectionEpoch,
             identity, harness.applyId + 1);
-        KtmSessionControllerTestAccess::selectedDeviceFinished(
-            harness.controller, harness.selectedId,
-            Xc2Result<Xc2SelectedVci>::success({approvedDevice()}));
+        QCOMPARE(harness.trace.count(QStringLiteral("selected")), 0);
         KtmSessionControllerTestAccess::stompMessage(
             harness.controller, vciStatusMessage(6, true, 12.4));
         QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
@@ -3607,8 +3649,27 @@ private slots:
 
         KtmSessionControllerTestAccess::applyDeviceFinished(
             harness.controller, harness.applyId);
+        QCOMPARE(harness.trace.count(QStringLiteral("selected")), 1);
         KtmSessionControllerTestAccess::stompMessage(
             harness.controller, vciStatusMessage(7, true, 12.4));
+        const auto selectedResult =
+            Xc2Result<Xc2SelectedVci>::success({approvedDevice()});
+        KtmSessionControllerTestAccess::staleSelectedDeviceFinished(
+            harness.controller, sessionEpoch - 1, selectionEpoch,
+            identity, harness.selectedId, selectedResult);
+        KtmSessionControllerTestAccess::staleSelectedDeviceFinished(
+            harness.controller, sessionEpoch, selectionEpoch - 1,
+            identity, harness.selectedId, selectedResult);
+        KtmSessionControllerTestAccess::staleSelectedDeviceFinished(
+            harness.controller, sessionEpoch, selectionEpoch,
+            identity + 1, harness.selectedId, selectedResult);
+        KtmSessionControllerTestAccess::staleSelectedDeviceFinished(
+            harness.controller, sessionEpoch, selectionEpoch,
+            identity, harness.selectedId + 1, selectedResult);
+        QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
+                 KtmSessionState::VciApplying);
+        KtmSessionControllerTestAccess::selectedDeviceFinished(
+            harness.controller, harness.selectedId, selectedResult);
         QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
                  KtmSessionState::VciReady);
     }
@@ -3647,11 +3708,25 @@ private slots:
                  KtmSessionState::Failed);
     }
 
+    void stopInvalidatesCallbacksResetsSessionThenStopsBackend_data()
+    {
+        QTest::addColumn<bool>("selectedPending");
+        QTest::newRow("apply-pending") << false;
+        QTest::newRow("selected-pending") << true;
+    }
+
     void stopInvalidatesCallbacksResetsSessionThenStopsBackend()
     {
+        QFETCH(bool, selectedPending);
         BootstrapHarness harness;
         harness.completeBootstrap();
         QVERIFY(harness.controller.applyVci(approvedDevice()));
+        QCOMPARE(harness.trace.count(QStringLiteral("selected")), 0);
+        if (selectedPending) {
+            KtmSessionControllerTestAccess::applyDeviceFinished(
+                harness.controller, harness.applyId);
+            QCOMPARE(harness.trace.count(QStringLiteral("selected")), 1);
+        }
         const quint64 oldEpoch =
             KtmSessionControllerTestAccess::sessionEpoch(harness.controller);
         const QPointer<Xc2RestClient> oldRest =
@@ -3670,9 +3745,11 @@ private slots:
         QVERIFY(oldRest.isNull());
         QVERIFY(oldStomp.isNull());
         QVERIFY(oldRegistry.isNull());
+        const QString activeAbort = selectedPending
+            ? QStringLiteral("abort-rest:32")
+            : QStringLiteral("abort-rest:31");
         QCOMPARE(harness.trace,
-                 QStringList({QStringLiteral("abort-rest:31"),
-                              QStringLiteral("abort-rest:32"),
+                 QStringList({activeAbort,
                               QStringLiteral("disconnect-stomp"),
                               QStringLiteral("abort-stomp"),
                               QStringLiteral("reset-session"),
@@ -3803,36 +3880,66 @@ private slots:
                 != KtmSessionState::Failed);
     }
 
-    void oneParallelSelectionFailureAbortsTheOtherRequest_data()
+    void selectionPhaseFailureDoesNotStartOrAbortCompletedPeer_data()
     {
         QTest::addColumn<bool>("applyFails");
         QTest::newRow("apply-fails") << true;
         QTest::newRow("selected-fails") << false;
     }
 
-    void oneParallelSelectionFailureAbortsTheOtherRequest()
+    void selectionPhaseFailureDoesNotStartOrAbortCompletedPeer()
     {
         QFETCH(bool, applyFails);
         BootstrapHarness harness;
         harness.completeBootstrap();
         QVERIFY(harness.controller.applyVci(approvedDevice()));
+        QCOMPARE(harness.trace.count(QStringLiteral("selected")), 0);
         Xc2Error failure;
         failure.category = Xc2ErrorCategory::Vci;
         failure.message = QStringLiteral("synthetic selection failure");
         if (applyFails) {
             KtmSessionControllerTestAccess::applyDeviceFinished(
                 harness.controller, harness.applyId, failure);
-            QCOMPARE(harness.trace.count(QStringLiteral("abort-rest:32")),
-                     1);
+            QCOMPARE(harness.trace.count(QStringLiteral("selected")), 0);
         } else {
+            KtmSessionControllerTestAccess::applyDeviceFinished(
+                harness.controller, harness.applyId);
+            QCOMPARE(harness.trace.count(QStringLiteral("selected")), 1);
             KtmSessionControllerTestAccess::selectedDeviceFinished(
                 harness.controller, harness.selectedId,
                 Xc2Result<Xc2SelectedVci>::failure(failure));
-            QCOMPARE(harness.trace.count(QStringLiteral("abort-rest:31")),
-                     1);
         }
+        QCOMPARE(harness.trace.count(QStringLiteral("abort-rest:31")), 0);
+        QCOMPARE(harness.trace.count(QStringLiteral("abort-rest:32")), 0);
         QCOMPARE(KtmSessionControllerTestAccess::state(harness.controller),
                  KtmSessionState::Failed);
+    }
+
+    void reentrantStopDuringSelectedRequestCannotLeavePendingId()
+    {
+        BootstrapHarness harness;
+        harness.completeBootstrap();
+        KtmSessionControllerTestAccess::setRequestSelectedOp(
+            harness.controller, [&harness] {
+                harness.trace.append(QStringLiteral("selected"));
+                harness.controller.stop();
+                return harness.selectedId;
+            });
+
+        QVERIFY(harness.controller.applyVci(approvedDevice()));
+        QCOMPARE(harness.trace.count(QStringLiteral("selected")), 0);
+        KtmSessionControllerTestAccess::applyDeviceFinished(
+            harness.controller, harness.applyId);
+
+        QCOMPARE(harness.trace.count(QStringLiteral("selected")), 1);
+        QCOMPARE(KtmSessionControllerTestAccess::applyRequestId(
+                     harness.controller), Xc2RequestId(0));
+        QCOMPARE(KtmSessionControllerTestAccess::selectedRequestId(
+                     harness.controller), Xc2RequestId(0));
+        QVERIFY(KtmSessionControllerTestAccess::stopping(
+            harness.controller));
+        QVERIFY(KtmSessionControllerTestAccess::state(harness.controller)
+                != KtmSessionState::Failed);
     }
 
     void stopFromOperationProjectionWinsOverFailure()
